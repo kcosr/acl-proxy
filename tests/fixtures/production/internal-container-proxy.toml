@@ -46,17 +46,15 @@ http_versions = ["http1"]
 kind = "acl_proxy"
 url = "http://host-proxy.example.test:8881"
 
+[egress.parent_proxy.presentation]
+kind = "bearer_environment"
+variable = "AW_IDENTITY_TOKEN"
+
 [[egress.request_headers]]
 operation = "set"
 when = "always"
 name = "x-aw-policy-context"
 value = "fixture-internal"
-
-[[egress.credential_actions]]
-kind = "custom_header"
-transport_security = "cleartext_allowed"
-header = "x-aw-identity-token"
-credential = "aw_identity"
 
 [policy]
 default = "deny"
@@ -118,13 +116,6 @@ urls = ["http://*.corp.example.test/**"]
 
 [authorization]
 internal_context_headers = ["x-aw-policy-context"]
-
-[credentials]
-allowed_custom_headers = ["x-aw-identity-token"]
-
-[credentials.sources.aw_identity]
-source = "environment"
-variable = "AW_IDENTITY_TOKEN"
 
 [observation.logging]
 level = "error"

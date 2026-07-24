@@ -5,6 +5,10 @@ use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+use access_identity::{
+    project_static_resolver_resources, AuthorityId, GroupId, IdentityAudience, PrincipalId,
+    PrincipalKind, StaticGroup, StaticPrincipal, TokenId,
+};
 use base64::encoded_len as base64_encoded_len;
 use credential_core::{
     project_credential_resources, CredentialDescriptor, CredentialLimits, CredentialProfile,
@@ -23,7 +27,7 @@ use http_access_redaction::{
     MAX_EXTERNAL_SLOTS_PER_PROFILE, MAX_EXTERNAL_SLOTS_PER_SNAPSHOT, MAX_PROFILES,
     MAX_RULES_PER_PROFILE,
 };
-use http_access_runtime::BodyBudget;
+use http_access_runtime::{BodyBudget, HttpConnectionAuthenticationCapacity};
 use http_access_types::{
     BodyLimits, CanonicalUrl, CredentialMutation, CredentialMutationKind, CredentialRef,
     HeaderName as NeutralHeaderName, HttpScheme, RedirectPolicy, ResponsePolicy, SnapshotIdentity,
@@ -57,9 +61,10 @@ use http_access_url::{canonicalize_http_url, CompiledUrlPattern};
 use super::authoring::{
     AccessFlowTransportConfig, AuthorizationConfig, AuthorizationProviderConfig,
     CredentialActionConfig, CredentialSourceConfig, CredentialsConfig, EgressConfig, EgressRoute,
-    HeaderEffectConfig, HeaderEffectWhen, Http1ConnectPolicy, HttpVersion, ListenerEndpointConfig,
-    ListenersConfig, MitmConfig, ObservationConfig, ParentProxyKind, PolicyConfig,
-    PolicyRuleConfig, RedactionConfig, RedactionPayloads, RuleDecision, SafetyConfig,
+    HeaderEffectConfig, HeaderEffectWhen, Http1ConnectPolicy, HttpVersion,
+    IdentityPrincipalKindConfig, ListenerEndpointConfig, ListenerIdentityModeConfig,
+    ListenersConfig, MitmConfig, ObservationConfig, ParentProxyKind, ParentProxyPresentationConfig,
+    PolicyConfig, PolicyRuleConfig, RedactionConfig, RedactionPayloads, RuleDecision, SafetyConfig,
     StaticTlsIdentityConfig, TlsTrust, TransportSecurity, TransportTlsConfig,
     UnsupportedExtensions,
 };
@@ -241,6 +246,7 @@ pub(crate) struct StaticCleartextListener {
     pub(crate) request_header_timeout: Duration,
     pub(crate) max_connections: usize,
     pub(crate) max_concurrent_streams: u32,
+    pub(crate) identity_mode: CompiledListenerIdentityMode,
     pub(crate) connect: Option<StaticConnectPolicy>,
 }
 
@@ -252,6 +258,7 @@ pub(crate) struct StaticExplicitHttpsListener {
     pub(crate) request_header_timeout: Duration,
     pub(crate) max_connections: usize,
     pub(crate) max_concurrent_streams: u32,
+    pub(crate) identity_mode: CompiledListenerIdentityMode,
     pub(crate) connect: StaticConnectPolicy,
     pub(crate) tls: CompiledTlsIdentity,
 }
@@ -264,6 +271,16 @@ pub(crate) struct StaticTransparentHttpsListener {
     pub(crate) request_header_timeout: Duration,
     pub(crate) max_connections: usize,
     pub(crate) max_concurrent_streams: u32,
+    pub(crate) identity_mode: CompiledListenerIdentityMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CompiledListenerIdentityMode {
+    #[default]
+    Disabled,
+    Optional,
+    Required,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -333,6 +350,8 @@ pub(crate) struct ReloadableProductPlan {
     pub(crate) request_timeout: Duration,
     pub(crate) max_content_decoding_expansion_ratio: usize,
     pub(crate) forwarding: ForwardingPlan,
+    pub(crate) identity: Option<IdentityPlan>,
+    pub(crate) identity_connection_capacity: HttpConnectionAuthenticationCapacity,
     pub(crate) egress: EgressPlan,
     pub(crate) policy: PolicyPlan,
     pub(crate) authorization: AuthorizationPlan,
@@ -341,6 +360,57 @@ pub(crate) struct ReloadableProductPlan {
     pub(crate) observation: ObservationPlan,
     pub(crate) safety: SafetyPlan,
     pub(crate) resource_plan: CompiledResourcePlan,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct IdentityPlan {
+    pub(crate) max_pending_authentications: usize,
+    pub(crate) authority: AuthorityId,
+    pub(crate) audience: IdentityAudience,
+    pub(crate) principals: Vec<IdentityPrincipalPlan>,
+    pub(crate) groups: Vec<IdentityGroupPlan>,
+    pub(crate) tokens: Vec<IdentityTokenPlan>,
+    pub(crate) resources: access_identity::ResourceProjection,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct IdentityPrincipalPlan {
+    pub(crate) id: PrincipalId,
+    pub(crate) kind: PrincipalKind,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct IdentityGroupPlan {
+    pub(crate) id: GroupId,
+    pub(crate) members: Vec<PrincipalId>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct IdentityTokenPlan {
+    pub(crate) id: TokenId,
+    pub(crate) principal: PrincipalId,
+    pub(crate) source: IdentitySourcePlan,
+}
+
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum IdentitySourcePlan {
+    Environment { variable: String },
+    File { path: PathBuf },
+}
+
+impl fmt::Debug for IdentitySourcePlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Environment { .. } => formatter
+                .debug_struct("Environment")
+                .field("variable", &"[REDACTED]")
+                .finish(),
+            Self::File { .. } => formatter
+                .debug_struct("File")
+                .field("path", &"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -369,6 +439,10 @@ impl fmt::Debug for ReloadableProductPlan {
                 &self.max_content_decoding_expansion_ratio,
             )
             .field("forwarding", &self.forwarding)
+            .field(
+                "identity_connection_capacity",
+                &self.identity_connection_capacity,
+            )
             .field("policy_rule_count", &self.policy.rules.len())
             .field(
                 "authorization_provider_count",
@@ -414,13 +488,12 @@ pub(crate) enum CompiledTlsTrust {
 
 #[derive(Clone)]
 pub(crate) struct ParentProxyPlan {
-    #[cfg(test)]
     pub(crate) kind: CompiledParentProxyKind,
     pub(crate) target: CanonicalUrl,
     pub(crate) tls: Option<ParentProxyTlsPlan>,
+    pub(crate) presentation: Option<IdentitySourcePlan>,
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompiledParentProxyKind {
     AclProxy,
@@ -669,6 +742,7 @@ pub(crate) struct ProcessProviderPlan {
     pub(crate) inherit_environment: bool,
     pub(crate) pass_environment: Vec<String>,
     pub(crate) environment: BTreeMap<String, String>,
+    pub(crate) blocked_environment: Vec<String>,
     pub(crate) include_headers: Vec<HeaderName>,
     pub(crate) include_request_body: bool,
     pub(crate) allow_request_body_replacement: bool,
@@ -920,6 +994,8 @@ pub(super) fn compile_config(
     let endpoint_urls = canonical_endpoint_urls(&config)?;
 
     validate_positive_limits(&config)?;
+    validate_identity(&config)?;
+    validate_protected_identity_locators(&config)?;
     let listener_facts = validate_listener_control_mitm_matrix(&config)?;
     validate_tls_and_parent_matrix(&config, &listener_facts, &endpoint_urls)?;
     let validation = validate_references_and_security_boundaries(&config)?;
@@ -1092,6 +1168,21 @@ fn normalize_authored_paths(
             if let Some(path) = tls.ca_certificate.as_mut() {
                 *path =
                     normalize_authored_path(root, path, "egress.parent_proxy.tls.ca_certificate")?;
+            }
+        }
+        if let Some(ParentProxyPresentationConfig::BearerFile { path }) =
+            parent.presentation.as_ref()
+        {
+            validate_identity_file_locator(path, "egress.parent_proxy.presentation.path")?;
+        }
+    }
+    if let Some(identity) = config.identity.as_mut() {
+        for (index, token) in identity.resolver.tokens.iter().enumerate() {
+            if let super::authoring::StaticIdentityTokenConfig::File { path, .. } = token {
+                validate_identity_file_locator(
+                    path,
+                    &format!("identity.resolver.tokens[{index}].path"),
+                )?;
             }
         }
     }
@@ -1362,6 +1453,613 @@ fn validate_positive_limits(
     validate_logging_capture_limits(config)?;
     validate_provider_limits(config)?;
     validate_redaction_limits(config)?;
+    Ok(())
+}
+
+fn validate_identity(config: &super::authoring::AuthoringConfig) -> Result<(), ConfigCompileError> {
+    const MAX_PENDING_AUTHENTICATIONS: usize = 4_096;
+    const MAX_PENDING_AUTHENTICATIONS_PER_CONNECTION: usize = 256;
+    const MAX_IDENTITY_PRINCIPALS: usize = 4096;
+    const MAX_IDENTITY_GROUPS: usize = 4096;
+    const MAX_IDENTITY_TOKENS: usize = 8192;
+    const MAX_IDENTITY_MEMBERSHIPS: usize = 65_536;
+    const MAX_IDENTITY_GROUPS_PER_PRINCIPAL: usize = 256;
+    for (name, listener) in [
+        (
+            "listeners.transparent_http",
+            config
+                .listeners
+                .transparent_http
+                .as_ref()
+                .map(|value| (&value.endpoint, value.identity.as_ref())),
+        ),
+        (
+            "listeners.transparent_https",
+            config
+                .listeners
+                .transparent_https
+                .as_ref()
+                .map(|value| (&value.endpoint, value.identity.as_ref())),
+        ),
+    ] {
+        let Some((ListenerEndpointConfig::Tcp { .. }, Some(identity))) = listener else {
+            continue;
+        };
+        if !matches!(identity.mode, ListenerIdentityModeConfig::Disabled) {
+            return Err(ConfigCompileError::at(
+                format!("{name}.identity.mode"),
+                "optional or required identity is supported only on a transparent access_flow endpoint",
+            ));
+        }
+    }
+    let enabled_listener = [
+        config
+            .listeners
+            .explicit_http
+            .as_ref()
+            .and_then(|value| value.identity.as_ref()),
+        config
+            .listeners
+            .transparent_http
+            .as_ref()
+            .and_then(|value| value.identity.as_ref()),
+        config
+            .listeners
+            .explicit_https
+            .as_ref()
+            .and_then(|value| value.identity.as_ref()),
+        config
+            .listeners
+            .transparent_https
+            .as_ref()
+            .and_then(|value| value.identity.as_ref()),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|identity| !matches!(identity.mode, ListenerIdentityModeConfig::Disabled));
+
+    let Some(identity) = &config.identity else {
+        if enabled_listener {
+            return Err(ConfigCompileError::at(
+                "identity",
+                "is required when a listener enables identity",
+            ));
+        }
+        return Ok(());
+    };
+    if !enabled_listener {
+        return Err(ConfigCompileError::at(
+            "identity",
+            "requires at least one optional or required identity listener",
+        ));
+    }
+    check_range(
+        "identity.max_pending_authentications",
+        identity.max_pending_authentications,
+        MAX_PENDING_AUTHENTICATIONS,
+    )?;
+    if identity.resolver.principals.len() > MAX_IDENTITY_PRINCIPALS {
+        return Err(ConfigCompileError::at(
+            "identity.resolver.principals",
+            "exceeds the static identity principal limit",
+        ));
+    }
+    if identity.resolver.groups.len() > MAX_IDENTITY_GROUPS {
+        return Err(ConfigCompileError::at(
+            "identity.resolver.groups",
+            "exceeds the static identity group limit",
+        ));
+    }
+    if identity.resolver.tokens.len() > MAX_IDENTITY_TOKENS {
+        return Err(ConfigCompileError::at(
+            "identity.resolver.tokens",
+            "exceeds the static identity token-record limit",
+        ));
+    }
+    check_range(
+        "identity.max_pending_authentications_per_connection",
+        identity.max_pending_authentications_per_connection,
+        MAX_PENDING_AUTHENTICATIONS_PER_CONNECTION,
+    )?;
+    if identity.max_pending_authentications_per_connection > identity.max_pending_authentications {
+        return Err(ConfigCompileError::at(
+            "identity.max_pending_authentications_per_connection",
+            "must not exceed identity.max_pending_authentications",
+        ));
+    }
+
+    AuthorityId::new(identity.resolver.authority.clone()).map_err(|error| {
+        ConfigCompileError::at("identity.resolver.authority", error.to_string())
+    })?;
+    IdentityAudience::new("acl-proxy.identity")
+        .map_err(|error| ConfigCompileError::at("identity.resolver", error.to_string()))?;
+
+    let mut principal_ids = BTreeSet::new();
+    for (index, principal) in identity.resolver.principals.iter().enumerate() {
+        let id = PrincipalId::new(principal.id.clone()).map_err(|error| {
+            ConfigCompileError::at(
+                format!("identity.resolver.principals[{index}].id"),
+                error.to_string(),
+            )
+        })?;
+        if !principal_ids.insert(id) {
+            return Err(ConfigCompileError::at(
+                format!("identity.resolver.principals[{index}].id"),
+                "duplicates an earlier principal",
+            ));
+        }
+    }
+    if principal_ids.is_empty() {
+        return Err(ConfigCompileError::at(
+            "identity.resolver.principals",
+            "must not be empty",
+        ));
+    }
+
+    let mut group_ids = BTreeSet::new();
+    let mut membership_count = 0usize;
+    let mut groups_per_principal = BTreeMap::<PrincipalId, usize>::new();
+    for (index, group) in identity.resolver.groups.iter().enumerate() {
+        let id = GroupId::new(group.id.clone()).map_err(|error| {
+            ConfigCompileError::at(
+                format!("identity.resolver.groups[{index}].id"),
+                error.to_string(),
+            )
+        })?;
+        if !group_ids.insert(id) {
+            return Err(ConfigCompileError::at(
+                format!("identity.resolver.groups[{index}].id"),
+                "duplicates an earlier group",
+            ));
+        }
+        let mut members = BTreeSet::new();
+        for (member_index, member) in group.members.iter().enumerate() {
+            let member = PrincipalId::new(member.clone()).map_err(|error| {
+                ConfigCompileError::at(
+                    format!("identity.resolver.groups[{index}].members[{member_index}]"),
+                    error.to_string(),
+                )
+            })?;
+            if !principal_ids.contains(&member) {
+                return Err(ConfigCompileError::at(
+                    format!("identity.resolver.groups[{index}].members[{member_index}]"),
+                    "references an unknown principal",
+                ));
+            }
+            if !members.insert(member.clone()) {
+                return Err(ConfigCompileError::at(
+                    format!("identity.resolver.groups[{index}].members[{member_index}]"),
+                    "duplicates an earlier member",
+                ));
+            }
+            membership_count = membership_count.checked_add(1).ok_or_else(|| {
+                ConfigCompileError::at(
+                    "identity.resolver.groups",
+                    "identity membership arithmetic overflow",
+                )
+            })?;
+            let principal_group_count = groups_per_principal.entry(member).or_default();
+            *principal_group_count = principal_group_count.checked_add(1).ok_or_else(|| {
+                ConfigCompileError::at(
+                    "identity.resolver.groups",
+                    "identity membership arithmetic overflow",
+                )
+            })?;
+            if *principal_group_count > MAX_IDENTITY_GROUPS_PER_PRINCIPAL {
+                return Err(ConfigCompileError::at(
+                    format!("identity.resolver.groups[{index}].members"),
+                    "a principal exceeds the static identity group-membership limit",
+                ));
+            }
+        }
+    }
+    if membership_count > MAX_IDENTITY_MEMBERSHIPS {
+        return Err(ConfigCompileError::at(
+            "identity.resolver.groups",
+            "exceeds the static identity membership limit",
+        ));
+    }
+
+    let mut token_ids = BTreeSet::new();
+    let mut source_variables = BTreeSet::new();
+    for (index, token) in identity.resolver.tokens.iter().enumerate() {
+        let (id_value, principal_value, variable) = match token {
+            super::authoring::StaticIdentityTokenConfig::Environment {
+                id,
+                principal,
+                variable,
+            } => (id, principal, Some(variable)),
+            super::authoring::StaticIdentityTokenConfig::File { id, principal, .. } => {
+                (id, principal, None)
+            }
+        };
+        let id = TokenId::new(id_value.clone()).map_err(|error| {
+            ConfigCompileError::at(
+                format!("identity.resolver.tokens[{index}].id"),
+                error.to_string(),
+            )
+        })?;
+        if !token_ids.insert(id) {
+            return Err(ConfigCompileError::at(
+                format!("identity.resolver.tokens[{index}].id"),
+                "duplicates an earlier token record",
+            ));
+        }
+        let principal = PrincipalId::new(principal_value.clone()).map_err(|error| {
+            ConfigCompileError::at(
+                format!("identity.resolver.tokens[{index}].principal"),
+                error.to_string(),
+            )
+        })?;
+        if !principal_ids.contains(&principal) {
+            return Err(ConfigCompileError::at(
+                format!("identity.resolver.tokens[{index}].principal"),
+                "references an unknown principal",
+            ));
+        }
+        if let Some(variable) = variable {
+            if !valid_identity_environment_name(variable) {
+                return Err(ConfigCompileError::at(
+                    format!("identity.resolver.tokens[{index}].variable"),
+                    "must use the ACL Proxy identity-token environment namespace",
+                ));
+            }
+            if !source_variables.insert(variable.as_str()) {
+                return Err(ConfigCompileError::at(
+                    format!("identity.resolver.tokens[{index}].variable"),
+                    "duplicates an earlier identity environment source",
+                ));
+            }
+        }
+    }
+    if token_ids.is_empty() {
+        return Err(ConfigCompileError::at(
+            "identity.resolver.tokens",
+            "must not be empty",
+        ));
+    }
+
+    let protected_source_variables = identity_environment_sources(config);
+    for (name, provider) in &config.authorization.providers {
+        let AuthorizationProviderConfig::Process(provider) = provider else {
+            continue;
+        };
+        if provider.inherit_environment && !protected_source_variables.is_empty() {
+            return Err(ConfigCompileError::at(
+                format!("authorization.providers.{name}.inherit_environment"),
+                "must be false when identity token sources are configured",
+            ));
+        }
+        for variable in &provider.pass_environment {
+            if protected_source_variables.contains(variable) {
+                return Err(ConfigCompileError::at(
+                    format!("authorization.providers.{name}.pass_environment"),
+                    "must not expose an identity token source",
+                ));
+            }
+        }
+        for variable in provider.environment.keys() {
+            if protected_source_variables.contains(variable) {
+                return Err(ConfigCompileError::at(
+                    format!("authorization.providers.{name}.environment"),
+                    "must not define an identity token source",
+                ));
+            }
+        }
+    }
+
+    for (name, listener) in [(
+        "listeners.explicit_http",
+        config
+            .listeners
+            .explicit_http
+            .as_ref()
+            .map(|value| (&value.endpoint, value.identity.as_ref())),
+    )] {
+        let Some((ListenerEndpointConfig::Tcp { address }, Some(listener_identity))) = listener
+        else {
+            continue;
+        };
+        if !matches!(listener_identity.mode, ListenerIdentityModeConfig::Disabled)
+            && !address.ip().is_loopback()
+        {
+            return Err(ConfigCompileError::at(
+                format!("{name}.identity.mode"),
+                "identity over cleartext TCP requires a loopback listener",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn identity_environment_sources(config: &super::authoring::AuthoringConfig) -> BTreeSet<String> {
+    config
+        .identity
+        .iter()
+        .flat_map(|identity| identity.resolver.tokens.iter())
+        .filter_map(|token| match token {
+            super::authoring::StaticIdentityTokenConfig::Environment { variable, .. } => {
+                Some(variable.clone())
+            }
+            super::authoring::StaticIdentityTokenConfig::File { .. } => None,
+        })
+        .chain(
+            config
+                .egress
+                .parent_proxy
+                .iter()
+                .filter_map(|parent| match &parent.presentation {
+                    Some(ParentProxyPresentationConfig::BearerEnvironment { variable }) => {
+                        Some(variable.clone())
+                    }
+                    Some(ParentProxyPresentationConfig::BearerFile { .. }) | None => None,
+                }),
+        )
+        .collect()
+}
+
+fn identity_file_sources(config: &super::authoring::AuthoringConfig) -> BTreeSet<PathBuf> {
+    config
+        .identity
+        .iter()
+        .flat_map(|identity| identity.resolver.tokens.iter())
+        .filter_map(|token| match token {
+            super::authoring::StaticIdentityTokenConfig::File { path, .. } => Some(path.clone()),
+            super::authoring::StaticIdentityTokenConfig::Environment { .. } => None,
+        })
+        .chain(
+            config
+                .egress
+                .parent_proxy
+                .iter()
+                .filter_map(|parent| match &parent.presentation {
+                    Some(ParentProxyPresentationConfig::BearerFile { path }) => Some(path.clone()),
+                    Some(ParentProxyPresentationConfig::BearerEnvironment { .. }) | None => None,
+                }),
+        )
+        .collect()
+}
+
+fn validate_protected_identity_locators(
+    config: &super::authoring::AuthoringConfig,
+) -> Result<(), ConfigCompileError> {
+    let protected_environment = identity_environment_sources(config);
+    let protected_files = identity_file_sources(config);
+
+    for (name, provider) in &config.authorization.providers {
+        match provider {
+            AuthorizationProviderConfig::Process(provider) => {
+                if provider.inherit_environment && !protected_environment.is_empty() {
+                    return Err(ConfigCompileError::at(
+                        format!("authorization.providers.{name}.inherit_environment"),
+                        "must be false when identity token sources are configured",
+                    ));
+                }
+                if provider
+                    .pass_environment
+                    .iter()
+                    .any(|source| protected_environment.contains(source))
+                {
+                    return Err(ConfigCompileError::at(
+                        format!("authorization.providers.{name}.pass_environment"),
+                        "must not expose an identity token source",
+                    ));
+                }
+                if provider
+                    .environment
+                    .keys()
+                    .any(|source| protected_environment.contains(source))
+                {
+                    return Err(ConfigCompileError::at(
+                        format!("authorization.providers.{name}.environment"),
+                        "must not define an identity token source",
+                    ));
+                }
+                reject_protected_file_overlap(
+                    &protected_files,
+                    &provider.command,
+                    &format!("authorization.providers.{name}.command"),
+                )?;
+            }
+            AuthorizationProviderConfig::Webhook(provider) => {
+                if let Some(path) = provider
+                    .tls
+                    .as_ref()
+                    .and_then(|tls| tls.ca_certificate.as_ref())
+                {
+                    reject_protected_file_overlap(
+                        &protected_files,
+                        path,
+                        &format!("authorization.providers.{name}.tls.ca_certificate"),
+                    )?;
+                }
+            }
+        }
+    }
+
+    for (name, source) in &config.credentials.sources {
+        let overlaps = match source {
+            CredentialSourceConfig::Environment(source) => {
+                protected_environment.contains(&source.variable)
+            }
+            CredentialSourceConfig::File(source) => protected_files.contains(&source.path),
+        };
+        if overlaps {
+            return Err(ConfigCompileError::at(
+                format!("credentials.sources.{name}"),
+                "must not overlap an identity token source",
+            ));
+        }
+    }
+
+    for (profile_name, profile) in &config.redaction.profiles {
+        for (rule_index, rule) in profile.rules.iter().enumerate() {
+            if rule
+                .literal_environment_variables
+                .iter()
+                .any(|source| protected_environment.contains(source))
+            {
+                return Err(ConfigCompileError::at(
+                    format!("redaction.profiles.{profile_name}.rules[{rule_index}]"),
+                    "must not use an identity token source",
+                ));
+            }
+        }
+    }
+
+    if let Some(tls) = config
+        .control
+        .as_ref()
+        .and_then(|control| control.tls.as_ref())
+    {
+        reject_protected_file_overlap(
+            &protected_files,
+            &tls.certificate_chain,
+            "control.tls.certificate_chain",
+        )?;
+        reject_protected_file_overlap(
+            &protected_files,
+            &tls.private_key,
+            "control.tls.private_key",
+        )?;
+    }
+    if let Some(tls) = config
+        .listeners
+        .explicit_https
+        .as_ref()
+        .map(|listener| &listener.tls)
+    {
+        reject_protected_file_overlap(
+            &protected_files,
+            &tls.certificate_chain,
+            "listeners.explicit_https.tls.certificate_chain",
+        )?;
+        reject_protected_file_overlap(
+            &protected_files,
+            &tls.private_key,
+            "listeners.explicit_https.tls.private_key",
+        )?;
+    }
+    if let Some(MitmConfig::Files(mitm)) = config.mitm.as_ref() {
+        reject_protected_file_overlap(
+            &protected_files,
+            &mitm.ca_certificate,
+            "mitm.ca_certificate",
+        )?;
+        reject_protected_file_overlap(
+            &protected_files,
+            &mitm.ca_private_key,
+            "mitm.ca_private_key",
+        )?;
+    }
+    if let Some(path) = config.egress.origin_tls.ca_certificate.as_ref() {
+        reject_protected_file_overlap(&protected_files, path, "egress.origin_tls.ca_certificate")?;
+    }
+    if let Some(path) = config
+        .egress
+        .parent_proxy
+        .as_ref()
+        .and_then(|parent| parent.tls.as_ref())
+        .and_then(|tls| tls.ca_certificate.as_ref())
+    {
+        reject_protected_file_overlap(
+            &protected_files,
+            path,
+            "egress.parent_proxy.tls.ca_certificate",
+        )?;
+    }
+
+    Ok(())
+}
+
+fn reject_protected_file_overlap(
+    protected_files: &BTreeSet<PathBuf>,
+    candidate: &Path,
+    field: &str,
+) -> Result<(), ConfigCompileError> {
+    if protected_files.contains(candidate) {
+        return Err(ConfigCompileError::at(
+            field,
+            "must not overlap an identity token source",
+        ));
+    }
+    Ok(())
+}
+
+fn valid_identity_environment_name(value: &str) -> bool {
+    if value.len() > 256 {
+        return false;
+    }
+    let Some(middle) = value
+        .strip_prefix("AW_")
+        .and_then(|value| value.strip_suffix("IDENTITY_TOKEN"))
+    else {
+        return false;
+    };
+    let mut remaining = middle;
+    while !remaining.is_empty() {
+        let Some(separator) = remaining.find('_') else {
+            return false;
+        };
+        let segment = &remaining[..separator];
+        if segment.is_empty()
+            || !segment
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        {
+            return false;
+        }
+        remaining = &remaining[separator + 1..];
+    }
+    true
+}
+
+fn validate_identity_file_locator(path: &Path, field: &str) -> Result<(), ConfigCompileError> {
+    const MAX_IDENTITY_PATH_BYTES: usize = 4_096;
+    const MAX_IDENTITY_COMPONENT_BYTES: usize = 255;
+
+    if !path.is_absolute() {
+        return Err(ConfigCompileError::at(
+            field,
+            "must be an already absolute, lexically normalized identity file path",
+        ));
+    }
+    let normalized = lexical_normalize_absolute(path).ok_or_else(|| {
+        ConfigCompileError::at(
+            field,
+            "must be an already absolute, lexically normalized identity file path",
+        )
+    })?;
+    if normalized.as_os_str().as_encoded_bytes() != path.as_os_str().as_encoded_bytes() {
+        return Err(ConfigCompileError::at(
+            field,
+            "must be an already absolute, lexically normalized identity file path",
+        ));
+    }
+    if path.as_os_str().as_encoded_bytes().len() > MAX_IDENTITY_PATH_BYTES {
+        return Err(ConfigCompileError::at(
+            field,
+            "exceeds the identity file path limit",
+        ));
+    }
+    let mut has_leaf = false;
+    for component in path.components() {
+        if let Component::Normal(name) = component {
+            has_leaf = true;
+            if name.as_encoded_bytes().len() > MAX_IDENTITY_COMPONENT_BYTES {
+                return Err(ConfigCompileError::at(
+                    field,
+                    "contains a component over the identity file path component limit",
+                ));
+            }
+        }
+    }
+    if !has_leaf {
+        return Err(ConfigCompileError::at(
+            field,
+            "must identify an identity file",
+        ));
+    }
     Ok(())
 }
 
@@ -2036,6 +2734,22 @@ fn validate_tls_and_parent_matrix(
                     "safety.loop_detection.inject",
                     "must be true when the parent proxy kind is generic",
                 ));
+            }
+            if matches!(parent.kind, ParentProxyKind::Generic) && parent.presentation.is_some() {
+                return Err(ConfigCompileError::at(
+                    "egress.parent_proxy.presentation",
+                    "is valid only for an ACL Proxy parent",
+                ));
+            }
+            if let Some(ParentProxyPresentationConfig::BearerEnvironment { variable }) =
+                &parent.presentation
+            {
+                if !valid_identity_environment_name(variable) {
+                    return Err(ConfigCompileError::at(
+                        "egress.parent_proxy.presentation.variable",
+                        "must use the ACL Proxy identity-token environment namespace",
+                    ));
+                }
             }
         }
     }
@@ -5536,6 +6250,13 @@ fn compile_reloadable_plan(
         request_timeout: config.service.request_timeout.get(),
         max_content_decoding_expansion_ratio: config.service.max_content_decoding_expansion_ratio,
         forwarding: compile_forwarding_plan(&config.service.forwarding),
+        identity: compile_identity_plan(config.identity.as_ref())?,
+        identity_connection_capacity: HttpConnectionAuthenticationCapacity::new(
+            config.identity.as_ref().map_or(1, |identity| {
+                identity.max_pending_authentications_per_connection
+            }),
+        )
+        .expect("identity connection capacity was validated"),
         egress: compile_egress_plan(&config.egress, endpoint_urls.parent_proxy.as_ref())?,
         policy: compile_policy_plan(
             &config.policy,
@@ -5546,6 +6267,7 @@ fn compile_reloadable_plan(
             &config.authorization,
             working_directory,
             &endpoint_urls.webhooks,
+            &identity_environment_sources(config),
         )?,
         credentials: compile_credentials_plan(&config.credentials)?,
         redaction,
@@ -5557,6 +6279,159 @@ fn compile_reloadable_plan(
         safety: compile_safety_plan(&config.safety)?,
         resource_plan,
     })
+}
+
+fn compile_identity_plan(
+    value: Option<&super::authoring::IdentityConfig>,
+) -> Result<Option<IdentityPlan>, ConfigCompileError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.resolver.kind {
+        super::authoring::StaticIdentityResolverKind::Static => {}
+    }
+    let principals = value
+        .resolver
+        .principals
+        .iter()
+        .map(|principal| {
+            Ok(IdentityPrincipalPlan {
+                id: PrincipalId::new(principal.id.clone()).map_err(|error| {
+                    ConfigCompileError::at("identity.resolver.principals", error.to_string())
+                })?,
+                kind: match principal.kind {
+                    IdentityPrincipalKindConfig::User => PrincipalKind::User,
+                    IdentityPrincipalKindConfig::ServiceAccount => PrincipalKind::ServiceAccount,
+                    IdentityPrincipalKindConfig::System => PrincipalKind::System,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, ConfigCompileError>>()?;
+    let groups = value
+        .resolver
+        .groups
+        .iter()
+        .map(|group| {
+            Ok(IdentityGroupPlan {
+                id: GroupId::new(group.id.clone()).map_err(|error| {
+                    ConfigCompileError::at("identity.resolver.groups", error.to_string())
+                })?,
+                members: group
+                    .members
+                    .iter()
+                    .map(|member| {
+                        PrincipalId::new(member.clone()).map_err(|error| {
+                            ConfigCompileError::at(
+                                "identity.resolver.groups.members",
+                                error.to_string(),
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            })
+        })
+        .collect::<Result<Vec<_>, ConfigCompileError>>()?;
+    let tokens = value
+        .resolver
+        .tokens
+        .iter()
+        .map(|token| {
+            let (id, principal, source) = match token {
+                super::authoring::StaticIdentityTokenConfig::Environment {
+                    id,
+                    principal,
+                    variable,
+                } => (
+                    id,
+                    principal,
+                    IdentitySourcePlan::Environment {
+                        variable: variable.clone(),
+                    },
+                ),
+                super::authoring::StaticIdentityTokenConfig::File {
+                    id,
+                    principal,
+                    path,
+                } => (
+                    id,
+                    principal,
+                    IdentitySourcePlan::File { path: path.clone() },
+                ),
+            };
+            Ok(IdentityTokenPlan {
+                id: TokenId::new(id.clone()).map_err(|error| {
+                    ConfigCompileError::at("identity.resolver.tokens", error.to_string())
+                })?,
+                principal: PrincipalId::new(principal.clone()).map_err(|error| {
+                    ConfigCompileError::at("identity.resolver.tokens", error.to_string())
+                })?,
+                source,
+            })
+        })
+        .collect::<Result<Vec<_>, ConfigCompileError>>()?;
+    let authority = AuthorityId::new(value.resolver.authority.clone()).map_err(|error| {
+        ConfigCompileError::at("identity.resolver.authority", error.to_string())
+    })?;
+    let audience = IdentityAudience::new("acl-proxy.identity")
+        .map_err(|error| ConfigCompileError::at("identity.resolver", error.to_string()))?;
+    let resources =
+        project_identity_resources(&authority, &audience, &principals, &groups, &tokens)?;
+    Ok(Some(IdentityPlan {
+        max_pending_authentications: value.max_pending_authentications,
+        authority,
+        audience,
+        resources,
+        principals,
+        groups,
+        tokens,
+    }))
+}
+
+fn project_identity_resources(
+    authority: &AuthorityId,
+    audience: &IdentityAudience,
+    principals: &[IdentityPrincipalPlan],
+    groups: &[IdentityGroupPlan],
+    tokens: &[IdentityTokenPlan],
+) -> Result<access_identity::ResourceProjection, ConfigCompileError> {
+    let principals = principals
+        .iter()
+        .map(|principal| StaticPrincipal {
+            id: principal.id.clone(),
+            kind: principal.kind,
+        })
+        .collect::<Vec<_>>();
+    let groups = groups
+        .iter()
+        .map(|group| StaticGroup {
+            id: group.id.clone(),
+            members: group.members.clone().into_boxed_slice(),
+        })
+        .collect::<Vec<_>>();
+    let token_principals = tokens
+        .iter()
+        .map(|token| token.principal.clone())
+        .collect::<Vec<_>>();
+    project_static_resolver_resources(authority, audience, &principals, &groups, &token_principals)
+        .map_err(|error| {
+            ConfigCompileError::at(
+                "identity.resolver",
+                format!("identity resource projection failed: {error}"),
+            )
+        })
+}
+
+#[cfg(test)]
+pub(crate) fn project_identity_resources_for_test(
+    authority: &AuthorityId,
+    principals: &[IdentityPrincipalPlan],
+    groups: &[IdentityGroupPlan],
+    tokens: &[IdentityTokenPlan],
+) -> access_identity::ResourceProjection {
+    let audience = IdentityAudience::new("acl-proxy.identity")
+        .expect("the product identity audience is a checked constant");
+    project_identity_resources(authority, &audience, principals, groups, tokens)
+        .expect("checked identity test metadata projects")
 }
 
 fn compile_forwarding_plan(value: &super::authoring::ForwardingConfig) -> ForwardingPlan {
@@ -5626,7 +6501,6 @@ fn compile_parent_proxy_plan(
     target: &CanonicalUrl,
 ) -> ParentProxyPlan {
     ParentProxyPlan {
-        #[cfg(test)]
         kind: match value.kind {
             ParentProxyKind::AclProxy => CompiledParentProxyKind::AclProxy,
             ParentProxyKind::Generic => CompiledParentProxyKind::Generic,
@@ -5640,6 +6514,19 @@ fn compile_parent_proxy_plan(
                 .clone()
                 .unwrap_or_else(|| target.authority().host().as_str().to_owned()),
         }),
+        presentation: value
+            .presentation
+            .as_ref()
+            .map(|presentation| match presentation {
+                ParentProxyPresentationConfig::BearerEnvironment { variable } => {
+                    IdentitySourcePlan::Environment {
+                        variable: variable.clone(),
+                    }
+                }
+                ParentProxyPresentationConfig::BearerFile { path } => {
+                    IdentitySourcePlan::File { path: path.clone() }
+                }
+            }),
     }
 }
 
@@ -5903,13 +6790,20 @@ fn compile_authorization_plan(
     value: &AuthorizationConfig,
     working_directory: &Path,
     webhook_urls: &BTreeMap<String, CanonicalUrl>,
+    blocked_environment: &BTreeSet<String>,
 ) -> Result<AuthorizationPlan, ConfigCompileError> {
     let providers = value
         .providers
         .iter()
         .map(|(name, provider)| {
-            compile_provider_plan(name, provider, working_directory, webhook_urls)
-                .map(|provider| (name.clone(), provider))
+            compile_provider_plan(
+                name,
+                provider,
+                working_directory,
+                webhook_urls,
+                blocked_environment,
+            )
+            .map(|provider| (name.clone(), provider))
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
     Ok(AuthorizationPlan {
@@ -5936,6 +6830,7 @@ fn compile_provider_plan(
     value: &AuthorizationProviderConfig,
     working_directory: &Path,
     webhook_urls: &BTreeMap<String, CanonicalUrl>,
+    blocked_environment: &BTreeSet<String>,
 ) -> Result<AuthorizationProviderPlan, ConfigCompileError> {
     let prefix = format!("authorization.providers.{name}");
     Ok(match value {
@@ -5970,6 +6865,7 @@ fn compile_provider_plan(
                 inherit_environment: value.inherit_environment,
                 pass_environment: value.pass_environment.clone(),
                 environment: value.environment.clone(),
+                blocked_environment: blocked_environment.iter().cloned().collect(),
                 include_headers: compile_header_names(
                     &value.include_headers,
                     &format!("{prefix}.include_headers"),
@@ -6414,6 +7310,7 @@ fn compile_listeners(value: &ListenersConfig) -> StaticListenersConfig {
                 request_header_timeout: listener.request_header_timeout.get(),
                 max_connections: listener.max_connections,
                 max_concurrent_streams: listener.max_concurrent_streams,
+                identity_mode: compile_listener_identity_mode(listener.identity.as_ref()),
                 connect: Some(compile_connect(&listener.connect)),
             }),
         transparent_http: value
@@ -6425,6 +7322,7 @@ fn compile_listeners(value: &ListenersConfig) -> StaticListenersConfig {
                 request_header_timeout: listener.request_header_timeout.get(),
                 max_connections: listener.max_connections,
                 max_concurrent_streams: listener.max_concurrent_streams,
+                identity_mode: compile_listener_identity_mode(listener.identity.as_ref()),
                 connect: None,
             }),
         explicit_https: value
@@ -6437,6 +7335,7 @@ fn compile_listeners(value: &ListenersConfig) -> StaticListenersConfig {
                 request_header_timeout: listener.request_header_timeout.get(),
                 max_connections: listener.max_connections,
                 max_concurrent_streams: listener.max_concurrent_streams,
+                identity_mode: compile_listener_identity_mode(listener.identity.as_ref()),
                 connect: compile_connect(&listener.connect),
                 tls: compile_tls_identity(&listener.tls),
             }),
@@ -6448,8 +7347,19 @@ fn compile_listeners(value: &ListenersConfig) -> StaticListenersConfig {
                 request_header_timeout: listener.request_header_timeout.get(),
                 max_connections: listener.max_connections,
                 max_concurrent_streams: listener.max_concurrent_streams,
+                identity_mode: compile_listener_identity_mode(listener.identity.as_ref()),
             }
         }),
+    }
+}
+
+fn compile_listener_identity_mode(
+    value: Option<&super::authoring::ListenerIdentityConfig>,
+) -> CompiledListenerIdentityMode {
+    match value.map(|value| value.mode) {
+        None | Some(ListenerIdentityModeConfig::Disabled) => CompiledListenerIdentityMode::Disabled,
+        Some(ListenerIdentityModeConfig::Optional) => CompiledListenerIdentityMode::Optional,
+        Some(ListenerIdentityModeConfig::Required) => CompiledListenerIdentityMode::Required,
     }
 }
 
@@ -6553,6 +7463,7 @@ fn base_protected_headers() -> BTreeSet<&'static str> {
         "upgrade",
         "content-length",
         "content-encoding",
+        http_access_types::HTTP_IDENTITY_TOKEN_HEADER,
     ])
 }
 
@@ -6743,6 +7654,478 @@ path = "{oversized_component}"
         assert!(error
             .to_string()
             .contains("contains a component over the credential path component limit"));
+    }
+
+    fn identity_config(token_source: &str) -> String {
+        format!(
+            r#"
+schema_version = 3
+
+[listeners.explicit_http]
+endpoint.kind = "tcp"
+endpoint.address = "127.0.0.1:8881"
+http_versions = ["http1"]
+
+[listeners.explicit_http.identity]
+mode = "required"
+
+[listeners.explicit_http.connect]
+http1 = "deny"
+
+[identity]
+max_pending_authentications = 8
+max_pending_authentications_per_connection = 2
+
+[identity.resolver]
+kind = "static"
+authority = "test-authority"
+
+[[identity.resolver.principals]]
+id = "test-principal"
+kind = "service_account"
+
+[[identity.resolver.tokens]]
+id = "test-token"
+principal = "test-principal"
+{token_source}
+
+[policy]
+default = "deny"
+"#
+        )
+    }
+
+    fn environment_identity_config(variable: &str) -> String {
+        identity_config(&format!(
+            "source = \"environment\"\nvariable = {variable:?}"
+        ))
+    }
+
+    fn file_identity_config(path: &str) -> String {
+        identity_config(&format!("source = \"file\"\npath = {path:?}"))
+    }
+
+    #[test]
+    fn identity_environment_names_enforce_the_acl_proxy_contract_and_bound() {
+        let exact = format!(
+            "AW_{}_IDENTITY_TOKEN",
+            "A".repeat(256 - "AW__IDENTITY_TOKEN".len())
+        );
+        assert_eq!(exact.len(), 256);
+        for accepted in [
+            "AW_IDENTITY_TOKEN".to_owned(),
+            "AW_CONTAINER_A_IDENTITY_TOKEN".to_owned(),
+            "AW_7_IDENTITY_TOKEN".to_owned(),
+            exact.clone(),
+        ] {
+            compile(&environment_identity_config(&accepted))
+                .unwrap_or_else(|error| panic!("valid identity name {accepted} failed: {error}"));
+        }
+
+        for rejected in [
+            "IDENTITY_TOKEN".to_owned(),
+            "AW_ACCESS_FLOW_TOKEN".to_owned(),
+            "AW_container_IDENTITY_TOKEN".to_owned(),
+            "AW__IDENTITY_TOKEN".to_owned(),
+            "AW_CONTAINER__IDENTITY_TOKEN".to_owned(),
+            format!("{exact}A"),
+        ] {
+            let error = compile(&environment_identity_config(&rejected))
+                .expect_err("invalid identity environment name must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("identity.resolver.tokens[0].variable"),
+                "unexpected error for {rejected}: {error}"
+            );
+            assert!(
+                !error.to_string().contains(&rejected),
+                "secret locator leaked in error: {error}"
+            );
+        }
+
+        let parent_only = MINIMAL.replace(
+            "[policy]",
+            r#"[egress]
+route = "parent_proxy"
+
+[egress.parent_proxy]
+kind = "acl_proxy"
+url = "http://192.0.2.10:8080"
+
+[egress.parent_proxy.presentation]
+kind = "bearer_environment"
+variable = "AW_ACCESS_FLOW_TOKEN"
+
+[policy]"#,
+        );
+        let error = compile(&parent_only).expect_err("typed parent uses the ACL Proxy name rule");
+        assert!(
+            error
+                .to_string()
+                .contains("egress.parent_proxy.presentation.variable"),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("AW_ACCESS_FLOW_TOKEN"));
+    }
+
+    #[test]
+    fn identity_file_locators_require_exact_absolute_normalized_bounds() {
+        let exact = format!(
+            "/{}",
+            (0..16)
+                .map(|_| "p".repeat(MAX_CREDENTIAL_FILE_COMPONENT_BYTES))
+                .collect::<Vec<_>>()
+                .join("/")
+        );
+        assert_eq!(exact.len(), MAX_CREDENTIAL_FILE_PATH_BYTES);
+        compile(&file_identity_config(&exact)).unwrap();
+
+        for rejected in [
+            "relative/token".to_owned(),
+            "/etc/acl-proxy/../token".to_owned(),
+            "/etc//acl-proxy/token".to_owned(),
+            "/etc/./acl-proxy/token".to_owned(),
+            "/etc/acl-proxy/token/".to_owned(),
+            "/".to_owned(),
+            format!("/{}", "p".repeat(MAX_CREDENTIAL_FILE_COMPONENT_BYTES + 1)),
+            format!("{exact}p"),
+        ] {
+            let error = compile(&file_identity_config(&rejected))
+                .expect_err("invalid identity file locator must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("identity.resolver.tokens[0].path"),
+                "unexpected error for identity path: {error}"
+            );
+            assert!(
+                !error.to_string().contains(&rejected),
+                "identity path leaked in error: {error}"
+            );
+        }
+
+        let parent_relative = MINIMAL.replace(
+            "[policy]",
+            r#"[egress]
+route = "parent_proxy"
+
+[egress.parent_proxy]
+kind = "acl_proxy"
+url = "http://192.0.2.10:8080"
+
+[egress.parent_proxy.presentation]
+kind = "bearer_file"
+path = "relative/token"
+
+[policy]"#,
+        );
+        let error = compile(&parent_relative)
+            .expect_err("typed parent identity files are not rooted generically");
+        assert!(
+            error
+                .to_string()
+                .contains("egress.parent_proxy.presentation.path"),
+            "{error}"
+        );
+
+        let parent_redundant_separator = parent_relative.replace(
+            "path = \"relative/token\"",
+            "path = \"/etc//acl-proxy/parent-token\"",
+        );
+        let error = compile(&parent_redundant_separator)
+            .expect_err("typed parent identity paths require exact canonical bytes");
+        assert!(
+            error
+                .to_string()
+                .contains("egress.parent_proxy.presentation.path"),
+            "{error}"
+        );
+        assert!(
+            !error.to_string().contains("/etc//acl-proxy/parent-token"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn identity_capacity_and_listener_usage_are_strict() {
+        let baseline = environment_identity_config("AW_IDENTITY_TOKEN");
+        for (needle, replacement, expected_path) in [
+            (
+                "max_pending_authentications = 8",
+                "max_pending_authentications = 0",
+                "identity.max_pending_authentications",
+            ),
+            (
+                "max_pending_authentications = 8",
+                "max_pending_authentications = 4097",
+                "identity.max_pending_authentications",
+            ),
+            (
+                "max_pending_authentications_per_connection = 2",
+                "max_pending_authentications_per_connection = 257",
+                "identity.max_pending_authentications_per_connection",
+            ),
+            (
+                "max_pending_authentications_per_connection = 2",
+                "max_pending_authentications_per_connection = 9",
+                "identity.max_pending_authentications_per_connection",
+            ),
+        ] {
+            let error = compile(&baseline.replacen(needle, replacement, 1))
+                .expect_err("invalid identity capacity must fail");
+            assert!(error.to_string().contains(expected_path), "{error}");
+        }
+
+        let unused = baseline.replace("mode = \"required\"", "mode = \"disabled\"");
+        let error = compile(&unused).expect_err("an unused resolver must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("requires at least one optional or required identity listener"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn transparent_tcp_rejects_identity_before_static_listener_compilation() {
+        let baseline = environment_identity_config("AW_TRANSPARENT_TCP_IDENTITY_TOKEN")
+            .replace("mode = \"required\"", "mode = \"disabled\"");
+        for listener in ["transparent_http", "transparent_https"] {
+            for mode in ["optional", "required"] {
+                let candidate = baseline.replace(
+                    "[policy]",
+                    &format!(
+                        r#"[listeners.{listener}]
+endpoint.kind = "tcp"
+endpoint.address = "127.0.0.1:8899"
+http_versions = ["http1"]
+
+[listeners.{listener}.identity]
+mode = "{mode}"
+
+[policy]"#
+                    ),
+                );
+                let error = compile(&candidate)
+                    .expect_err("transparent TCP cannot carry an authenticated identity");
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("listeners.{listener}.identity.mode")),
+                    "{error}"
+                );
+                assert!(
+                    error
+                        .to_string()
+                        .contains("only on a transparent access_flow endpoint"),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transparent_access_flow_compiles_enabled_identity_into_static_listener() {
+        let input = environment_identity_config("AW_TRANSPARENT_ACCESS_FLOW_IDENTITY_TOKEN")
+            .replace("mode = \"required\"", "mode = \"disabled\"");
+        let input = input.replace(
+            "[policy]",
+            r#"[listeners.transparent_http]
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
+endpoint.allowed_destination_ports = [80]
+http_versions = ["http1"]
+
+[listeners.transparent_http.identity]
+mode = "required"
+
+[listeners.transparent_http.endpoint.transport]
+kind = "unix"
+path = "/tmp/acl-proxy-identity-access-flow.sock"
+mode = "0600"
+
+[policy]"#,
+        );
+        let compiled = compile(&input).expect("transparent Access Flow supports identity");
+        let listener = compiled
+            .static_config
+            .listeners
+            .transparent_http
+            .expect("compiled transparent listener");
+        assert_eq!(
+            listener.identity_mode,
+            CompiledListenerIdentityMode::Required
+        );
+        assert!(matches!(
+            listener.endpoint,
+            StaticListenerEndpoint::AccessFlow { .. }
+        ));
+    }
+
+    #[test]
+    fn identity_locators_can_be_shared_only_by_resolver_and_typed_parent() {
+        let variable = "AW_SHARED_IDENTITY_TOKEN";
+        let baseline = environment_identity_config(variable);
+        let parent = format!(
+            r#"
+[egress]
+route = "parent_proxy"
+
+[egress.parent_proxy]
+kind = "acl_proxy"
+url = "http://192.0.2.10:8080"
+
+[egress.parent_proxy.presentation]
+kind = "bearer_environment"
+variable = "{variable}"
+
+"#
+        );
+        let shared = baseline.replace("[policy]", &format!("{parent}[policy]"));
+        compile(&shared).expect("resolver and typed parent may share one locator");
+
+        let ordinary_surfaces = [
+            format!(
+                r#"[credentials.sources.overlap]
+source = "environment"
+variable = "{variable}"
+
+"#
+            ),
+            format!(
+                r#"[redaction.profiles.overlap]
+rules = [{{ literal_environment_variables = ["{variable}"] }}]
+
+"#
+            ),
+            format!(
+                r#"[authorization.providers.overlap]
+kind = "process"
+command = "/bin/true"
+inherit_environment = false
+pass_environment = ["{variable}"]
+
+"#
+            ),
+            format!(
+                r#"[authorization.providers.overlap]
+kind = "process"
+command = "/bin/true"
+inherit_environment = false
+environment = {{ {variable} = "not-the-bearer" }}
+
+"#
+            ),
+        ];
+        for ordinary in ordinary_surfaces {
+            let error = compile(&shared.replace("[policy]", &format!("{ordinary}[policy]")))
+                .expect_err("ordinary surfaces must not reuse identity locators");
+            assert!(
+                error.to_string().contains("must not"),
+                "unexpected protected-locator error: {error}"
+            );
+            assert!(
+                !error.to_string().contains(variable),
+                "identity locator leaked in error: {error}"
+            );
+        }
+
+        let inherited = r#"[authorization.providers.overlap]
+kind = "process"
+command = "/bin/true"
+inherit_environment = true
+
+"#;
+        let error = compile(&shared.replace("[policy]", &format!("{inherited}[policy]")))
+            .expect_err("whole-environment inheritance must fail with identity locators");
+        assert!(
+            error
+                .to_string()
+                .contains("inherit_environment: must be false"),
+            "{error}"
+        );
+
+        let path = "/etc/acl-proxy/shared-identity-token";
+        let file_baseline = file_identity_config(path);
+        let file_parent = format!(
+            r#"
+[egress]
+route = "parent_proxy"
+
+[egress.parent_proxy]
+kind = "acl_proxy"
+url = "http://192.0.2.10:8080"
+
+[egress.parent_proxy.presentation]
+kind = "bearer_file"
+path = "{path}"
+
+"#
+        );
+        let shared_file = file_baseline.replace("[policy]", &format!("{file_parent}[policy]"));
+        compile(&shared_file).expect("resolver and typed parent may share one file locator");
+        let generic_file = format!(
+            r#"[credentials.sources.overlap]
+source = "file"
+path = "{path}"
+
+"#
+        );
+        let error = compile(&shared_file.replace("[policy]", &format!("{generic_file}[policy]")))
+            .expect_err("generic credential file must not reuse identity locator");
+        assert!(
+            error
+                .to_string()
+                .contains("must not overlap an identity token source"),
+            "{error}"
+        );
+        assert!(!error.to_string().contains(path), "{error}");
+
+        let process_command = r#"[authorization.providers.overlap]
+kind = "process"
+command = "shared-identity-token"
+
+"#;
+        let error =
+            compile(&shared_file.replace("[policy]", &format!("{process_command}[policy]")))
+                .expect_err("normalized process command must not reuse an identity locator");
+        assert!(
+            error
+                .to_string()
+                .contains("authorization.providers.overlap.command"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("must not overlap an identity token source"),
+            "{error}"
+        );
+        assert!(!error.to_string().contains(path), "{error}");
+
+        let origin_ca = r#"[egress.origin_tls]
+trust = "custom"
+ca_certificate = "shared-identity-token"
+http_versions = ["http1"]
+
+"#;
+        let error = compile(&shared_file.replace("[policy]", &format!("{origin_ca}[policy]")))
+            .expect_err("normalized TLS CA input must not reuse an identity locator");
+        assert!(
+            error
+                .to_string()
+                .contains("egress.origin_tls.ca_certificate"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("must not overlap an identity token source"),
+            "{error}"
+        );
+        assert!(!error.to_string().contains(path), "{error}");
     }
 
     fn compile(toml: &str) -> Result<CompiledProductConfig, ConfigCompileError> {
@@ -9121,6 +10504,23 @@ filename = "{{requestId}}-{{suffix}}.json"
     }
 
     #[test]
+    fn per_connection_identity_capacity_is_reloadable_not_resolver_metadata() {
+        let first = compile(&environment_identity_config("AW_IDENTITY_TOKEN")).unwrap();
+        let changed = compile(&environment_identity_config("AW_IDENTITY_TOKEN").replace(
+            "max_pending_authentications_per_connection = 2",
+            "max_pending_authentications_per_connection = 7",
+        ))
+        .unwrap();
+        assert_eq!(first.static_fingerprint, changed.static_fingerprint);
+        assert!(first.reloadable_plan.identity == changed.reloadable_plan.identity);
+        assert_eq!(first.reloadable_plan.identity_connection_capacity.get(), 2);
+        assert_eq!(
+            changed.reloadable_plan.identity_connection_capacity.get(),
+            7
+        );
+    }
+
+    #[test]
     fn static_fingerprint_changes_with_listener_bind() {
         let first = compile(MINIMAL).unwrap();
         let changed = compile(&MINIMAL.replace("127.0.0.1:8881", "127.0.0.1:9999")).unwrap();
@@ -9761,14 +11161,51 @@ urls = ["https://192.0.2.10/**"]"#,
         const PROVIDER_VALUE: &str = "provider-environment-value-86ac";
         const REDACTION_LITERAL: &str = "redaction-authored-literal-153e";
         const REDACTION_SOURCE: &str = "REDACTION_ENV_SOURCE_24F8";
+        const IDENTITY_ENV_LOCATOR: &str = "AW_REDACTION_TEST_IDENTITY_TOKEN";
+        const PARENT_FILE_LOCATOR: &str = "/etc/acl-proxy/parent-identity-file-locator-a45e";
 
         let input = MINIMAL.replace(
             "[policy]",
             &format!(
-                r#"[authorization.providers.local]
+                r#"[listeners.explicit_http.identity]
+mode = "required"
+
+[authorization.providers.local]
 kind = "process"
 command = "/bin/true"
 environment = {{ PROVIDER_MARKER = "{PROVIDER_VALUE}" }}
+
+[identity]
+max_pending_authentications = 8
+max_pending_authentications_per_connection = 2
+
+[identity.resolver]
+kind = "static"
+authority = "redaction-test"
+
+[[identity.resolver.principals]]
+id = "redaction-test-principal"
+kind = "system"
+
+[[identity.resolver.tokens]]
+id = "redaction-test-token"
+principal = "redaction-test-principal"
+source = "environment"
+variable = "{IDENTITY_ENV_LOCATOR}"
+
+[egress]
+route = "parent_proxy"
+
+[egress.parent_proxy]
+kind = "acl_proxy"
+url = "https://parent.example.test:8443"
+
+[egress.parent_proxy.presentation]
+kind = "bearer_file"
+path = "{PARENT_FILE_LOCATOR}"
+
+[egress.parent_proxy.tls]
+trust = "system"
 
 [credentials.sources.environment]
 source = "environment"
@@ -9793,10 +11230,27 @@ rules = [{{ literals = ["{REDACTION_LITERAL}"], literal_environment_variables = 
             PROVIDER_VALUE,
             REDACTION_LITERAL,
             REDACTION_SOURCE,
+            IDENTITY_ENV_LOCATOR,
+            PARENT_FILE_LOCATOR,
         ] {
             assert!(!candidate_debug.contains(marker), "{candidate_debug}");
             assert!(!plan_debug.contains(marker), "{plan_debug}");
         }
+        let identity_debug = format!(
+            "{:?} {:?}",
+            IdentitySourcePlan::Environment {
+                variable: IDENTITY_ENV_LOCATOR.to_owned()
+            },
+            IdentitySourcePlan::File {
+                path: PathBuf::from(PARENT_FILE_LOCATOR)
+            }
+        );
+        assert!(!identity_debug.contains(IDENTITY_ENV_LOCATOR));
+        assert!(!identity_debug.contains(PARENT_FILE_LOCATOR));
+        assert_eq!(
+            identity_debug,
+            "Environment { variable: \"[REDACTED]\" } File { path: \"[REDACTED]\" }"
+        );
         assert!(candidate_debug.contains("credential_source_count"));
         assert!(candidate_debug.contains("redaction_profile_count"));
     }
@@ -9928,7 +11382,10 @@ trust = "insecure"
 
         let (neutral, _) = activation.into_parts();
         let (_, _, route, _, _) = neutral.into_parts();
-        assert!(matches!(route, http_access_types::Route::Parent { .. }));
+        assert!(matches!(
+            route,
+            http_access_types::Route::AclProxyParent { .. }
+        ));
     }
 
     #[test]
@@ -9976,6 +11433,7 @@ public_url = "http://[::1]:8898/_acl-proxy/external-auth/callback"
                 "upgrade",
                 "content-length",
                 "content-encoding",
+                "x-aw-identity-token",
             ])
         );
         for header in ["proxy-authenticate", "content-length", "content-encoding"] {
@@ -10519,7 +11977,7 @@ decision = "allow"
 x-aw-identity-token = ["secret"]"#,
         );
         let error = compile(&input).expect_err("inbound credential values are not predicates");
-        assert!(error.to_string().contains("credential-bearing"));
+        assert!(error.to_string().contains("reserved by the proxy"));
     }
 
     #[test]

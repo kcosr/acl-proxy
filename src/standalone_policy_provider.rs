@@ -95,8 +95,15 @@ impl StandaloneRequestFactory for ProductStandaloneRequestFactory {
         Box::pin(async move {
             let started_at = Instant::now();
             let listener_transport = ingress.listener_transport();
-            let (facts, peer, peer_is_local, listener_connect_denied, body, private_fields) =
-                ingress.into_parts();
+            let (
+                facts,
+                peer,
+                peer_is_local,
+                listener_connect_denied,
+                identity,
+                body,
+                private_fields,
+            ) = ingress.into_parts();
             let lease = self
                 .runtime
                 .lease()
@@ -160,6 +167,7 @@ impl StandaloneRequestFactory for ProductStandaloneRequestFactory {
                 cancellation: ProductForwardingCancellation::new(),
                 clock,
                 listener_denied: listener_connect_denied,
+                _identity: identity,
                 decision_target: Arc::clone(&self.observation).into(),
                 capture,
             };
@@ -231,6 +239,7 @@ struct StandaloneProviderInput {
     pub(crate) cancellation: ProductForwardingCancellation,
     pub(crate) clock: Arc<TokioRuntimeClock>,
     pub(crate) listener_denied: bool,
+    pub(crate) _identity: Arc<access_identity::IdentityContext>,
     pub(crate) decision_target: DecisionSubmissionTarget,
     pub(crate) capture: HttpCaptureContext,
 }
@@ -516,6 +525,7 @@ impl StandalonePolicyProvider {
             cancellation,
             clock,
             listener_denied,
+            _identity,
             decision_target,
             capture,
         } = input;

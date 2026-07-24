@@ -561,6 +561,7 @@ mod tests {
             HttpProtocolSet::new(vec![HttpProtocol::Http1]).unwrap(),
             TlsTrust::Insecure,
             route,
+            None,
             &snapshot,
             &ForwardingCancellation::new(),
         )
@@ -743,7 +744,7 @@ mod tests {
         let endpoint = listener.local_addr().unwrap();
         let parent = semantic_url(HttpScheme::Http, "parent.example", endpoint.port(), "/");
         let origin = semantic_url(HttpScheme::Https, "origin.example", 443, "/rejected");
-        let route = Route::Parent {
+        let route = Route::GenericParent {
             target: parent.clone(),
             security: TransportSecurity::Cleartext,
         };

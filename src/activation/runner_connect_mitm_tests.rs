@@ -453,7 +453,7 @@ async fn connect_mitm_outer_tunnel_omits_global_origin_credentials() {
         let mut stream = acceptor.accept(stream).await.unwrap();
         let request = read_http_message(&mut stream).await;
         let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
-        assert!(request.contains("\r\nx-aw-identity-token: inner-identity\r\n"));
+        assert!(request.contains("\r\nx-origin-credential: inner-identity\r\n"));
         stream
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\ncredentialized",
@@ -468,11 +468,11 @@ async fn connect_mitm_outer_tunnel_omits_global_origin_credentials() {
         r#"[[egress.credential_actions]]
 kind = "custom_header"
 transport_security = "tls_required"
-header = "x-aw-identity-token"
+header = "x-origin-credential"
 credential = "outer_identity"
 
 [credentials]
-allowed_custom_headers = ["x-aw-identity-token"]
+allowed_custom_headers = ["x-origin-credential"]
 
 [credentials.sources.outer_identity]
 source = "environment"

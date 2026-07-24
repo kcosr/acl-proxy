@@ -374,7 +374,9 @@ fn compile_header_predicates(
             .map(neutral_header_name)
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
-            .map(HeaderPredicate::present),
+            .map(HeaderPredicate::present)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ProductAclCompileError::InvalidCheckedValue)?,
     );
     for predicate in &plan.all {
         predicates.push(compile_value_predicate(predicate, true)?);

@@ -30,12 +30,12 @@ negative tests. They are not production byte copies.
 
 | Role | V3 rules | V3 patterns | Actions | Scheme intent |
 | --- | ---: | ---: | --- | --- |
-| host TCP | 45 | 134 | 37 allow, 7 deny, 1 delegate | 118 HTTPS, 13 HTTP, 3 catchall |
+| host TCP | 44 | 133 | 37 allow, 6 deny, 1 delegate | 118 HTTPS, 13 HTTP, 2 catchall |
 | host UDS workstation | 1 | 1 | 1 allow | catchall under fixed workstation identity |
 | common container | 1 | 1 | 1 allow | catchall |
 | internal container | 8 | 12 | 8 allow | 11 HTTPS, 1 HTTP |
 
-The host fixture has 22 method-constrained rules, 8 header-predicate rules, and
+The host fixture has 22 method-constrained rules, no header-predicate rules, and
 4 wire-redaction rules. The v3 fixture preserves source-rule order,
 HTTP-versus-HTTPS intent, method boundaries, and provider placement. The host
 adds one CONNECT-only bootstrap rule because parent CONNECT control requests
@@ -55,8 +55,8 @@ below.
 | container CA certificate/key paths | explicit file MITM mode; tests generate non-checked-in material |
 | parent host and port | `route = "parent_proxy"`, `kind = "acl_proxy"`, and one canonical HTTP URL |
 | loop protection enabled with inner add-header false | unconditional detection with `inject = false` only for the `acl_proxy` child |
-| remove identity then set it from an environment placeholder | one typed environment credential source and one replacing custom-header credential action |
-| host identity header removal | typed inbound credential boundary strips identity automatically |
+| remove identity then set it from an environment placeholder | one typed static identity token source, required listener identity, and typed ACL Proxy parent presentation |
+| host identity header removal | protected carrier extraction authenticates before policy and the bearer cannot enter ordinary header configuration |
 | literal policy-context injection/removal | declared internal-context header with exactly one unconditional global set or remove action |
 | policy `action`, `pattern`/`patterns`, and implicit IDs | ordered `decision` plus one `urls` array and stable source-index IDs |
 | context value used as a policy predicate | removed as an authentication input; sanitized CIDRs retain ordering/blast-radius intent and the Git provider validates the exact identity/context pair |
@@ -71,7 +71,8 @@ below.
 The context change is intentional security hardening. The internal fixture
 injects the invented value `fixture-internal`. The host declares a consuming
 role, strips the context before origin egress, and passes it only to the Git
-process provider together with typed inbound identity. Local policy does not
+process provider. The raw identity bearer is never projected to a provider;
+checked identity projection is introduced separately. Local policy does not
 trust an internal-context value. Sanitized benchmark CIDRs preserve the source
 rule groups without claiming that a source address authenticates a workload.
 
@@ -87,10 +88,11 @@ rule groups without claiming that a source address authenticates a workload.
 The source scripts use `#!/usr/bin/env python3`, `--config` with a relative JSON
 file, newline-delimited JSON on stdin/stdout, stable request IDs, and only
 `allow` or `deny`. Missing and unknown identities deny with a normal response.
-The active Git provider receives identity and context. The configured but
-inactive runner provider receives identity only. Synthetic providers preserve
-that protocol and failure posture without reproducing source code or private
-authorization data.
+The active Git provider currently receives context only. The configured but
+inactive runner provider receives no headers. Both therefore deny identity-
+dependent requests until checked identity projection is introduced. Synthetic
+providers preserve the existing protocol and failure posture without
+reproducing source code or private authorization data.
 
 ## Host Rule Map
 
@@ -100,7 +102,6 @@ destinations and paths are replaced, but the stated counts apply to each row.
 | Source | V3 ID | Decision | Patterns | Preserved intent |
 | --- | --- | --- | ---: | --- |
 | bootstrap | `prod-host-parent-connect` | allow | 1 | credential-free parent CONNECT from the sanitized container network; inner requests remain fully authorized |
-| 00 | `prod-host-r00-require-identity` | deny | 1 | catchall missing-identity gate |
 | 01 | `prod-host-r01-ai-redaction-a` | allow | 4 | AI service group with wire redaction |
 | 02 | `prod-host-r02-editor-redaction` | allow | 2 | editor group, one-label wildcard, wire redaction |
 | 03 | `prod-host-r03-ai-redaction-b` | allow | 7 | AI/source group, recursive ChatGPT wildcard, wire redaction |
@@ -177,9 +178,9 @@ destinations and paths are replaced, but the stated counts apply to each row.
 2. Reject all three sanitized v1 shapes through the strict runtime and CLI.
 3. Assert the exact rule IDs, counts, pattern counts, method sets, wildcard
    classes, provider placement, and redaction placement recorded above.
-4. Execute both synthetic providers for allow, deny, missing identity, unknown
-   identity, malformed input, restart, timeout, and reload cases.
-5. Prove the internal identity/context pair is visible to the Git provider, is
-   replaced when spoofed, and neither header reaches the origin.
+4. Execute both synthetic providers for deny, malformed input, restart,
+   timeout, and reload cases while checked identity projection is absent.
+5. Prove the protected bearer is filtered from both providers and origin
+   traffic, while the internal context reaches only the Git provider.
 6. Probe readiness at control port 8898 and prove control paths are unavailable
    through ports 8881 and 8889.

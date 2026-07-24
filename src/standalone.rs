@@ -2147,10 +2147,11 @@ header = "x-acl-proxy-request-id"
                 ca_certificate: Some("parent-root.pem".into()),
                 server_name: "parent.example.test".to_owned(),
             }),
+            presentation: None,
         });
 
         let plan = finalized(&compiled.reloadable_plan, GenerationId::for_test(31)).await;
-        let Route::Parent { target, security } = plan.route() else {
+        let Route::GenericParent { target, security } = plan.route() else {
             panic!("parent route intent is retained")
         };
         assert_eq!(target.as_str(), "https://parent.example.test:8443/");

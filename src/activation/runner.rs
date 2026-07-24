@@ -75,8 +75,9 @@ fn listener_transport_name(transport: http_access_runtime::ListenerTransport) ->
 impl ProductRuntime {
     pub(crate) async fn prepare(
         loaded: LoadedCompiledConfig,
+        identity_sources: Arc<crate::identity::IdentitySourceRegistry>,
     ) -> Result<Arc<Self>, ProductRuntimeError> {
-        Self::prepare_inner(loaded, None, None).await
+        Self::prepare_inner(loaded, None, None, Some(identity_sources)).await
     }
 
     #[cfg(test)]
@@ -84,7 +85,7 @@ impl ProductRuntime {
         loaded: LoadedCompiledConfig,
         listeners: Vec<std::net::TcpListener>,
     ) -> Result<Arc<Self>, ProductRuntimeError> {
-        Self::prepare_inner(loaded, Some(listeners), None).await
+        Self::prepare_inner(loaded, Some(listeners), None, None).await
     }
 
     #[cfg(test)]
@@ -93,30 +94,67 @@ impl ProductRuntime {
         listeners: Vec<std::net::TcpListener>,
         forwarding_network: Arc<http_access_runtime::ForwardingNetworkGuard>,
     ) -> Result<Arc<Self>, ProductRuntimeError> {
-        Self::prepare_inner(loaded, Some(listeners), Some(forwarding_network)).await
+        Self::prepare_inner(loaded, Some(listeners), Some(forwarding_network), None).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn prepare_from_prebound_with_forwarding_network_and_identity_sources(
+        loaded: LoadedCompiledConfig,
+        listeners: Vec<std::net::TcpListener>,
+        forwarding_network: Arc<http_access_runtime::ForwardingNetworkGuard>,
+        identity_sources: Arc<crate::identity::IdentitySourceRegistry>,
+    ) -> Result<Arc<Self>, ProductRuntimeError> {
+        Self::prepare_inner(
+            loaded,
+            Some(listeners),
+            Some(forwarding_network),
+            Some(identity_sources),
+        )
+        .await
     }
 
     async fn prepare_inner(
         loaded: LoadedCompiledConfig,
         prebound: Option<Vec<std::net::TcpListener>>,
         forwarding_network: Option<Arc<http_access_runtime::ForwardingNetworkGuard>>,
+        identity_sources: Option<Arc<crate::identity::IdentitySourceRegistry>>,
     ) -> Result<Arc<Self>, ProductRuntimeError> {
         let LoadedCompiledConfig { metadata, compiled } = loaded;
         #[cfg(not(test))]
         let _ = (prebound, forwarding_network);
         #[cfg(test)]
-        let static_resources = match forwarding_network {
-            Some(forwarding_network) => {
+        let static_resources = match (forwarding_network, identity_sources) {
+            (None, Some(identity_sources)) => {
+                ProductStaticResources::try_new_with_identity_sources(
+                    &compiled.static_config,
+                    identity_sources,
+                )
+                .await?
+            }
+            (Some(forwarding_network), None) => {
                 ProductStaticResources::try_new_with_forwarding_network(
                     &compiled.static_config,
                     forwarding_network,
                 )
                 .await?
             }
-            None => ProductStaticResources::try_new(&compiled.static_config).await?,
+            (Some(forwarding_network), Some(identity_sources)) => {
+                ProductStaticResources::try_new_with_forwarding_network_and_identity_sources(
+                    &compiled.static_config,
+                    forwarding_network,
+                    identity_sources,
+                )
+                .await?
+            }
+            (None, None) => ProductStaticResources::try_new(&compiled.static_config).await?,
         };
         #[cfg(not(test))]
-        let static_resources = ProductStaticResources::try_new(&compiled.static_config).await?;
+        let static_resources = ProductStaticResources::try_new_with_identity_sources(
+            &compiled.static_config,
+            identity_sources
+                .expect("production preparation supplies preactivated identity sources"),
+        )
+        .await?;
         let observation_runtime = static_resources.observation_runtime();
 
         #[cfg(test)]
@@ -160,6 +198,11 @@ impl ProductRuntime {
     #[cfg(test)]
     pub(crate) fn capture_pool_used_for_test(&self) -> usize {
         self.observation_runtime.capture_pool_used()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn identity_publisher_for_test(&self) -> Arc<crate::identity::IdentityPublisher> {
+        self.static_resources.identity_publisher()
     }
 
     #[cfg(test)]
@@ -262,6 +305,9 @@ impl ProductRuntime {
                 Arc::clone(assets),
                 self.static_resources.wire_body_pool(),
             );
+        let identity_publisher = self.static_resources.identity_publisher();
+        let http_bearer_admission: Arc<dyn http_access_runtime::HttpBearerAdmission> =
+            identity_publisher.clone();
         let access_flow_service = http_access_runtime::HttpAccessFlowService::new(
             ListenerTlsAcceptors::new(
                 assets.static_https(),
@@ -269,6 +315,7 @@ impl ProductRuntime {
                 assets.tls_connect(),
                 assets.transparent_https(),
             ),
+            Arc::clone(&http_bearer_admission),
             Arc::clone(&request_factory),
             self.static_resources.upgrade_runtime(),
         );
@@ -281,6 +328,7 @@ impl ProductRuntime {
                         static_resources: Arc::downgrade(&self.static_resources),
                     }),
                     tcp_tls,
+                    http_bearer_admission,
                     request_factory,
                     self.static_resources.upgrade_runtime(),
                 ));
@@ -298,6 +346,7 @@ impl ProductRuntime {
         let access_flow_runtime = AccessFlowListenerRuntime::start(
             inputs.access_flow,
             access_flow_service,
+            identity_publisher,
             Arc::new(move |error| {
                 let Some(resources) = failure_resources.upgrade() else {
                     return;
@@ -403,9 +452,11 @@ mod tests {
     use std::time::Duration;
 
     use access_flow::{write_access_flow_preface, AccessFlowDestination};
-    use access_identity::IdentityPresentation;
+    use access_identity::{IdentityPresentation, SensitiveBearer};
+    use bytes::Bytes;
     use flate2::write::GzEncoder;
     use flate2::Compression;
+    use http::{Method, Request, StatusCode, Version};
     use http_access_mitm::{GeneratedCertificateAuthority, PrivateStorageRoot};
     use rustls::pki_types::ServerName;
     use tempfile::tempdir;
@@ -483,6 +534,33 @@ default = "deny"
             message.extend_from_slice(&buffer[..count]);
         }
         message
+    }
+
+    async fn h2_identity_request(
+        sender: &mut h2::client::SendRequest<Bytes>,
+        uri: &str,
+        bearer: &str,
+    ) -> h2::client::ResponseFuture {
+        sender.clone().ready().await.unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .version(Version::HTTP_2)
+            .uri(uri)
+            .header("x-aw-identity-token", bearer)
+            .body(())
+            .unwrap();
+        sender.send_request(request, true).unwrap().0
+    }
+
+    async fn collect_h2_response(response: h2::client::ResponseFuture) -> (StatusCode, Vec<u8>) {
+        let response = response.await.unwrap();
+        let status = response.status();
+        let mut body = response.into_body();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.data().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        (status, bytes)
     }
 
     fn capture_records(directory: &Path) -> Vec<crate::capture::CaptureRecord> {
@@ -922,7 +1000,11 @@ urls = ["http://{origin_address}/capture-failure"]
             .await
             .unwrap();
         let response = read_http_message(&mut client).await;
-        assert!(response.starts_with(b"HTTP/1.1 200 "));
+        assert!(
+            response.starts_with(b"HTTP/1.1 200 "),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
         assert!(response.ends_with(b"\r\n\r\naccepted"));
 
         origin_task.await.unwrap();
@@ -1180,6 +1262,841 @@ value = "policy"
                 .as_deref(),
             Some("identity")
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn authenticated_bearer_has_explicit_http_and_access_flow_product_parity() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let reservations = super::super::reserve_listeners::<1>(&_test);
+        let addresses = reservations.addresses();
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let socket_path = directory.path().join("identity-access-flow.sock");
+        let config_path = directory.path().join("acl-proxy.toml");
+        let origin = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        const VARIABLE: &str = "AW_PRODUCT_PARITY_IDENTITY_TOKEN";
+        const BEARER: &str = "product-parity-identity-bearer-000000000000";
+        let text = format!(
+            r#"schema_version = 3
+
+[service]
+request_timeout = "5s"
+shutdown_drain_timeout = "1s"
+
+[listeners.explicit_http]
+endpoint.kind = "tcp"
+endpoint.address = "{}"
+http_versions = ["http1"]
+
+[listeners.explicit_http.identity]
+mode = "required"
+
+[listeners.explicit_http.connect]
+http1 = "deny"
+
+[listeners.transparent_http]
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
+endpoint.allowed_destination_ports = [80]
+http_versions = ["http1"]
+
+[listeners.transparent_http.identity]
+mode = "required"
+
+[listeners.transparent_http.endpoint.transport]
+kind = "unix"
+path = {:?}
+mode = "0600"
+
+[identity]
+max_pending_authentications = 8
+max_pending_authentications_per_connection = 2
+
+[identity.resolver]
+kind = "static"
+authority = "product-parity"
+
+[[identity.resolver.principals]]
+id = "test-workload"
+kind = "service_account"
+
+[[identity.resolver.tokens]]
+id = "test-workload-primary"
+principal = "test-workload"
+source = "environment"
+variable = "{VARIABLE}"
+
+[egress]
+route = "direct"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "identity-parity"
+decision = "allow"
+urls = ["http://origin.example.test/**"]
+methods = ["GET"]
+"#,
+            addresses[0], socket_path
+        );
+        fs::write(&config_path, text).unwrap();
+        let loaded = load_and_compile_exact_config(&config_path).unwrap();
+        unsafe {
+            std::env::set_var(VARIABLE, BEARER);
+        }
+        let identity_sources = crate::identity::IdentitySourceRegistry::activate().unwrap();
+        identity_sources
+            .preload(&loaded.compiled.reloadable_plan)
+            .unwrap();
+        assert!(std::env::var_os(VARIABLE).is_none());
+
+        let origin_url =
+            http_access_url::canonicalize_http_url("http://origin.example.test/").unwrap();
+        let network = Arc::new(
+            http_access_runtime::ForwardingDevHarness::new(
+                http_access_runtime::ForwardingNetworkFacts::new(
+                    vec![addresses[0]],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .map_prebound(&origin_url, origin_address)
+            .unwrap()
+            .into_standalone_guard(),
+        );
+        let product =
+            ProductRuntime::prepare_from_prebound_with_forwarding_network_and_identity_sources(
+                loaded,
+                reservations.into_listeners(),
+                network,
+                identity_sources,
+            )
+            .await
+            .unwrap();
+        product.activate_initial().await.unwrap();
+        product.start_listeners().await.unwrap();
+
+        let origin_task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = origin.accept().await.unwrap();
+                requests.push(read_http_message(&mut stream).await);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\naccepted",
+                    )
+                    .await
+                    .unwrap();
+            }
+            requests
+        });
+
+        let mut missing = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        missing
+            .write_all(
+                b"GET http://origin.example.test/missing HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let missing_response = read_http_message(&mut missing).await;
+        assert!(missing_response.starts_with(b"HTTP/1.1 403 "));
+        assert!(missing_response.ends_with(b"\r\n\r\nidentity required\n"));
+
+        let mut unknown = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        unknown
+            .write_all(
+                b"GET http://origin.example.test/unknown HTTP/1.1\r\nHost: origin.example.test\r\nx-aw-identity-token: unknown-product-identity-bearer-000000000000\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let unknown_response = read_http_message(&mut unknown).await;
+        assert!(unknown_response.starts_with(b"HTTP/1.1 403 "));
+        assert!(unknown_response.ends_with(b"\r\n\r\nidentity invalid\n"));
+
+        let mut explicit = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        explicit
+            .write_all(
+                format!(
+                    "GET http://origin.example.test/explicit HTTP/1.1\r\nHost: origin.example.test\r\nx-aw-identity-token: {BEARER}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let explicit_response = read_http_message(&mut explicit).await;
+        assert!(explicit_response.starts_with(b"HTTP/1.1 200 "));
+
+        let mut access_flow = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let presentation =
+            IdentityPresentation::Bearer(SensitiveBearer::new(BEARER.as_bytes()).unwrap());
+        write_access_flow_preface(
+            &mut access_flow,
+            AccessFlowDestination::new("203.0.113.8".parse().unwrap(), 80).unwrap(),
+            &presentation,
+        )
+        .await
+        .unwrap();
+        access_flow
+            .write_all(
+                b"GET /access-flow HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let access_flow_response = read_http_message(&mut access_flow).await;
+        assert!(access_flow_response.starts_with(b"HTTP/1.1 200 "));
+
+        for request in origin_task.await.unwrap() {
+            let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            assert!(!request.contains("x-aw-identity-token"));
+        }
+
+        product.shutdown().await;
+        assert!(socket_path.exists());
+        fs::remove_file(&socket_path).unwrap();
+        super::super::assert_listener_addresses_released(&_test, addresses);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_identity_saturation_precedes_provider_parent_and_capture_work() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let reservations = super::super::reserve_listeners::<1>(&_test);
+        let addresses = reservations.addresses();
+        let parent = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let parent_address = parent.local_addr().unwrap();
+        let directory = tempdir().unwrap();
+        let config_path = directory.path().join("acl-proxy.toml");
+        let provider_script = directory.path().join("provider.py");
+        let provider_log = directory.path().join("provider.jsonl");
+        fs::write(
+            &provider_script,
+            r#"import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    with open(sys.argv[1], "a", encoding="utf-8") as output:
+        output.write(json.dumps(request, separators=(",", ":")) + "\n")
+    print(json.dumps({"id": request["id"], "type": "response", "decision": "allow"}, separators=(",", ":")), flush=True)
+"#,
+        )
+        .unwrap();
+        const VARIABLE: &str = "AW_PROCESS_SATURATION_IDENTITY_TOKEN";
+        const BEARER: &str = "process-saturation-identity-bearer-000000000";
+        let text = format!(
+            r#"schema_version = 3
+
+[service]
+request_timeout = "5s"
+shutdown_drain_timeout = "1s"
+
+[listeners.explicit_http]
+endpoint.kind = "tcp"
+endpoint.address = "{}"
+http_versions = ["http1"]
+
+[listeners.explicit_http.identity]
+mode = "required"
+
+[listeners.explicit_http.connect]
+http1 = "deny"
+
+[identity]
+max_pending_authentications = 1
+max_pending_authentications_per_connection = 1
+
+[identity.resolver]
+kind = "static"
+authority = "process-saturation"
+
+[[identity.resolver.principals]]
+id = "saturation-workload"
+kind = "service_account"
+
+[[identity.resolver.tokens]]
+id = "saturation-workload-primary"
+principal = "saturation-workload"
+source = "environment"
+variable = "{VARIABLE}"
+
+[authorization.providers.audit]
+kind = "process"
+command = "/usr/bin/python3"
+args = [{:?}, {:?}]
+include_headers = ["x-visible"]
+
+[egress]
+route = "parent_proxy"
+
+[egress.parent_proxy]
+kind = "generic"
+url = "http://parent.test:8080"
+
+[redaction.profiles.audit]
+rules = [{{ literals = ["capture-marker"] }}]
+
+[observation.capture]
+events = ["request.allowed", "request.denied"]
+redaction_profile = "audit"
+directory = "captures"
+max_body_bytes = 1024
+max_inflight_body_bytes = 134217728
+max_pending_records = 8
+max_files = 8
+max_total_bytes = 1048576
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "saturation-delegate"
+decision = "delegate"
+authorization_provider = "audit"
+urls = ["http://origin.example.test/**"]
+methods = ["GET"]
+"#,
+            addresses[0], provider_script, provider_log
+        );
+        fs::write(&config_path, text).unwrap();
+        let loaded = load_and_compile_exact_config(&config_path).unwrap();
+        unsafe {
+            std::env::set_var(VARIABLE, BEARER);
+        }
+        let identity_sources = crate::identity::IdentitySourceRegistry::activate().unwrap();
+        identity_sources
+            .preload(&loaded.compiled.reloadable_plan)
+            .unwrap();
+        assert!(std::env::var_os(VARIABLE).is_none());
+
+        let parent_url =
+            http_access_url::canonicalize_http_url("http://parent.test:8080/").unwrap();
+        let network = Arc::new(
+            http_access_runtime::ForwardingDevHarness::new(
+                http_access_runtime::ForwardingNetworkFacts::new(
+                    vec![addresses[0]],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .map_local_parent(&parent_url, parent_address)
+            .unwrap()
+            .into_standalone_guard(),
+        );
+        let product =
+            ProductRuntime::prepare_from_prebound_with_forwarding_network_and_identity_sources(
+                loaded,
+                reservations.into_listeners(),
+                network,
+                identity_sources,
+            )
+            .await
+            .unwrap();
+        let gate = crate::identity::IdentityAdmissionGate::new();
+        product
+            .identity_publisher_for_test()
+            .set_admission_gate_for_test(Arc::clone(&gate));
+        product.activate_initial().await.unwrap();
+        product.start_listeners().await.unwrap();
+
+        let (parent_request_tx, mut parent_request_rx) = oneshot::channel();
+        let parent_task = tokio::spawn(async move {
+            let (mut stream, _) = parent.accept().await.unwrap();
+            let request = read_http_message(&mut stream).await;
+            parent_request_tx.send(request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\naccepted",
+                )
+                .await
+                .unwrap();
+        });
+
+        let first_address = addresses[0];
+        let first = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(first_address).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "GET http://origin.example.test/first HTTP/1.1\r\nHost: origin.example.test\r\nx-aw-identity-token: {BEARER}\r\nx-visible: retained\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            read_http_message(&mut stream).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), gate.wait_for_entries(1))
+            .await
+            .expect("first authentication reached the deterministic gate");
+
+        let mut overloaded = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        overloaded
+            .write_all(
+                format!(
+                    "GET http://origin.example.test/overloaded HTTP/1.1\r\nHost: origin.example.test\r\nx-aw-identity-token: {BEARER}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let overloaded = read_http_message(&mut overloaded).await;
+        assert!(overloaded.starts_with(b"HTTP/1.1 503 "));
+        assert!(overloaded.ends_with(b"\r\n\r\nservice unavailable\n"));
+        assert!(
+            !provider_log.exists(),
+            "saturated authentication reached the policy provider"
+        );
+        assert!(
+            matches!(
+                parent_request_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "saturated authentication reached the generic parent"
+        );
+
+        gate.release(1);
+        let first_response = first.await.unwrap();
+        assert!(first_response.starts_with(b"HTTP/1.1 200 "));
+        let parent_request = parent_request_rx.await.unwrap();
+        let parent_request_lower = String::from_utf8(parent_request)
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(!parent_request_lower.contains("x-aw-identity-token"));
+        assert!(!parent_request_lower.contains(BEARER));
+
+        parent_task.await.unwrap();
+        product.shutdown().await;
+
+        let provider_request = fs::read_to_string(&provider_log).unwrap();
+        assert_eq!(provider_request.lines().count(), 1);
+        assert!(!provider_request.contains("x-aw-identity-token"));
+        assert!(!provider_request.contains(BEARER));
+        let captures = capture_records(&directory.path().join("captures"));
+        assert!(!captures.is_empty());
+        let captures = serde_json::to_string(&captures)
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(captures.contains("/first"));
+        assert!(
+            !captures.contains("/overloaded"),
+            "saturated authentication produced capture work"
+        );
+        assert!(!captures.contains("x-aw-identity-token"));
+        assert!(!captures.contains(BEARER));
+        super::super::assert_listener_addresses_released(&_test, addresses);
+    }
+
+    #[tokio::test]
+    async fn connection_identity_saturation_is_isolated_before_origin_work() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let reservations = super::super::reserve_listeners::<1>(&_test);
+        let addresses = reservations.addresses();
+        let origin = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let directory = tempdir().unwrap();
+        let config_path = directory.path().join("acl-proxy.toml");
+        const VARIABLE: &str = "AW_CONNECTION_SATURATION_IDENTITY_TOKEN";
+        const BEARER: &str = "connection-saturation-identity-bearer-000000";
+        let text = format!(
+            r#"schema_version = 3
+
+[service]
+request_timeout = "5s"
+shutdown_drain_timeout = "1s"
+
+[listeners.explicit_http]
+endpoint.kind = "tcp"
+endpoint.address = "{}"
+http_versions = ["http2"]
+max_concurrent_streams = 8
+
+[listeners.explicit_http.identity]
+mode = "required"
+
+[listeners.explicit_http.connect]
+http2 = "deny"
+
+[identity]
+max_pending_authentications = 2
+max_pending_authentications_per_connection = 1
+
+[identity.resolver]
+kind = "static"
+authority = "connection-saturation"
+
+[[identity.resolver.principals]]
+id = "saturation-workload"
+kind = "service_account"
+
+[[identity.resolver.tokens]]
+id = "saturation-workload-primary"
+principal = "saturation-workload"
+source = "environment"
+variable = "{VARIABLE}"
+
+[egress]
+route = "direct"
+
+[egress.origin_tls]
+trust = "system"
+http_versions = ["http1"]
+
+[policy]
+default = "allow"
+"#,
+            addresses[0]
+        );
+        fs::write(&config_path, text).unwrap();
+        let loaded = load_and_compile_exact_config(&config_path).unwrap();
+        unsafe {
+            std::env::set_var(VARIABLE, BEARER);
+        }
+        let identity_sources = crate::identity::IdentitySourceRegistry::activate().unwrap();
+        identity_sources
+            .preload(&loaded.compiled.reloadable_plan)
+            .unwrap();
+        assert!(std::env::var_os(VARIABLE).is_none());
+
+        let origin_url =
+            http_access_url::canonicalize_http_url(&format!("http://{origin_address}/")).unwrap();
+        let network = Arc::new(
+            http_access_runtime::ForwardingDevHarness::new(
+                http_access_runtime::ForwardingNetworkFacts::new(
+                    vec![addresses[0]],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .map_prebound(&origin_url, origin_address)
+            .unwrap()
+            .into_standalone_guard(),
+        );
+        let product =
+            ProductRuntime::prepare_from_prebound_with_forwarding_network_and_identity_sources(
+                loaded,
+                reservations.into_listeners(),
+                network,
+                identity_sources,
+            )
+            .await
+            .unwrap();
+        let gate = crate::identity::IdentityAdmissionGate::new();
+        product
+            .identity_publisher_for_test()
+            .set_admission_gate_for_test(Arc::clone(&gate));
+        product.activate_initial().await.unwrap();
+        product.start_listeners().await.unwrap();
+
+        let origin_task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = origin.accept().await.unwrap();
+                requests.push(read_http_message(&mut stream).await);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\naccepted",
+                    )
+                    .await
+                    .unwrap();
+            }
+            requests
+        });
+
+        let stream = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        let (mut first_sender, first_connection) = h2::client::handshake(stream).await.unwrap();
+        let first_driver = tokio::spawn(first_connection);
+        let first = h2_identity_request(
+            &mut first_sender,
+            &format!("http://{origin_address}/first"),
+            BEARER,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(2), gate.wait_for_entries(1))
+            .await
+            .expect("first connection reached the deterministic gate");
+
+        let overloaded = h2_identity_request(
+            &mut first_sender,
+            &format!("http://{origin_address}/overloaded"),
+            BEARER,
+        )
+        .await;
+        let (status, body) = collect_h2_response(overloaded).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, b"service unavailable\n");
+
+        let stream = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        let (mut isolated_sender, isolated_connection) =
+            h2::client::handshake(stream).await.unwrap();
+        let isolated_driver = tokio::spawn(isolated_connection);
+        let isolated = h2_identity_request(
+            &mut isolated_sender,
+            &format!("http://{origin_address}/isolated"),
+            BEARER,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(2), gate.wait_for_entries(2))
+            .await
+            .expect("a separate connection retained independent authentication capacity");
+
+        gate.release(2);
+        let (first_status, first_body) = collect_h2_response(first).await;
+        let (isolated_status, isolated_body) = collect_h2_response(isolated).await;
+        assert_eq!(
+            (first_status, first_body.as_slice()),
+            (StatusCode::OK, b"accepted".as_slice())
+        );
+        assert_eq!(
+            (isolated_status, isolated_body.as_slice()),
+            (StatusCode::OK, b"accepted".as_slice())
+        );
+        let origin_requests = origin_task.await.unwrap();
+        assert_eq!(origin_requests.len(), 2);
+        for request in origin_requests {
+            let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            assert!(!request.contains("x-aw-identity-token"));
+            assert!(!request.contains(BEARER));
+        }
+
+        drop(first_sender);
+        drop(isolated_sender);
+        product.shutdown().await;
+        first_driver.await.unwrap().unwrap();
+        isolated_driver.await.unwrap().unwrap();
+        super::super::assert_listener_addresses_released(&_test, addresses);
+    }
+
+    #[tokio::test]
+    async fn typed_acl_parent_presentation_is_injected_only_at_the_parent_boundary() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let reservations = super::super::reserve_listeners::<1>(&_test);
+        let addresses = reservations.addresses();
+        let parent = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let parent_address = parent.local_addr().unwrap();
+        const INBOUND_VARIABLE: &str = "AW_INBOUND_PRODUCT_IDENTITY_TOKEN";
+        const INBOUND_BEARER: &str = "inbound-product-identity-bearer-000000000000";
+        const PARENT_VARIABLE: &str = "AW_PARENT_PRODUCT_IDENTITY_TOKEN";
+        const PARENT_BEARER: &str = "parent-product-identity-bearer-0000000000000";
+        let text = format!(
+            r#"schema_version = 3
+
+[service]
+request_timeout = "5s"
+shutdown_drain_timeout = "1s"
+
+[listeners.explicit_http]
+endpoint.kind = "tcp"
+endpoint.address = "{}"
+http_versions = ["http1"]
+
+[listeners.explicit_http.identity]
+mode = "required"
+
+[listeners.explicit_http.connect]
+http1 = "mitm"
+
+[mitm]
+mode = "generated"
+directory = "mitm"
+
+[identity]
+max_pending_authentications = 8
+max_pending_authentications_per_connection = 2
+
+[identity.resolver]
+kind = "static"
+authority = "parent-boundary"
+
+[[identity.resolver.principals]]
+id = "inbound-workload"
+kind = "service_account"
+
+[[identity.resolver.tokens]]
+id = "inbound-workload-primary"
+principal = "inbound-workload"
+source = "environment"
+variable = "{INBOUND_VARIABLE}"
+
+[egress]
+route = "parent_proxy"
+
+[egress.parent_proxy]
+kind = "acl_proxy"
+url = "http://parent.test:8080"
+
+[egress.parent_proxy.presentation]
+kind = "bearer_environment"
+variable = "{PARENT_VARIABLE}"
+
+[policy]
+default = "allow"
+"#,
+            addresses[0]
+        );
+        let (directory, loaded) = loaded(&text);
+        let generated_root =
+            http_access_mitm::PrivateStorageRoot::open_or_create(&directory.path().join("mitm"))
+                .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let generated_ca = http_access_mitm::GeneratedCertificateAuthority::open_or_generate(
+            generated_root,
+            i64::try_from(now).unwrap(),
+        )
+        .unwrap()
+        .public_ca_chain_der();
+        unsafe {
+            std::env::set_var(INBOUND_VARIABLE, INBOUND_BEARER);
+            std::env::set_var(PARENT_VARIABLE, PARENT_BEARER);
+        }
+        let identity_sources = crate::identity::IdentitySourceRegistry::activate().unwrap();
+        identity_sources
+            .preload(&loaded.compiled.reloadable_plan)
+            .unwrap();
+        assert!(std::env::var_os(INBOUND_VARIABLE).is_none());
+        assert!(std::env::var_os(PARENT_VARIABLE).is_none());
+
+        let parent_url =
+            http_access_url::canonicalize_http_url("http://parent.test:8080/").unwrap();
+        let network = Arc::new(
+            http_access_runtime::ForwardingDevHarness::new(
+                http_access_runtime::ForwardingNetworkFacts::new(
+                    vec![addresses[0]],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .map_local_parent(&parent_url, parent_address)
+            .unwrap()
+            .into_standalone_guard(),
+        );
+        let product =
+            ProductRuntime::prepare_from_prebound_with_forwarding_network_and_identity_sources(
+                loaded,
+                reservations.into_listeners(),
+                network,
+                identity_sources,
+            )
+            .await
+            .unwrap();
+        product.activate_initial().await.unwrap();
+        product.start_listeners().await.unwrap();
+
+        let parent_task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for index in 0..2 {
+                let (mut stream, _) = parent.accept().await.unwrap();
+                requests.push(read_http_message(&mut stream).await);
+                let response = if index == 0 {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\naccepted"
+                        .as_slice()
+                } else {
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .as_slice()
+                };
+                stream.write_all(response).await.unwrap();
+            }
+            requests
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET http://origin.example.test/resource HTTP/1.1\r\nHost: origin.example.test\r\nx-aw-identity-token: {INBOUND_BEARER}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let response = read_http_message(&mut client).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200 "),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+
+        let mut connect = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        connect
+            .write_all(
+                format!(
+                    "CONNECT origin.example.test:443 HTTP/1.1\r\nHost: origin.example.test:443\r\nx-aw-identity-token: {INBOUND_BEARER}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let connect_response = read_http_message(&mut connect).await;
+        assert!(
+            connect_response.starts_with(b"HTTP/1.1 "),
+            "{}",
+            String::from_utf8_lossy(&connect_response)
+        );
+        let connector = TlsConnector::from(Arc::new(client_config_for_roots(
+            generated_ca,
+            &[b"http/1.1"],
+        )));
+        let mut tunnel = connector
+            .connect(
+                ServerName::try_from("origin.example.test").unwrap(),
+                connect,
+            )
+            .await
+            .unwrap();
+        tunnel
+            .write_all(
+                b"GET /inside-connect HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let requests = tokio::time::timeout(Duration::from_secs(2), parent_task)
+            .await
+            .expect("typed parent did not receive the CONNECT request")
+            .unwrap()
+            .into_iter()
+            .map(|request| String::from_utf8(request).unwrap())
+            .collect::<Vec<_>>();
+        let parent_request = &requests[0];
+        assert!(
+            parent_request.starts_with("GET http://origin.example.test/resource HTTP/1.1\r\n"),
+            "{parent_request}"
+        );
+        assert!(
+            requests[1].starts_with("CONNECT origin.example.test:443 HTTP/1.1\r\n"),
+            "{}",
+            requests[1]
+        );
+        for parent_request in requests {
+            let lower = parent_request.to_ascii_lowercase();
+            assert!(
+                lower.contains(&format!("\r\nx-aw-identity-token: {PARENT_BEARER}\r\n")),
+                "{parent_request}"
+            );
+            assert!(!parent_request.contains(INBOUND_BEARER), "{parent_request}");
+        }
+
+        product.shutdown().await;
+        super::super::assert_listener_addresses_released(&_test, addresses);
     }
 
     #[cfg(unix)]

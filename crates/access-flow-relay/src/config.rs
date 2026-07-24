@@ -5,6 +5,7 @@ use std::{
     io::Read,
     net::SocketAddr,
     num::{NonZeroU16, NonZeroUsize},
+    os::unix::ffi::OsStringExt,
     os::unix::fs::FileTypeExt,
     path::Path,
     time::Duration,
@@ -17,17 +18,19 @@ use access_flow_unix::{
     NormalizedUnixSocketPath, UnixAccessFlowEndpoint, UnixEndpointExecutionError,
     UnixExecutionTarget,
 };
-use access_identity::IdentityPresentation;
+use access_identity::{IdentityPresentation, SensitiveBearer};
 use serde::Deserialize;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 pub const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 pub const MAX_DRAIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub const PROCESS_MEMORY_CEILING_BYTES: u64 = 256 * 1024 * 1024;
 pub const CONSUMER_MEMORY_RESERVE_BYTES: u64 = 2 * 1024 * 1024;
 pub const CONSUMER_DESCRIPTOR_RESERVE: u64 = 16;
+pub const MAX_PRESENTATION_ENVIRONMENT_NAME_BYTES: usize = 256;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
     pub routes: Vec<Route>,
@@ -40,7 +43,7 @@ pub struct Config {
     pub copy_buffer_bytes_per_direction: usize,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Route {
     pub name: String,
@@ -49,16 +52,18 @@ pub struct Route {
     pub transport: Transport,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Transport {
     Unix { path: String },
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Presentation {
     Disabled {},
+    Anonymous {},
+    BearerEnvironment { variable: String },
 }
 
 pub struct ValidatedConfig {
@@ -147,9 +152,7 @@ impl Config {
             );
         }
 
-        let presentation = match self.presentation {
-            Presentation::Disabled {} => IdentityPresentation::Disabled,
-        };
+        let presentation = activate_presentation(self.presentation)?;
         let plan = AccessFlowRelayPlan::new(
             endpoints,
             presentation,
@@ -163,6 +166,43 @@ impl Config {
             drain_timeout: self.drain_timeout,
         })
     }
+}
+
+fn activate_presentation(presentation: Presentation) -> Result<IdentityPresentation, ConfigError> {
+    match presentation {
+        Presentation::Disabled {} => Ok(IdentityPresentation::Disabled),
+        Presentation::Anonymous {} => Ok(IdentityPresentation::Anonymous),
+        Presentation::BearerEnvironment { variable } => {
+            if !valid_presentation_environment_name(&variable) {
+                return Err(invalid("bearer presentation environment source is invalid"));
+            }
+            let value = std::env::var_os(&variable)
+                .ok_or_else(|| invalid("bearer presentation environment source is unavailable"))?;
+            std::env::remove_var(&variable);
+            let scratch = Zeroizing::new(value.into_vec());
+            let bearer = SensitiveBearer::new(scratch.as_slice())
+                .map_err(|_| invalid("bearer presentation value is invalid"))?;
+            Ok(IdentityPresentation::Bearer(bearer))
+        }
+    }
+}
+
+fn valid_presentation_environment_name(value: &str) -> bool {
+    value.len() <= MAX_PRESENTATION_ENVIRONMENT_NAME_BYTES
+        && valid_environment_name(value)
+        && (value == "AW_IDENTITY_TOKEN"
+            || value
+                .strip_prefix("AW_ACCESS_FLOW_")
+                .is_some_and(|suffix| !suffix.is_empty()))
+}
+
+fn valid_environment_name(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 pub fn relay_descriptor_budget() -> Result<u64, ConfigError> {
@@ -307,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_json_rejects_unknown_remote_and_non_disabled_presentation() {
+    fn strict_json_accepts_exact_presentation_union_and_rejects_extra_fields() {
         let base = r#"{"routes":[],"presentation":{"kind":"disabled"},"setupTimeout":"2s","drainTimeout":"10s","maxConnections":1,"copyBufferBytesPerDirection":1}"#;
         assert!(serde_json::from_str::<Config>(&base.replace(
             "\"kind\":\"disabled\"",
@@ -322,7 +362,141 @@ mod tests {
         assert!(serde_json::from_str::<Config>(
             &base.replace("\"kind\":\"disabled\"", "\"kind\":\"anonymous\"")
         )
+        .is_ok());
+        assert!(serde_json::from_str::<Config>(&base.replace(
+            "\"kind\":\"disabled\"",
+            "\"kind\":\"bearer_environment\",\"variable\":\"AW_IDENTITY_TOKEN\""
+        ))
+        .is_ok());
+        assert!(serde_json::from_str::<Config>(
+            &base.replace("\"kind\":\"disabled\"", "\"kind\":\"bearer_environment\"")
+        )
         .is_err());
+        assert!(serde_json::from_str::<Config>(&base.replace(
+            "\"kind\":\"disabled\"",
+            "\"kind\":\"anonymous\",\"variable\":\"TOKEN\""
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn presentation_activation_removes_valid_and_invalid_bearers_from_environment() {
+        const VALID_VARIABLE: &str = "AW_ACCESS_FLOW_VALID_BEARER_TEST";
+        const INVALID_VARIABLE: &str = "AW_ACCESS_FLOW_INVALID_BEARER_TEST";
+        let valid_bearer = "a".repeat(access_identity::MIN_BEARER_LEN);
+
+        std::env::set_var(VALID_VARIABLE, &valid_bearer);
+        let presentation = activate_presentation(Presentation::BearerEnvironment {
+            variable: VALID_VARIABLE.to_owned(),
+        })
+        .unwrap();
+        assert!(std::env::var_os(VALID_VARIABLE).is_none());
+        match presentation {
+            IdentityPresentation::Bearer(bearer) => {
+                assert_eq!(bearer.expose(<[u8]>::len), valid_bearer.len());
+            }
+            _ => panic!("valid bearer source did not activate a bearer presentation"),
+        }
+
+        std::env::set_var(INVALID_VARIABLE, "invalid bearer with spaces");
+        let error = activate_presentation(Presentation::BearerEnvironment {
+            variable: INVALID_VARIABLE.to_owned(),
+        })
+        .err()
+        .unwrap();
+        assert!(std::env::var_os(INVALID_VARIABLE).is_none());
+        assert_eq!(
+            error.to_string(),
+            "invalid Access Flow relay configuration: bearer presentation value is invalid"
+        );
+        assert!(!error.to_string().contains(INVALID_VARIABLE));
+        assert!(!error.to_string().contains("invalid bearer with spaces"));
+    }
+
+    #[test]
+    fn presentation_activation_rejects_missing_and_invalid_source_names_without_disclosure() {
+        const MISSING_VARIABLE: &str = "AW_ACCESS_FLOW_MISSING_BEARER_TEST";
+        std::env::remove_var(MISSING_VARIABLE);
+        let error = activate_presentation(Presentation::BearerEnvironment {
+            variable: MISSING_VARIABLE.to_owned(),
+        })
+        .err()
+        .unwrap();
+        assert_eq!(
+            error.to_string(),
+            "invalid Access Flow relay configuration: bearer presentation environment source is unavailable"
+        );
+        assert!(!error.to_string().contains(MISSING_VARIABLE));
+
+        let maximum_variable = format!(
+            "AW_ACCESS_FLOW_{}",
+            "B".repeat(MAX_PRESENTATION_ENVIRONMENT_NAME_BYTES - "AW_ACCESS_FLOW_".len())
+        );
+        assert_eq!(
+            maximum_variable.len(),
+            MAX_PRESENTATION_ENVIRONMENT_NAME_BYTES
+        );
+        std::env::set_var(&maximum_variable, "abcdefghijklmnopqrstuvwxyzABCDEF");
+        let presentation = activate_presentation(Presentation::BearerEnvironment {
+            variable: maximum_variable.clone(),
+        })
+        .unwrap();
+        assert!(matches!(presentation, IdentityPresentation::Bearer(_)));
+        assert!(std::env::var_os(&maximum_variable).is_none());
+
+        let oversized_variable = format!(
+            "AW_ACCESS_FLOW_{}",
+            "B".repeat(MAX_PRESENTATION_ENVIRONMENT_NAME_BYTES - "AW_ACCESS_FLOW_".len() + 1)
+        );
+        assert_eq!(
+            oversized_variable.len(),
+            MAX_PRESENTATION_ENVIRONMENT_NAME_BYTES + 1
+        );
+        let variables = [
+            String::new(),
+            "9INVALID".to_owned(),
+            "INVALID-NAME".to_owned(),
+            "AW_ACCESS_FLOW_".to_owned(),
+            "AW_CONTAINER_IDENTITY_TOKEN".to_owned(),
+            oversized_variable,
+        ];
+        for variable in variables {
+            let error = activate_presentation(Presentation::BearerEnvironment {
+                variable: variable.clone(),
+            })
+            .err()
+            .unwrap();
+            assert_eq!(
+                error.to_string(),
+                "invalid Access Flow relay configuration: bearer presentation environment source is invalid"
+            );
+            assert!(variable.is_empty() || !error.to_string().contains(&variable));
+        }
+    }
+
+    #[test]
+    fn presentation_environment_name_contract_is_adapter_specific() {
+        for accepted in [
+            "AW_IDENTITY_TOKEN",
+            "AW_ACCESS_FLOW_TOKEN",
+            "AW_ACCESS_FLOW_CONTAINER_1_IDENTITY_TOKEN",
+        ] {
+            assert!(
+                valid_presentation_environment_name(accepted),
+                "{accepted} should be accepted"
+            );
+        }
+        for rejected in [
+            "AW_CONTAINER_IDENTITY_TOKEN",
+            "AW_ACCESS_FLOW_",
+            "AW-ACCESS-FLOW-TOKEN",
+            "_AW_ACCESS_FLOW_TOKEN",
+        ] {
+            assert!(
+                !valid_presentation_environment_name(rejected),
+                "{rejected} should be rejected"
+            );
+        }
     }
 
     #[test]

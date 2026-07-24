@@ -15,15 +15,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use access_async_contracts::BoxAccessFuture;
-use access_flow::{
-    AccessFlowAcceptor, AccessFlowAdmission, AccessFlowAdmissionInput, AccessFlowPresentationMode,
-};
+use access_flow::{AccessFlowAcceptor, AccessFlowPresentationMode};
 use access_flow_unix::UnixAccessFlowListenerAdapter;
-use access_identity::IdentityContext;
 use http_access_runtime::{
     ForwardingCancellation, Http1ConnectPolicy, HttpAccessFlowService, ListenerConfig,
-    ListenerLimits, ListenerMode, ListenerRuntime, LocalAddressProvider,
+    ListenerIdentityMode, ListenerLimits, ListenerMode, ListenerRuntime, LocalAddressProvider,
     OriginalDestinationProvider, PreboundListener, PreboundListenerBundle,
     PreboundListenerEndpoint, RuntimeError as SharedRuntimeError,
 };
@@ -31,8 +27,9 @@ use http_access_types::{HttpProtocol, HttpProtocolSet};
 
 use crate::config::compiler::{
     unix_listener_lock_path, CompiledHttp1ConnectPolicy, CompiledHttpVersion,
-    StaticAccessFlowTransport, StaticCleartextListener, StaticExplicitHttpsListener,
-    StaticListenerEndpoint, StaticListenersConfig, StaticTransparentHttpsListener,
+    CompiledListenerIdentityMode, StaticAccessFlowTransport, StaticCleartextListener,
+    StaticExplicitHttpsListener, StaticListenerEndpoint, StaticListenersConfig,
+    StaticTransparentHttpsListener,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -257,6 +254,7 @@ impl PreparedProxyListener {
             ProxyListenerConfig::ExplicitHttp(config) => ListenerConfig::explicit_http(
                 protocol_set(&config.http_versions)?,
                 connect_policy(config.connect.as_ref().and_then(|connect| connect.http1)),
+                listener_identity_mode(config.identity_mode),
                 listener_limits(
                     config.max_connections,
                     config.max_concurrent_streams,
@@ -265,6 +263,7 @@ impl PreparedProxyListener {
             )?,
             ProxyListenerConfig::TransparentHttp(config) => ListenerConfig::transparent_http(
                 protocol_set(&config.http_versions)?,
+                listener_identity_mode(config.identity_mode),
                 listener_limits(
                     config.max_connections,
                     config.max_concurrent_streams,
@@ -274,6 +273,7 @@ impl PreparedProxyListener {
             ProxyListenerConfig::ExplicitHttps(config) => ListenerConfig::explicit_https(
                 protocol_set(&config.http_versions)?,
                 connect_policy(config.connect.http1),
+                listener_identity_mode(config.identity_mode),
                 config.handshake_timeout,
                 listener_limits(
                     config.max_connections,
@@ -283,6 +283,7 @@ impl PreparedProxyListener {
             )?,
             ProxyListenerConfig::TransparentHttps(config) => ListenerConfig::transparent_https(
                 protocol_set(&config.http_versions)?,
+                listener_identity_mode(config.identity_mode),
                 config.handshake_timeout,
                 listener_limits(
                     config.max_connections,
@@ -313,8 +314,11 @@ impl PreparedProxyListener {
                         std::num::NonZeroU16::new(port).ok_or(SharedRuntimeError::InvalidInput)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                let acceptor = AccessFlowAcceptor::new(AccessFlowPresentationMode::Disabled, ports)
-                    .map_err(|_| SharedRuntimeError::InvalidInput)?;
+                let acceptor = AccessFlowAcceptor::new(
+                    access_flow_presentation_mode(config.identity_mode()),
+                    ports,
+                )
+                .map_err(|_| SharedRuntimeError::InvalidInput)?;
                 let adapter =
                     UnixAccessFlowListenerAdapter::from_prebound(listener, admission_timeout)
                         .map_err(|_| SharedRuntimeError::InvalidInput)?;
@@ -350,20 +354,6 @@ pub(super) struct PreparedAccessFlowListener {
     config: ListenerConfig,
     adapter: UnixAccessFlowListenerAdapter,
     acceptor: AccessFlowAcceptor,
-}
-
-struct DisabledAccessFlowAdmission;
-
-impl<C> AccessFlowAdmission<C> for DisabledAccessFlowAdmission {
-    type Facts = IdentityContext;
-    type Error = std::convert::Infallible;
-
-    fn admit<'a>(
-        &'a self,
-        _input: AccessFlowAdmissionInput<'a, C>,
-    ) -> BoxAccessFuture<'a, Result<Self::Facts, Self::Error>> {
-        Box::pin(std::future::ready(Ok(IdentityContext::Disabled)))
-    }
 }
 
 struct AccessFlowAdmissionLatch {
@@ -415,6 +405,7 @@ impl AccessFlowListenerRuntime {
     pub(super) fn start(
         listeners: Vec<PreparedAccessFlowListener>,
         service: HttpAccessFlowService,
+        identity_admission: Arc<crate::identity::IdentityPublisher>,
         failure_observer: Arc<dyn Fn(Arc<ProxyListenerFailure>) + Send + Sync>,
     ) -> Option<Self> {
         if listeners.is_empty() {
@@ -432,6 +423,7 @@ impl AccessFlowListenerRuntime {
                 routes.spawn(run_access_flow_listener(
                     listener,
                     service.clone(),
+                    Arc::clone(&identity_admission),
                     supervisor_admission.clone(),
                     supervisor_force.clone(),
                     AccessFlowAdmissionGuard(Arc::clone(&supervisor_latch)),
@@ -574,6 +566,7 @@ impl ProductListenerRuntime {
 async fn run_access_flow_listener(
     listener: PreparedAccessFlowListener,
     service: HttpAccessFlowService,
+    identity_admission: Arc<crate::identity::IdentityPublisher>,
     admission_cancellation: ForwardingCancellation,
     force_cancellation: ForwardingCancellation,
     admission_guard: AccessFlowAdmissionGuard,
@@ -626,6 +619,7 @@ async fn run_access_flow_listener(
                 let config = config.clone();
                 let admission_cancellation = admission_cancellation.clone();
                 let connection_cancellation = force_cancellation.clone();
+                let identity_admission = Arc::clone(&identity_admission);
                 connections.spawn(async move {
                     let _permit = permit;
                     let (channel, deadline) = accepted.into_access_flow();
@@ -634,7 +628,7 @@ async fn run_access_flow_listener(
                             channel,
                             deadline,
                             &admission_cancellation,
-                            &DisabledAccessFlowAdmission,
+                            identity_admission.as_ref(),
                         )
                         .await
                     {
@@ -817,6 +811,22 @@ fn listener_limits(
         max_concurrent_streams,
         request_header_timeout,
     )
+}
+
+fn listener_identity_mode(mode: CompiledListenerIdentityMode) -> ListenerIdentityMode {
+    match mode {
+        CompiledListenerIdentityMode::Disabled => ListenerIdentityMode::Disabled,
+        CompiledListenerIdentityMode::Optional => ListenerIdentityMode::Optional,
+        CompiledListenerIdentityMode::Required => ListenerIdentityMode::Required,
+    }
+}
+
+fn access_flow_presentation_mode(mode: ListenerIdentityMode) -> AccessFlowPresentationMode {
+    match mode {
+        ListenerIdentityMode::Disabled => AccessFlowPresentationMode::Disabled,
+        ListenerIdentityMode::Optional => AccessFlowPresentationMode::Optional,
+        ListenerIdentityMode::Required => AccessFlowPresentationMode::Required,
+    }
 }
 
 #[derive(Default)]
@@ -1403,6 +1413,7 @@ mod tests {
                 request_header_timeout: Duration::from_secs(1),
                 max_connections: 1,
                 max_concurrent_streams: 1,
+                identity_mode: CompiledListenerIdentityMode::Disabled,
                 connect: None,
             })),
             endpoint: PreparedListenerEndpoint::Tcp(listener),
@@ -1540,6 +1551,7 @@ mod tests {
                 request_header_timeout: Duration::from_secs(5),
                 max_connections: 17,
                 max_concurrent_streams: 19,
+                identity_mode: CompiledListenerIdentityMode::Disabled,
                 connect: Some(cleartext_connect.clone()),
             }),
             transparent_http: Some(StaticCleartextListener {
@@ -1550,6 +1562,7 @@ mod tests {
                 request_header_timeout: Duration::from_secs(7),
                 max_connections: 23,
                 max_concurrent_streams: 29,
+                identity_mode: CompiledListenerIdentityMode::Disabled,
                 connect: None,
             }),
             explicit_https: Some(StaticExplicitHttpsListener {
@@ -1561,6 +1574,7 @@ mod tests {
                 request_header_timeout: Duration::from_secs(5),
                 max_connections: 17,
                 max_concurrent_streams: 19,
+                identity_mode: CompiledListenerIdentityMode::Disabled,
                 connect: cleartext_connect,
                 tls: CompiledTlsIdentity {
                     certificate_chain: PathBuf::from("server.pem"),
@@ -1576,6 +1590,7 @@ mod tests {
                 request_header_timeout: Duration::from_secs(11),
                 max_connections: 23,
                 max_concurrent_streams: 29,
+                identity_mode: CompiledListenerIdentityMode::Disabled,
             }),
         };
 
@@ -1932,6 +1947,7 @@ mod tests {
                 request_header_timeout: Duration::from_secs(1),
                 max_connections: 4,
                 max_concurrent_streams: 4,
+                identity_mode: CompiledListenerIdentityMode::Disabled,
                 connect: None,
             }),
             explicit_https: None,

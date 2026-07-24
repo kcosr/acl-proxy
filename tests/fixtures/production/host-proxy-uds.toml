@@ -19,6 +19,9 @@ endpoint.allowed_destination_ports = [80]
 http_versions = ["http1"]
 max_connections = 1024
 
+[listeners.transparent_http.identity]
+mode = "required"
+
 [listeners.transparent_http.endpoint.transport]
 kind = "unix"
 path = "/Users/fixture-user/Library/Application Support/AW Gateway/runtime/transparent-http.sock"
@@ -31,6 +34,9 @@ endpoint.allowed_destination_ports = [443]
 http_versions = ["http1", "http2"]
 max_connections = 1024
 
+[listeners.transparent_https.identity]
+mode = "required"
+
 [listeners.transparent_https.endpoint.transport]
 kind = "unix"
 path = "/Users/fixture-user/Library/Application Support/AW Gateway/runtime/transparent-https.sock"
@@ -40,6 +46,24 @@ mode = "0600"
 mode = "generated"
 directory = "runtime/certs"
 
+[identity]
+max_pending_authentications = 256
+max_pending_authentications_per_connection = 16
+
+[identity.resolver]
+kind = "static"
+authority = "aw-workstation"
+
+[[identity.resolver.principals]]
+id = "local-workstation"
+kind = "system"
+
+[[identity.resolver.tokens]]
+id = "local-workstation-primary"
+principal = "local-workstation"
+source = "environment"
+variable = "AW_IDENTITY_TOKEN"
+
 [egress]
 route = "parent_proxy"
 
@@ -48,17 +72,15 @@ trust = "system"
 http_versions = ["http1", "http2"]
 
 [egress.parent_proxy]
-kind = "generic"
+kind = "acl_proxy"
 url = "https://external-proxy.example.test:8443"
+
+[egress.parent_proxy.presentation]
+kind = "bearer_environment"
+variable = "AW_IDENTITY_TOKEN"
 
 [egress.parent_proxy.tls]
 trust = "system"
-
-[[egress.credential_actions]]
-kind = "custom_header"
-transport_security = "cleartext_allowed"
-header = "x-aw-identity-token"
-credential = "workstation_identity"
 
 [policy]
 default = "deny"
@@ -68,13 +90,6 @@ id = "prod-host-uds-workstation"
 description = "All Unix ingress shares the fixed local-workstation principal"
 decision = "allow"
 urls = ["**"]
-
-[credentials]
-allowed_custom_headers = ["x-aw-identity-token"]
-
-[credentials.sources.workstation_identity]
-source = "environment"
-variable = "AW_IDENTITY_TOKEN"
 
 [observation.logging]
 level = "info"

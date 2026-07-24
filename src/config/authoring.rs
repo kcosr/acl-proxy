@@ -49,6 +49,9 @@ pub(super) struct AuthoringConfig {
     pub listeners: ListenersConfig,
 
     #[serde(default)]
+    pub identity: Option<IdentityConfig>,
+
+    #[serde(default)]
     pub mitm: Option<MitmConfig>,
 
     #[serde(default)]
@@ -339,6 +342,82 @@ pub(super) struct ListenersConfig {
     pub transparent_https: Option<TransparentHttpsListenerConfig>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct IdentityConfig {
+    pub max_pending_authentications: usize,
+    pub max_pending_authentications_per_connection: usize,
+    pub resolver: StaticIdentityResolverConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct StaticIdentityResolverConfig {
+    pub kind: StaticIdentityResolverKind,
+    pub authority: String,
+    pub principals: Vec<StaticIdentityPrincipalConfig>,
+    #[serde(default)]
+    pub groups: Vec<StaticIdentityGroupConfig>,
+    pub tokens: Vec<StaticIdentityTokenConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum StaticIdentityResolverKind {
+    Static,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct StaticIdentityPrincipalConfig {
+    pub id: String,
+    pub kind: IdentityPrincipalKindConfig,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum IdentityPrincipalKindConfig {
+    User,
+    ServiceAccount,
+    System,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct StaticIdentityGroupConfig {
+    pub id: String,
+    pub members: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum StaticIdentityTokenConfig {
+    Environment {
+        id: String,
+        principal: String,
+        variable: String,
+    },
+    File {
+        id: String,
+        principal: String,
+        path: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ListenerIdentityConfig {
+    pub mode: ListenerIdentityModeConfig,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ListenerIdentityModeConfig {
+    Disabled,
+    Optional,
+    Required,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(super) enum HttpVersion {
@@ -381,6 +460,9 @@ pub(super) struct ExplicitHttpListenerConfig {
     pub max_concurrent_streams: u32,
 
     pub connect: ConnectConfig,
+
+    #[serde(default)]
+    pub identity: Option<ListenerIdentityConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -397,6 +479,9 @@ pub(super) struct TransparentHttpListenerConfig {
 
     #[serde(default = "default_listener_max_concurrent_streams")]
     pub max_concurrent_streams: u32,
+
+    #[serde(default)]
+    pub identity: Option<ListenerIdentityConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -419,6 +504,9 @@ pub(super) struct ExplicitHttpsListenerConfig {
 
     pub connect: ConnectConfig,
     pub tls: StaticTlsIdentityConfig,
+
+    #[serde(default)]
+    pub identity: Option<ListenerIdentityConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -438,6 +526,9 @@ pub(super) struct TransparentHttpsListenerConfig {
 
     #[serde(default = "default_listener_max_concurrent_streams")]
     pub max_concurrent_streams: u32,
+
+    #[serde(default)]
+    pub identity: Option<ListenerIdentityConfig>,
 }
 
 fn default_listener_timeout() -> PositiveDuration {
@@ -597,6 +688,16 @@ pub(super) struct ParentProxyConfig {
 
     #[serde(default)]
     pub tls: Option<ParentProxyTlsConfig>,
+
+    #[serde(default)]
+    pub presentation: Option<ParentProxyPresentationConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum ParentProxyPresentationConfig {
+    BearerEnvironment { variable: String },
+    BearerFile { path: PathBuf },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]

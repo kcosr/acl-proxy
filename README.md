@@ -147,6 +147,49 @@ max_concurrent_streams = 128
 http1 = "deny" # deny | mitm
 ```
 
+Listeners support `disabled`, `optional`, or `required` workload identity:
+
+```toml
+[listeners.explicit_http.identity]
+mode = "required"
+
+[identity]
+max_pending_authentications = 256
+max_pending_authentications_per_connection = 16
+
+[identity.resolver]
+kind = "static"
+authority = "workstation"
+
+[[identity.resolver.principals]]
+id = "local-workload"
+kind = "service_account" # user | service_account | system
+
+[[identity.resolver.groups]]
+id = "developers"
+members = ["local-workload"]
+
+[[identity.resolver.tokens]]
+id = "local-workload-primary"
+principal = "local-workload"
+source = "environment"
+variable = "AW_IDENTITY_TOKEN"
+```
+
+Environment token sources are read once before runtime threads start, removed
+from the process environment, and retained in sensitive process-owned storage.
+File sources use `source = "file"` with an absolute `path` and are read through
+the proxy's private credential-file checks during candidate activation. Reload
+may replace file-backed catalogs, but cannot introduce a new environment
+locator after startup. Cleartext TCP identity is restricted to loopback;
+Access Flow carries the typed presentation in its authenticated preface.
+
+For HTTP listeners, `optional` treats a missing protected carrier as anonymous,
+while `required` rejects it. Every presented invalid bearer fails closed.
+`x-aw-identity-token` is reserved for this carrier and cannot be used by
+ordinary header predicates, mutations, credentials, provider header
+projection, capture, or generic egress.
+
 Transparent HTTP and HTTPS listeners may instead accept a Unix stream carrying
 one strict AW Access Flow preface followed by the untouched TCP stream:
 
@@ -216,6 +259,10 @@ See `examples/access-flow-relay.json` for the complete schema and
 listener addresses must be unprivileged IPv4 loopback addresses. Route names,
 listeners are unique. `setupTimeout` covers both the Unix connection and
 complete AW Access Flow preface write. `maxConnections` is global across routes.
+The strict `presentation` union accepts `disabled`, `anonymous`, or
+`bearer_environment`; the latter requires a `variable`, consumes and removes
+that environment value before the Tokio runtime starts, and presents the same
+bearer on every admitted relay connection.
 The relay reserves 16 non-relay descriptors from `RLIMIT_NOFILE`, reserves
 2 MiB from its fixed 256 MiB process preflight ceiling, and delegates exact
 checked resource projection to the shared relay engine before binding.
@@ -301,11 +348,17 @@ route = "parent_proxy"
 [egress.parent_proxy]
 kind = "acl_proxy" # acl_proxy | generic
 url = "http://parent-proxy.example.test:8881"
+
+[egress.parent_proxy.presentation]
+kind = "bearer_environment" # bearer_environment | bearer_file
+variable = "AW_IDENTITY_TOKEN"
 ```
 
 Parent endpoints may not resolve to loopback, a local interface, a data
 listener, or the control listener. DNS results are pinned and revalidated
-before and after connect.
+before and after connect. Presentation is valid only for `kind = "acl_proxy"`;
+the bearer is added to ACL Proxy parent requests and never to direct-origin or
+generic-parent traffic. A file presentation uses `path` instead of `variable`.
 
 ### Policy
 

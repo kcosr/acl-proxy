@@ -12,6 +12,8 @@ mod credentials;
 mod egress;
 mod filesystem;
 mod http_body;
+mod identity;
+mod identity_file;
 mod logging;
 mod network;
 mod observation;

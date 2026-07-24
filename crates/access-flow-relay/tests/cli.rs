@@ -25,6 +25,32 @@ fn reserve_address() -> std::net::SocketAddr {
         .unwrap()
 }
 
+fn write_config(
+    directory: &tempfile::TempDir,
+    socket_path: &std::path::Path,
+    presentation: serde_json::Value,
+) -> std::path::PathBuf {
+    let config_path = directory.path().join("relay.json");
+    let config = serde_json::json!({
+        "routes": [{
+            "name": "http",
+            "listen": reserve_address().to_string(),
+            "allowedDestinationPorts": [80],
+            "transport": {
+                "kind": "unix",
+                "path": socket_path,
+            },
+        }],
+        "presentation": presentation,
+        "setupTimeout": "2s",
+        "drainTimeout": "1s",
+        "maxConnections": 1,
+        "copyBufferBytesPerDirection": 1024,
+    });
+    std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    config_path
+}
+
 #[test]
 fn binary_loads_strict_config_binds_and_drains_on_signal() {
     let directory = tempfile::tempdir().unwrap();
@@ -114,4 +140,58 @@ fn binary_reports_removed_fields_without_accepting_an_alias() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("allowedOriginalPorts"), "{stderr}");
     assert!(stderr.contains("allowedDestinationPorts"), "{stderr}");
+}
+
+#[test]
+fn binary_sanitizes_missing_and_invalid_bearer_activation_failures() {
+    const MISSING_VARIABLE: &str = "AW_ACCESS_FLOW_CLI_MISSING_BEARER";
+    const INVALID_VARIABLE: &str = "AW_ACCESS_FLOW_CLI_INVALID_BEARER";
+    const INVALID_SECRET: &str = "invalid secret that must not appear anywhere";
+
+    let directory = tempfile::tempdir().unwrap();
+    let socket_path = directory.path().join("proxy.sock");
+    let _socket = UnixListener::bind(&socket_path).unwrap();
+
+    let missing_config = write_config(
+        &directory,
+        &socket_path,
+        serde_json::json!({
+            "kind": "bearer_environment",
+            "variable": MISSING_VARIABLE,
+        }),
+    );
+    let missing = Command::new(env!("CARGO_BIN_EXE_acl-proxy-access-flow-relay"))
+        .args(["--config", missing_config.to_str().unwrap()])
+        .env_remove(MISSING_VARIABLE)
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        stderr.contains("bearer presentation environment source is unavailable"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(MISSING_VARIABLE), "{stderr}");
+
+    let invalid_config = write_config(
+        &directory,
+        &socket_path,
+        serde_json::json!({
+            "kind": "bearer_environment",
+            "variable": INVALID_VARIABLE,
+        }),
+    );
+    let invalid = Command::new(env!("CARGO_BIN_EXE_acl-proxy-access-flow-relay"))
+        .args(["--config", invalid_config.to_str().unwrap()])
+        .env(INVALID_VARIABLE, INVALID_SECRET)
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(
+        stderr.contains("bearer presentation value is invalid"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(INVALID_VARIABLE), "{stderr}");
+    assert!(!stderr.contains(INVALID_SECRET), "{stderr}");
 }

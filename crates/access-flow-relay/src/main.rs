@@ -10,7 +10,9 @@ use access_flow_relay::{
 #[cfg(target_os = "linux")]
 use access_flow_unix::UnixAccessFlowConnector;
 #[cfg(target_os = "linux")]
-use acl_proxy_access_flow_relay::config::{relay_descriptor_budget, relay_memory_budget, Config};
+use acl_proxy_access_flow_relay::config::{
+    relay_descriptor_budget, relay_memory_budget, Config, ValidatedConfig,
+};
 #[cfg(target_os = "linux")]
 use tokio::sync::watch;
 
@@ -98,16 +100,12 @@ async fn shutdown_signal() -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-async fn run(path: PathBuf) -> Result<(), String> {
+async fn run(validated: ValidatedConfig) -> Result<(), String> {
     // Signal resources are initialized before relay preparation and are covered
     // by the fixed consumer descriptor reserve.
     let signal = shutdown_signal();
     tokio::pin!(signal);
 
-    let validated = Config::load(&path)
-        .map_err(|error| error.to_string())?
-        .validate()
-        .map_err(|error| error.to_string())?;
     let budget = AccessFlowRelayResourceBudget {
         descriptors: relay_descriptor_budget().map_err(|error| error.to_string())?,
         memory_bytes: relay_memory_budget(),
@@ -210,11 +208,15 @@ fn main() -> ExitCode {
         .init();
 
     let result = config_path().map_err(String::from).and_then(|path| {
+        let validated = Config::load(&path)
+            .map_err(|error| error.to_string())?
+            .validate()
+            .map_err(|error| error.to_string())?;
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|error| format!("failed to initialize runtime: {error}"))?
-            .block_on(run(path))
+            .block_on(run(validated))
     });
     match result {
         Ok(()) => ExitCode::SUCCESS,

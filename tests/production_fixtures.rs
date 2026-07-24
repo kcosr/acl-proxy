@@ -55,7 +55,7 @@ fn strings<'a>(value: &'a TomlValue, key: &str) -> Vec<&'a str> {
 #[test]
 fn sanitized_production_role_structure_matches_difference_record() {
     let expectations = [
-        ("host-proxy-tcp.toml", 45, 134, 22, 2, 4),
+        ("host-proxy-tcp.toml", 44, 133, 22, 2, 4),
         ("host-proxy-uds.toml", 1, 1, 0, 0, 0),
         ("common-container-proxy.toml", 1, 1, 0, 0, 0),
         ("internal-container-proxy.toml", 8, 12, 1, 0, 0),
@@ -155,7 +155,7 @@ fn sanitized_production_role_structure_matches_difference_record() {
             counts
         });
     assert_eq!(decisions.get("allow"), Some(&37));
-    assert_eq!(decisions.get("deny"), Some(&7));
+    assert_eq!(decisions.get("deny"), Some(&6));
     assert_eq!(decisions.get("delegate"), Some(&1));
 
     let delegate = rules(&host)
@@ -257,17 +257,33 @@ fn sanitized_production_role_structure_matches_difference_record() {
         "internal-container-proxy.toml",
     ] {
         let config = parse_fixture(name);
-        let actions = table(&config, "egress")
-            .get("credential_actions")
-            .and_then(TomlValue::as_array)
-            .expect("container production fixture credential action");
-        assert_eq!(actions.len(), 1, "{name} credential action count");
+        let egress = table(&config, "egress");
+        assert!(
+            egress
+                .get("credential_actions")
+                .and_then(TomlValue::as_array)
+                .is_none_or(Vec::is_empty),
+            "{name} must not model identity as a generic credential action"
+        );
+        let parent = egress
+            .get("parent_proxy")
+            .and_then(TomlValue::as_table)
+            .expect("container production fixture ACL Proxy parent");
         assert_eq!(
-            actions[0]
-                .get("transport_security")
-                .and_then(TomlValue::as_str),
-            Some("cleartext_allowed"),
-            "{name} workload identity must explicitly permit its HTTP parent hop"
+            parent.get("kind").and_then(TomlValue::as_str),
+            Some("acl_proxy")
+        );
+        let presentation = parent
+            .get("presentation")
+            .and_then(TomlValue::as_table)
+            .expect("container production fixture parent presentation");
+        assert_eq!(
+            presentation.get("kind").and_then(TomlValue::as_str),
+            Some("bearer_environment")
+        );
+        assert_eq!(
+            presentation.get("variable").and_then(TomlValue::as_str),
+            Some("AW_IDENTITY_TOKEN")
         );
     }
 }

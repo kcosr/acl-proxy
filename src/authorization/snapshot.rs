@@ -730,6 +730,7 @@ mod tests {
             inherit_environment: false,
             pass_environment: vec![],
             environment: BTreeMap::new(),
+            blocked_environment: vec![],
             include_headers: vec![],
             include_request_body: false,
             allow_request_body_replacement: false,
