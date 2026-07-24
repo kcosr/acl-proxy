@@ -94,8 +94,8 @@ target.joinpath("lifetime-origin.sh").write_text(source.replace(
 target.joinpath("lifetime-reset.sh").write_text(source.replace(
     'assert post_reload_elapsed < 3.7, post_reload_elapsed', '', 1))
 target.joinpath("shutdown-order.sh").write_text(source.replace(
-    '    (( listener_closed_ns <= client_finished_ns )) \\\n        || fail "WebSocket streams stopped before the data listener closed"',
-    '    true # removed listener-first assertion', 1))
+    '    assert_listener_closed()\n',
+    '    pass # removed listener-first assertion\n', 1))
 target.joinpath("shutdown-relay.sh").write_text(source.replace(
     'assert_origin_events terminal-once:/shutdown-direct terminal-once:/shutdown-connect',
     'true # removed relay join proof', 1))

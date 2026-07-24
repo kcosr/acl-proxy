@@ -478,6 +478,36 @@ for statement in (
 ):
     require_direct_python_statement(reload_node, statement, "reload/lifetime proof")
 
+listener_closed_node = python_function_node("assert_listener_closed", client_tree)
+expected_listener_closed = ast.parse(
+    '''def expected():
+    try:
+        stream = socket.create_connection(("127.0.0.1", 8881), timeout=1)
+    except ConnectionRefusedError:
+        return
+    stream.close()
+    raise AssertionError("data listener accepted after WebSocket streams stopped")
+'''
+).body[0]
+expected_listener_closed.name = "assert_listener_closed"
+if ast.dump(listener_closed_node, include_attributes=False) != ast.dump(
+    expected_listener_closed, include_attributes=False
+):
+    raise SystemExit("listener-closure proof must use one exact same-namespace refusal probe")
+
+shutdown_python_node = python_function_node("shutdown_case", client_tree)
+require_direct_python_statement(
+    shutdown_python_node,
+    "assert_listener_closed()",
+    "listener closure after stream stop",
+)
+require_direct_python_statement(
+    shutdown_python_node,
+    """success(ASSERT_BOUNDED_STOP=1, ASSERT_STREAMS_STOPPED=1,
+        ASSERT_LISTENER_CLOSED_FIRST=1)""",
+    "listener-first shutdown result",
+)
+
 accept_node = python_function_node("accept_loop", python_trees["origin"])
 accept_loops = [node for node in accept_node.body if isinstance(node, ast.While)
                 and isinstance(node.test, ast.Constant) and node.test.value is True]
@@ -662,7 +692,8 @@ field_matches = [tokens for tokens in field_statements
                  and tokens[4:6] == ["||", "fail"]]
 if len(field_matches) != 1:
     raise SystemExit("assert_ws_field lacks one reachable grep enforcement")
-require_executable(shutdown_case, r'^\s*\(\( listener_closed_ns <= client_finished_ns \)\) \\$\s*', "shutdown listener-first ordering")
+if "listener_closed_ns" in shutdown_case:
+    raise SystemExit("shutdown case retains delayed shell listener-closure timing")
 require_executable(shutdown_case, r'^\s*\(\( host_status == 0 \)\) \|\| fail ', "graceful shutdown status")
 require_executable(shutdown_case, r'^\s*assert_origin_events terminal-once:/shutdown-direct terminal-once:/shutdown-connect\s*$', "shutdown relay joins")
 require_executable(shutdown_case, r'^\s*assert_capture_contains /shutdown-connect ', "shutdown capture flush")

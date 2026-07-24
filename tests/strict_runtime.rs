@@ -277,32 +277,6 @@ fn proxy_request(proxy: SocketAddr, method: &str, url: &str, body: &[u8]) -> Htt
     )
 }
 
-fn anonymous_proxy_request(proxy: SocketAddr, method: &str, url: &str) -> HttpResponse {
-    anonymous_proxy_request_with_body(proxy, method, url, &[])
-}
-
-fn anonymous_proxy_request_with_body(
-    proxy: SocketAddr,
-    method: &str,
-    url: &str,
-    body: &[u8],
-) -> HttpResponse {
-    let host = url
-        .strip_prefix("http://")
-        .and_then(|rest| rest.split('/').next())
-        .expect("test URL authority");
-    let mut stream = connect(proxy);
-    send_request(
-        &mut stream,
-        method,
-        url,
-        host,
-        &[("Content-Type", "text/plain")],
-        body,
-        true,
-    )
-}
-
 fn control_request(control: SocketAddr, path: &str) -> HttpResponse {
     let mut stream = connect(control);
     send_request(
@@ -805,8 +779,35 @@ fn start_unix_authorization_provider(
                 assert_eq!(request["invocation"], "effects_allowed");
                 assert_eq!(request["client"], "127.0.0.1:0");
                 assert_eq!(request["headers"], json!({}));
-                assert!(request.get("identity").is_none());
+                assert_eq!(
+                    request["identity"],
+                    json!({
+                        "state": "authenticated",
+                        "principal": {
+                            "authority": "unix-runtime",
+                            "id": "unix-agent",
+                            "kind": "service_account",
+                        },
+                        "groups": [
+                            {"authority": "unix-runtime", "id": "auditors"},
+                            {"authority": "unix-runtime", "id": "operators"},
+                        ],
+                    })
+                );
                 assert!(request.get("body").is_none());
+                let encoded_request = serde_json::to_vec(&request).unwrap();
+                assert!(
+                    !encoded_request
+                        .windows(b"abcdefghijklmnopqrstuvwxyzABCDEF".len())
+                        .any(|window| window == b"abcdefghijklmnopqrstuvwxyzABCDEF"),
+                    "AWAP request exposed the raw identity bearer"
+                );
+                assert!(
+                    !encoded_request
+                        .windows(b"unix-request-body-secret".len())
+                        .any(|window| window == b"unix-request-body-secret"),
+                    "AWAP request exposed the request body"
+                );
 
                 let path = request["url"]
                     .as_str()
@@ -877,8 +878,37 @@ request_header_timeout = "2s"
 max_connections = 16
 max_concurrent_streams = 16
 
+[listeners.explicit_http.identity]
+mode = "required"
+
 [listeners.explicit_http.connect]
 http1 = "deny"
+
+[identity]
+max_pending_authentications = 8
+max_pending_authentications_per_connection = 4
+
+[identity.resolver]
+kind = "static"
+authority = "unix-runtime"
+
+[[identity.resolver.principals]]
+id = "unix-agent"
+kind = "service_account"
+
+[[identity.resolver.groups]]
+id = "operators"
+members = ["unix-agent"]
+
+[[identity.resolver.groups]]
+id = "auditors"
+members = ["unix-agent"]
+
+[[identity.resolver.tokens]]
+id = "unix-token"
+principal = "unix-agent"
+source = "environment"
+variable = "AW_TEST_IDENTITY_TOKEN"
 
 [authorization.providers.unix_live]
 kind = "unix_socket"
@@ -886,6 +916,7 @@ socket_path = "{}"
 timeout = "2s"
 on_failure = "deny"
 include_headers = []
+include_identity = true
 max_request_bytes = 65536
 max_response_bytes = 65536
 max_pending_requests = 4
@@ -934,6 +965,10 @@ decision = "delegate"
 urls = ["http://{origin}/unix-pass", "http://{origin}/unix-allow", "http://{origin}/unix-body"]
 methods = ["GET", "POST"]
 authorization_provider = "unix_live"
+identity_states = ["authenticated"]
+identity_subjects = [
+  {{ kind = "group", authority = "unix-runtime", id = "operators" }},
+]
 
 [[policy.rules.response_headers]]
 operation = "set"
@@ -1084,7 +1119,7 @@ fn unix_authorization_provider_isolated_product_paths_are_live() {
     wait_for_ready(&mut proxy, control);
 
     let pass_url = format!("http://{origin}/unix-pass");
-    let pass = anonymous_proxy_request(data, "GET", &pass_url);
+    let pass = proxy_request(data, "GET", &pass_url, &[]);
     assert_eq!(
         pass.status,
         200,
@@ -1096,7 +1131,7 @@ fn unix_authorization_provider_isolated_product_paths_are_live() {
     assert_eq!(pass.header("x-unix-pass-successor"), Some("applied"));
 
     let allow_url = format!("http://{origin}/unix-allow");
-    let allow = anonymous_proxy_request(data, "GET", &allow_url);
+    let allow = proxy_request(data, "GET", &allow_url, &[]);
     assert_eq!(allow.status, 200);
     assert_eq!(
         allow.header("x-seen-provider-token"),
@@ -1107,7 +1142,7 @@ fn unix_authorization_provider_isolated_product_paths_are_live() {
 
     let body_marker = b"unix-request-body-secret";
     let body_url = format!("http://{origin}/unix-body");
-    let body = anonymous_proxy_request_with_body(data, "POST", &body_url, body_marker);
+    let body = proxy_request(data, "POST", &body_url, body_marker);
     assert_eq!(body.status, 200);
     assert_eq!(body.body, body_marker);
     assert_eq!(
@@ -1117,24 +1152,18 @@ fn unix_authorization_provider_isolated_product_paths_are_live() {
 
     let missing_deny_url = format!("http://{origin}/missing-deny");
     assert_eq!(
-        anonymous_proxy_request(data, "GET", &missing_deny_url).status,
+        proxy_request(data, "GET", &missing_deny_url, &[]).status,
         403
     );
     let unrelated_url = format!("http://{origin}/unrelated");
-    assert_eq!(
-        anonymous_proxy_request(data, "GET", &unrelated_url).status,
-        200
-    );
+    assert_eq!(proxy_request(data, "GET", &unrelated_url, &[]).status, 200);
 
     let missing_error_url = format!("http://{origin}/missing-error");
     assert_eq!(
-        anonymous_proxy_request(data, "GET", &missing_error_url).status,
+        proxy_request(data, "GET", &missing_error_url, &[]).status,
         500
     );
-    assert_eq!(
-        anonymous_proxy_request(data, "GET", &unrelated_url).status,
-        200
-    );
+    assert_eq!(proxy_request(data, "GET", &unrelated_url, &[]).status, 200);
 
     provider.join().expect("Unix provider server completed");
     let status = proxy.terminate();
@@ -1147,6 +1176,7 @@ fn unix_authorization_provider_isolated_product_paths_are_live() {
         &[
             "unix-typed-secret",
             "unix-request-body-secret",
+            "abcdefghijklmnopqrstuvwxyzABCDEF",
             live_socket.as_ref(),
             missing_deny_socket.as_ref(),
             missing_error_socket.as_ref(),

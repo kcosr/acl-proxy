@@ -828,6 +828,15 @@ def connect_tcp(address):
     return stream
 
 
+def assert_listener_closed():
+    try:
+        stream = socket.create_connection(("127.0.0.1", 8881), timeout=1)
+    except ConnectionRefusedError:
+        return
+    stream.close()
+    raise AssertionError("data listener accepted after WebSocket streams stopped")
+
+
 def outer_connect(proxy, authority):
     stream = connect_tcp(proxy)
     headers = "".join(f"{name}: {value}\r\n" for name, value in identity_headers())
@@ -1074,9 +1083,11 @@ def shutdown_case(ca, ready, finished):
             stop_modes.append("tls-stop")
         stream.close()
     assert len(stop_modes) == 2
+    assert_listener_closed()
     with open(finished, "w", encoding="ascii") as stream:
         stream.write(f"{time.time_ns()} {' '.join(stop_modes)}\n")
-    success(ASSERT_BOUNDED_STOP=1, ASSERT_STREAMS_STOPPED=1)
+    success(ASSERT_BOUNDED_STOP=1, ASSERT_STREAMS_STOPPED=1,
+            ASSERT_LISTENER_CLOSED_FIRST=1)
 
 
 command = sys.argv[1]
@@ -1500,30 +1511,23 @@ p11_ws_shutdown_join() {
         sleep 0.05
     done
     [[ -s "$ready_file" ]] || fail "shutdown WebSocket clients did not become ready"
-    local started=$SECONDS listener_closed_ns="" process_exit_ns="" client_finished_ns=""
+    local started=$SECONDS process_exit_ns="" client_finished_ns=""
     signal_owned_pid TERM "${ROLE_PIDS[host]}" \
         || fail "could not signal the owned host process"
     for attempt in {1..2000}; do
-        if [[ -z "$listener_closed_ns" ]] && ip netns exec "$HOST_NS" \
-            bash -c '! exec 3<>/dev/tcp/127.0.0.1/8881' >/dev/null 2>&1; then
-            listener_closed_ns=$(date +%s%N)
-        fi
         if [[ -z "$client_finished_ns" && -s "$finished_file" ]]; then
             read -r client_finished_ns _ <"$finished_file"
         fi
         if [[ -z "$process_exit_ns" ]] && ! owned_pid_running "${ROLE_PIDS[host]}"; then
             process_exit_ns=$(date +%s%N)
         fi
-        if [[ -n "$listener_closed_ns" && -n "$client_finished_ns" && -n "$process_exit_ns" ]]; then
+        if [[ -n "$client_finished_ns" && -n "$process_exit_ns" ]]; then
             break
         fi
         sleep 0.005
     done
-    [[ -n "$listener_closed_ns" ]] || fail "host listener remained open during shutdown"
     [[ -n "$client_finished_ns" ]] || fail "shutdown clients did not record bounded stream stop"
     [[ -n "$process_exit_ns" ]] || fail "host process exceeded its shutdown bound"
-    (( listener_closed_ns <= client_finished_ns )) \
-        || fail "WebSocket streams stopped before the data listener closed"
     local host_status client_status
     if wait "${ROLE_PIDS[host]}"; then host_status=0; else host_status=$?; fi
     (( host_status == 0 )) || fail "host process aborted during shutdown: status $host_status"
@@ -1534,7 +1538,6 @@ p11_ws_shutdown_join() {
     assert_capture_contains /shutdown-direct 'direct-before-stop'
     assert_capture_contains /shutdown-connect 'connect-before-stop'
     {
-        printf '%s\n' 'ASSERT_LISTENER_CLOSED_FIRST=1'
         printf '%s\n' 'ASSERT_GRACEFUL_PROCESS_EXIT=1'
         printf '%s\n' 'ASSERT_RELAY_TERMINALS_JOINED=1'
         printf '%s\n' 'ASSERT_CAPTURE_TASKS_FLUSHED=1'
