@@ -1026,6 +1026,7 @@ header = "x-test-loop"
             BodyRepresentation::PreservedContentCoded,
             body,
             30_001,
+            Arc::new(access_identity::IdentityContext::Disabled),
         )
         .unwrap();
         observe_body(&mut request);
@@ -1062,6 +1063,7 @@ header = "x-test-loop"
             BodyRepresentation::PreservedContentCoded,
             body,
             30_001,
+            Arc::new(access_identity::IdentityContext::Disabled),
         )
         .unwrap();
         observe_body(&mut request);
@@ -1136,6 +1138,7 @@ header = "x-test-loop"
             RuntimeRequest::INITIAL_REVISION,
             BodyRepresentation::PreservedContentCoded,
             BodyObservation::unobserved(),
+            request.identity(),
         )
         .unwrap();
         let evaluation = lease
@@ -1264,6 +1267,7 @@ header = "x-test-loop"
             RuntimeRequest::INITIAL_REVISION,
             BodyRepresentation::PreservedContentCoded,
             BodyObservation::unobserved(),
+            request.identity(),
         )
         .unwrap();
         let PolicyEvaluation::Delegate(delegated) = lease
@@ -1319,6 +1323,7 @@ header = "x-test-loop"
             RuntimeRequest::INITIAL_REVISION,
             BodyRepresentation::PreservedContentCoded,
             BodyObservation::unobserved(),
+            request.identity(),
         )
         .unwrap();
         let PolicyEvaluation::Allow {

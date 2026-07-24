@@ -1842,6 +1842,7 @@ mod tests {
             BodyRepresentation::PreservedContentCoded,
             body,
             1_000,
+            Arc::new(access_identity::IdentityContext::Disabled),
         )
         .unwrap()
     }

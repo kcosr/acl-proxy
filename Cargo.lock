@@ -785,6 +785,7 @@ dependencies = [
 name = "http-access-conformance"
 version = "0.1.0"
 dependencies = [
+ "access-identity",
  "http-access-types",
  "http-access-url",
  "serde",
@@ -816,6 +817,7 @@ dependencies = [
 name = "http-access-policy-acl"
 version = "0.1.0"
 dependencies = [
+ "access-identity",
  "http-access-types",
  "http-access-url",
 ]
@@ -866,6 +868,7 @@ dependencies = [
 name = "http-access-types"
 version = "0.1.0"
 dependencies = [
+ "access-identity",
  "idna",
  "memchr",
  "serde",

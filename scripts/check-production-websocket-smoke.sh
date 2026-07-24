@@ -204,6 +204,34 @@ def statement_index(statements, expected, description):
 def require_executable(body, pattern, description):
     if re.search(pattern, body, re.MULTILINE) is None:
         raise SystemExit(f"missing executable smoke statement: {description}")
+
+
+topology_identities = re.findall(
+    r"(?m)^readonly TOPOLOGY_IDENTITY=([A-Za-z0-9._-]+)$",
+    code,
+)
+if len(topology_identities) != 1 or len(topology_identities[0].encode("ascii")) < 32:
+    raise SystemExit("topology identity must be one literal bearer of at least 32 bytes")
+for alias in ("HOST_IDENTITY", "COMMON_IDENTITY", "INTERNAL_IDENTITY"):
+    assignments = re.findall(
+        rf"(?m)^readonly {alias}=\$TOPOLOGY_IDENTITY$",
+        code,
+    )
+    if len(assignments) != 1:
+        raise SystemExit(f"{alias} must derive exactly once from the topology identity")
+
+topology_statements = shell_statements(code)
+for namespace, role, identity, expected_count in (
+    ("$HOST_NS", "host", "$HOST_IDENTITY", 2),
+    ("$COMMON_NS", "common", "$COMMON_IDENTITY", 1),
+    ("$INTERNAL_NS", "internal", "$INTERNAL_IDENTITY", 1),
+):
+    expected_launch = ["run_proxy", namespace, role, identity]
+    if sum(tokens == expected_launch for tokens in topology_statements) != expected_count:
+        raise SystemExit(
+            f"expected {expected_count} executable {role} identity-bearing proxy launches"
+        )
+
 expected = [
     "p11_ws_direct_unprotected",
     "p11_ws_connect_mitm_fragmented_redaction_capture",
@@ -226,7 +254,7 @@ required_commands = {
     "p11_ws_https_parent_protected_redaction": [
         ("assert_ws_field", ["$result", "ASSERT_PARENT_TLS"]),
         ("assert_ws_field", ["$result", "ASSERT_INJECTED_IDENTITY_AUTHORIZATION"]),
-        ("assert_ws_field", ["$result", "ASSERT_SPOOF_REPLACED_AND_STRIPPED"]),
+        ("assert_ws_field", ["$result", "ASSERT_CONTEXT_REPLACED_AND_STRIPPED"]),
         ("assert_origin_events", ["headers-absent:/group/public.git/parent-protected"]),
     ],
     "p11_ws_admission_saturation": [
@@ -267,6 +295,66 @@ for case in expected:
         if len(matches) != 1:
             raise SystemExit(f"P11 WebSocket case {case} lacks one reachable {command} proof: {required}")
 
+host_identity_cases = [
+    "p11_ws_direct_unprotected",
+    "p11_ws_connect_mitm_fragmented_redaction_capture",
+    "p11_ws_admission_saturation",
+    "p11_ws_reload_and_lifetime",
+    "p11_ws_shutdown_join",
+]
+for case in host_identity_cases:
+    statements = shell_statements(function_body(case))
+    presentations = [
+        tokens
+        for tokens in statements
+        if "TOPOLOGY_IDENTITY=$TOPOLOGY_IDENTITY" in tokens
+    ]
+    command_prefix = "ip" if case == "p11_ws_shutdown_join" else "result=$(ip"
+    expected_prefix = [
+        command_prefix,
+        "netns",
+        "exec",
+        "$HOST_NS",
+        "env",
+        "TOPOLOGY_IDENTITY=$TOPOLOGY_IDENTITY",
+        "timeout",
+    ]
+    if (
+        len(presentations) != 1
+        or presentations[0][:len(expected_prefix)] != expected_prefix
+        or any(
+            token in {"env", "-u", "unset"}
+            or token.startswith("TOPOLOGY_IDENTITY=")
+            for token in presentations[0][len(expected_prefix):]
+        )
+    ):
+        raise SystemExit(f"host-only WebSocket case lacks one exact trusted identity command: {case}")
+
+parent_statements = shell_statements(function_body("p11_ws_https_parent_protected_redaction"))
+parent_identity_command = [
+    tokens
+    for tokens in parent_statements
+    if tokens[:8] == [
+        "result=$(ip",
+        "netns",
+        "exec",
+        "$COMMON_NS",
+        "env",
+        "-u",
+        "TOPOLOGY_IDENTITY",
+        "timeout",
+    ]
+]
+if (
+    len(parent_identity_command) != 1
+    or any(
+        token.startswith("TOPOLOGY_IDENTITY=")
+        or token in {"env", "-u", "unset"}
+        for token in parent_identity_command[0][8:]
+    )
+):
+    raise SystemExit("disabled-identity child WebSocket case must explicitly clear topology identity")
+
 assertion_body = function_body("assert_ws_101")
 assertion_statements = shell_statements(assertion_body)
 for proof in ("ASSERT_WS_101=1", "ASSERT_WS_ACCEPT=1"):
@@ -305,6 +393,15 @@ def require_direct_python_statement(function, statement, description):
 
 
 client_tree = python_trees["client"]
+client_identity_assignment = statement_shape(
+    'IDENTITY = os.environ.get("TOPOLOGY_IDENTITY")'
+)
+if sum(
+    ast.dump(node, include_attributes=False) == client_identity_assignment
+    for node in client_tree.body
+) != 1:
+    raise SystemExit("generated WebSocket client must bind identity from TOPOLOGY_IDENTITY")
+
 direct_node = python_function_node("direct_case", client_tree)
 require_direct_python_statement(direct_node, 'sensitive = b"fixture-secret-a-00000000000000000000"', "direct literal assignment")
 require_direct_python_statement(direct_node, "message(stream, sensitive, sensitive)", "direct unprotected message")
@@ -316,6 +413,27 @@ require_direct_python_statement(fragmented_node, "stream.sendall(masked_frame(0x
 tls_node = python_function_node("tls_wrap", client_tree)
 require_direct_python_statement(tls_node, "context = ssl.create_default_context(cafile=ca)", "verified TLS context")
 
+identity_headers_node = python_function_node("identity_headers", client_tree)
+require_direct_python_statement(
+    identity_headers_node,
+    'return (("x-aw-identity-token", IDENTITY),) if IDENTITY else ()',
+    "identity-header projection",
+)
+
+outer_connect_node = python_function_node("outer_connect", client_tree)
+require_direct_python_statement(
+    outer_connect_node,
+    'headers = "".join(f"{name}: {value}\\r\\n" for name, value in identity_headers())',
+    "outer CONNECT identity headers",
+)
+
+direct_open_node = python_function_node("direct_open", client_tree)
+require_direct_python_statement(
+    direct_open_node,
+    'upgrade(stream, f"http://{host}:8080{path}", f"{host}:8080", identity_headers())',
+    "direct request identity headers",
+)
+
 parent_node = python_function_node("parent_case", client_tree)
 parent_assignments = [node for node in parent_node.body if isinstance(node, ast.Assign)
                       and isinstance(node.value, ast.Call)
@@ -324,9 +442,19 @@ if len(parent_assignments) != 1:
     raise SystemExit("parent_case must directly assign one mitm_open call")
 extra_headers = [keyword.value for keyword in parent_assignments[0].value.keywords
                  if keyword.arg == "extra_headers"]
-expected_headers = ast.parse('x = (("x-aw-identity-token", "spoofed-client-identity"), ("x-aw-policy-context", "spoofed-client-context"))').body[0].value
+expected_headers = ast.parse(
+    'x = (("x-aw-policy-context", "spoofed-client-context"),)'
+).body[0].value
 if len(extra_headers) != 1 or ast.dump(extra_headers[0], include_attributes=False) != ast.dump(expected_headers, include_attributes=False):
-    raise SystemExit("parent_case lacks the exact direct spoof-header fixture")
+    raise SystemExit("parent_case lacks the exact disabled-ingress-safe context spoof fixture")
+require_direct_python_statement(
+    parent_node,
+    """success(ASSERT_PARENT_TLS=1, ASSERT_INJECTED_IDENTITY_AUTHORIZATION=1,
+        ASSERT_CONTEXT_REPLACED_AND_STRIPPED=1, ASSERT_CREDENTIAL_ISOLATION=1)""",
+    "parent identity/context proof",
+)
+if "ASSERT_SPOOF_REPLACED_AND_STRIPPED" in source:
+    raise SystemExit("stale spoof-replacement assertion name remains in topology smoke")
 
 admission_node = python_function_node("admission_case", client_tree)
 for statement in (
@@ -380,11 +508,12 @@ def require_config_replace(tree, old_text, new_fragment, description):
             matches.append(node)
     if len(matches) != 1:
         raise SystemExit(f"active config program lacks one direct {description} replacement")
+    return matches[0]
 
 
-require_config_replace(
+host_policy_replace = require_config_replace(
     python_trees["host_config"],
-    '[[policy.rules]]\nid = "prod-host-r00-require-identity"',
+    '[[policy.rules]]\nid = "prod-host-parent-connect"',
     'authorization_provider = "gitlab_acl"',
     "host protected-policy provider",
 )
@@ -393,6 +522,97 @@ require_config_replace(
     'url = "http://host-proxy.example.test:8881"\n',
     'url = "https://host-proxy.example.test:8443"\n',
     "child HTTPS parent proxy",
+)
+
+host_config_tree = python_trees["host_config"]
+listener_assignments = [
+    node
+    for node in host_config_tree.body
+    if isinstance(node, ast.Assign)
+    and len(node.targets) == 1
+    and isinstance(node.targets[0], ast.Name)
+    and node.targets[0].id == "listener"
+    and isinstance(node.value, ast.Constant)
+    and isinstance(node.value.value, str)
+]
+if len(listener_assignments) != 1 or (
+    "\n[listeners.explicit_https.identity]\nmode = \"required\"\n"
+    not in listener_assignments[0].value.value
+):
+    raise SystemExit("generated host HTTPS listener must require identity")
+
+policy_anchor_assignment = statement_shape(
+    'policy_anchor = \'[[policy.rules]]\\nid = "prod-host-parent-connect"\''
+)
+policy_anchor_guard = statement_shape(
+    '''if text.count(policy_anchor) != 1:
+    raise SystemExit("unexpected host policy anchor fixture shape")'''
+)
+anchor_assignments = [
+    node
+    for node in host_config_tree.body
+    if ast.dump(node, include_attributes=False) == policy_anchor_assignment
+]
+anchor_guards = [
+    node
+    for node in host_config_tree.body
+    if ast.dump(node, include_attributes=False) == policy_anchor_guard
+]
+if (
+    len(anchor_assignments) != 1
+    or len(anchor_guards) != 1
+    or not anchor_assignments[0].lineno
+    < anchor_guards[0].lineno
+    < host_policy_replace.lineno
+):
+    raise SystemExit("host policy anchor requires one exact-count guard before replacement")
+
+def require_tls_proxy_identity(statements, identity, description):
+    identity_header = f"x-aw-identity-token: ${identity}"
+
+    def is_identity_header(value):
+        name, separator, _ = value.partition(":")
+        return bool(separator) and name.strip().lower() == "x-aw-identity-token"
+
+    def has_origin_identity_header(tokens):
+        for index, token in enumerate(tokens):
+            if token in {"-H", "--header"}:
+                if index + 1 < len(tokens) and is_identity_header(tokens[index + 1]):
+                    return True
+            elif token.startswith("-H") and token != "-H":
+                if is_identity_header(token[2:]):
+                    return True
+            elif token.startswith("--header="):
+                if is_identity_header(token.removeprefix("--header=")):
+                    return True
+        return False
+
+    matches = [
+        tokens
+        for tokens in statements
+        if "https://host-proxy.example.test:8443" in tokens
+        and "--proxy-cacert" in tokens
+        and sum(
+            tokens[index:index + 2] == ["--proxy-header", identity_header]
+            for index in range(len(tokens) - 1)
+        ) == 1
+    ]
+    if len(matches) != 1:
+        raise SystemExit(f"{description} lacks one TLS proxy identity presentation")
+    tokens = matches[0]
+    if has_origin_identity_header(tokens):
+        raise SystemExit(f"{description} sends proxy identity as an origin header")
+
+
+require_tls_proxy_identity(
+    shell_statements(function_body("direct_host_context_must_match_identity_authorization")),
+    "COMMON_IDENTITY",
+    "direct host authorization check",
+)
+require_tls_proxy_identity(
+    shell_statements(code),
+    "INTERNAL_IDENTITY",
+    "direct host HTTP check",
 )
 
 signal_tree = python_trees["signal"]

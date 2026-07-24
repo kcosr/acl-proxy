@@ -71,10 +71,12 @@ below.
 The context change is intentional security hardening. The internal fixture
 injects the invented value `fixture-internal`. The host declares a consuming
 role, strips the context before origin egress, and passes it only to the Git
-process provider. The raw identity bearer is never projected to a provider;
-checked identity projection is introduced separately. Local policy does not
-trust an internal-context value. Sanitized benchmark CIDRs preserve the source
-rule groups without claiming that a source address authenticates a workload.
+process provider. The raw identity bearer is never projected to a provider. The
+Git delegate is limited to an exact authority-qualified authenticated group,
+and both process providers receive the complete checked identity projection
+plus the exact matched rule ID. Local policy does not trust an internal-context
+value. Sanitized benchmark CIDRs preserve the source rule groups without
+claiming that a source address authenticates a workload.
 
 ## Provider Traceability And Parity
 
@@ -88,11 +90,12 @@ rule groups without claiming that a source address authenticates a workload.
 The source scripts use `#!/usr/bin/env python3`, `--config` with a relative JSON
 file, newline-delimited JSON on stdin/stdout, stable request IDs, and only
 `allow` or `deny`. Missing and unknown identities deny with a normal response.
-The active Git provider currently receives context only. The configured but
-inactive runner provider receives no headers. Both therefore deny identity-
-dependent requests until checked identity projection is introduced. Synthetic
-providers preserve the existing protocol and failure posture without
-reproducing source code or private authorization data.
+The active Git provider receives context plus checked identity and authorizes
+the exact matched rule through authority-qualified group membership. The
+configured but inactive runner provider receives checked principal identity and
+uses the same rule-ID keyed provider contract. Synthetic providers preserve the
+existing protocol and failure posture without reproducing source code or
+private authorization data.
 
 ## Host Rule Map
 
@@ -178,9 +181,10 @@ destinations and paths are replaced, but the stated counts apply to each row.
 2. Reject all three sanitized v1 shapes through the strict runtime and CLI.
 3. Assert the exact rule IDs, counts, pattern counts, method sets, wildcard
    classes, provider placement, and redaction placement recorded above.
-4. Execute both synthetic providers for deny, malformed input, restart,
-   timeout, and reload cases while checked identity projection is absent.
+4. Execute both synthetic providers for allow, deny, missing or unknown checked
+   identity, malformed input, restart, timeout, and reload cases.
 5. Prove the protected bearer is filtered from both providers and origin
-   traffic, while the internal context reaches only the Git provider.
+   traffic, checked identity and matched rule ID reach both provider transports,
+   and the internal context reaches only the Git provider.
 6. Probe readiness at control port 8898 and prove control paths are unavailable
    through ports 8881 and 8889.

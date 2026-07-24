@@ -640,6 +640,7 @@ mod tests {
                 timeout: Duration::from_secs(30),
                 on_failure: CompiledProviderFailureMode::Deny,
                 include_headers: Vec::new(),
+                include_identity: false,
                 max_request_bytes: 8 * 1024,
                 max_response_bytes,
                 outputs,

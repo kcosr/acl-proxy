@@ -39,6 +39,7 @@ decision = "delegate"
 urls = ["https://example.test/api/**", "https://example.test/status"]
 methods = ["get"]
 client_cidrs = ["10.0.0.0/8"]
+identity_states = ["disabled"]
 request_timeout = "5s"
 allow_upgrades = true
 authorization_provider = "approval"
@@ -112,6 +113,8 @@ fn policy_dump_defaults_to_stable_secret_free_json_off_tty() {
     assert_eq!(rule["urls"][1], "https://example.test/status");
     assert_eq!(rule["methods"][0], "GET");
     assert_eq!(rule["client_cidrs"][0], "10.0.0.0/8");
+    assert_eq!(rule["identity_states"][0], "disabled");
+    assert_eq!(rule["identity_subjects"], serde_json::json!([]));
     assert_eq!(rule["headers"]["absent_any"][0], "x-blocked");
     assert_eq!(rule["headers"]["present_all"][0], "x-identity");
     assert_eq!(rule["headers"]["all"][0]["name"], "x-tenant");
@@ -143,6 +146,7 @@ fn policy_dump_table_uses_the_same_compiled_projection() {
         .stdout(contains("present:x-identity"))
         .stdout(contains("x-tenant=engineering"))
         .stdout(contains("x-channel!=untrusted"))
+        .stdout(contains("state=disabled"))
         .stdout(contains("approval"))
         .stdout(contains("request:set:x-route"))
         .stdout(contains("response:remove:x-remove-me"))

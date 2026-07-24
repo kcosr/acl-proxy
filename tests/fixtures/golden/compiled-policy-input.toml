@@ -5,8 +5,33 @@ endpoint.kind = "tcp"
 endpoint.address = "127.0.0.1:1"
 http_versions = ["http1"]
 
+[listeners.explicit_http.identity]
+mode = "required"
+
 [listeners.explicit_http.connect]
 http1 = "deny"
+
+[identity]
+max_pending_authentications = 8
+max_pending_authentications_per_connection = 2
+
+[identity.resolver]
+kind = "static"
+authority = "test-authority"
+
+[[identity.resolver.principals]]
+id = "test-principal"
+kind = "service_account"
+
+[[identity.resolver.groups]]
+id = "developers"
+members = ["test-principal"]
+
+[[identity.resolver.tokens]]
+id = "test-token"
+principal = "test-principal"
+source = "environment"
+variable = "AW_IDENTITY_TOKEN"
 
 [authorization.providers.approval]
 kind = "process"
@@ -27,6 +52,11 @@ decision = "delegate"
 urls = ["https://example.com/app/**"]
 description = "delegate application"
 authorization_provider = "approval"
+identity_states = ["authenticated"]
+identity_subjects = [
+  { kind = "group", authority = "test-authority", id = "developers" },
+  { kind = "principal", authority = "test-authority", id = "test-principal" },
+]
 
 [[policy.rules]]
 id = "allow-app-after-pass"

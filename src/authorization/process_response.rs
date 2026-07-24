@@ -813,6 +813,7 @@ mod tests {
             environment: BTreeMap::new(),
             blocked_environment: Vec::new(),
             include_headers: Vec::new(),
+            include_identity: false,
             include_request_body: false,
             allow_request_body_replacement,
             max_request_body_bytes: 1,

@@ -19,6 +19,7 @@ pub(crate) struct WebhookProvider {
     timeout: Duration,
     failure_mode: CompiledProviderFailureMode,
     include_headers: Box<[HeaderName]>,
+    include_identity: bool,
     max_request_bytes: usize,
     max_response_bytes: usize,
     outputs: ProviderOutputRegistry,
@@ -100,6 +101,7 @@ impl WebhookProvider {
             timeout: plan.timeout,
             failure_mode: plan.on_failure,
             include_headers: plan.include_headers.into_boxed_slice(),
+            include_identity: plan.include_identity,
             max_request_bytes: plan.max_request_bytes,
             max_response_bytes: plan.max_response_bytes,
             outputs: ProviderOutputRegistry::activate(plan.outputs),
@@ -162,6 +164,7 @@ impl WebhookProvider {
             timeout: plan.timeout,
             failure_mode: plan.on_failure,
             include_headers: plan.include_headers.into_boxed_slice(),
+            include_identity: plan.include_identity,
             max_request_bytes: plan.max_request_bytes,
             max_response_bytes: plan.max_response_bytes,
             outputs: ProviderOutputRegistry::activate(plan.outputs),
@@ -183,6 +186,10 @@ impl WebhookProvider {
 
     pub(crate) fn include_headers(&self) -> &[HeaderName] {
         &self.include_headers
+    }
+
+    pub(crate) fn include_identity(&self) -> bool {
+        self.include_identity
     }
 
     pub(crate) fn max_request_bytes(&self) -> usize {
@@ -232,6 +239,7 @@ mod tests {
             timeout: Duration::from_secs(3),
             on_failure: CompiledProviderFailureMode::Deny,
             include_headers: vec![HeaderName::from_static("x-context")],
+            include_identity: false,
             max_request_bytes: 8192,
             max_response_bytes: 4096,
             outputs: BTreeMap::new(),

@@ -6,8 +6,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use access_identity::{
-    project_static_resolver_resources, AuthorityId, GroupId, IdentityAudience, PrincipalId,
-    PrincipalKind, StaticGroup, StaticPrincipal, TokenId,
+    project_static_resolver_resources, AuthorityId, GroupId, IdentityAudience, IdentityState,
+    IdentitySubject, PrincipalId, PrincipalKind, StaticGroup, StaticPrincipal, TokenId,
 };
 use base64::encoded_len as base64_encoded_len;
 use credential_core::{
@@ -62,9 +62,10 @@ use super::authoring::{
     AccessFlowTransportConfig, AuthorizationConfig, AuthorizationProviderConfig,
     CredentialActionConfig, CredentialSourceConfig, CredentialsConfig, EgressConfig, EgressRoute,
     HeaderEffectConfig, HeaderEffectWhen, Http1ConnectPolicy, HttpVersion,
-    IdentityPrincipalKindConfig, ListenerEndpointConfig, ListenerIdentityModeConfig,
-    ListenersConfig, MitmConfig, ObservationConfig, ParentProxyKind, ParentProxyPresentationConfig,
-    PolicyConfig, PolicyRuleConfig, RedactionConfig, RedactionPayloads, RuleDecision, SafetyConfig,
+    IdentityPrincipalKindConfig, IdentityStateConfig, IdentitySubjectConfig,
+    ListenerEndpointConfig, ListenerIdentityModeConfig, ListenersConfig, MitmConfig,
+    ObservationConfig, ParentProxyKind, ParentProxyPresentationConfig, PolicyConfig,
+    PolicyRuleConfig, RedactionConfig, RedactionPayloads, RuleDecision, SafetyConfig,
     StaticTlsIdentityConfig, TlsTrust, TransportSecurity, TransportTlsConfig,
     UnsupportedExtensions,
 };
@@ -586,6 +587,7 @@ pub(crate) struct PolicyRulePlan {
     pub(crate) urls: Vec<CompiledUrlPattern>,
     pub(crate) methods: Vec<Method>,
     pub(crate) client_cidrs: Vec<ipnet::IpNet>,
+    pub(crate) identity: Option<IdentityPredicatePlan>,
     pub(crate) headers: HeaderPredicatesPlan,
     pub(crate) request_timeout: Option<Duration>,
     pub(crate) allow_upgrades: bool,
@@ -594,6 +596,12 @@ pub(crate) struct PolicyRulePlan {
     pub(crate) request_headers: Vec<HeaderEffectPlan>,
     pub(crate) response_headers: Vec<HeaderEffectPlan>,
     pub(crate) credential_actions: Vec<CredentialActionPlan>,
+}
+
+#[derive(Clone)]
+pub(crate) struct IdentityPredicatePlan {
+    pub(crate) states: Vec<IdentityState>,
+    pub(crate) subjects: Vec<IdentitySubject>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -720,6 +728,7 @@ pub(crate) struct WebhookProviderPlan {
     pub(crate) timeout: Duration,
     pub(crate) on_failure: CompiledProviderFailureMode,
     pub(crate) include_headers: Vec<HeaderName>,
+    pub(crate) include_identity: bool,
     pub(crate) max_request_bytes: usize,
     pub(crate) max_response_bytes: usize,
     pub(crate) outputs: BTreeMap<String, ProviderOutputPlan>,
@@ -744,6 +753,7 @@ pub(crate) struct ProcessProviderPlan {
     pub(crate) environment: BTreeMap<String, String>,
     pub(crate) blocked_environment: Vec<String>,
     pub(crate) include_headers: Vec<HeaderName>,
+    pub(crate) include_identity: bool,
     pub(crate) include_request_body: bool,
     pub(crate) allow_request_body_replacement: bool,
     pub(crate) max_request_body_bytes: usize,
@@ -1517,12 +1527,50 @@ fn validate_identity(config: &super::authoring::AuthoringConfig) -> Result<(), C
     .into_iter()
     .flatten()
     .any(|identity| !matches!(identity.mode, ListenerIdentityModeConfig::Disabled));
+    let optional_listener = [
+        config
+            .listeners
+            .explicit_http
+            .as_ref()
+            .and_then(|value| value.identity.as_ref()),
+        config
+            .listeners
+            .transparent_http
+            .as_ref()
+            .and_then(|value| value.identity.as_ref()),
+        config
+            .listeners
+            .explicit_https
+            .as_ref()
+            .and_then(|value| value.identity.as_ref()),
+        config
+            .listeners
+            .transparent_https
+            .as_ref()
+            .and_then(|value| value.identity.as_ref()),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|identity| matches!(identity.mode, ListenerIdentityModeConfig::Optional));
+
+    validate_policy_identity_shapes(config, enabled_listener, optional_listener)?;
 
     let Some(identity) = &config.identity else {
         if enabled_listener {
             return Err(ConfigCompileError::at(
                 "identity",
                 "is required when a listener enables identity",
+            ));
+        }
+        if config
+            .policy
+            .rules
+            .iter()
+            .any(|rule| rule.identity_subjects.is_some())
+        {
+            return Err(ConfigCompileError::at(
+                "policy.rules.identity_subjects",
+                "requires a configured identity resolver",
             ));
         }
         return Ok(());
@@ -1568,7 +1616,7 @@ fn validate_identity(config: &super::authoring::AuthoringConfig) -> Result<(), C
         ));
     }
 
-    AuthorityId::new(identity.resolver.authority.clone()).map_err(|error| {
+    let authority = AuthorityId::new(identity.resolver.authority.clone()).map_err(|error| {
         ConfigCompileError::at("identity.resolver.authority", error.to_string())
     })?;
     IdentityAudience::new("acl-proxy.identity")
@@ -1659,6 +1707,7 @@ fn validate_identity(config: &super::authoring::AuthoringConfig) -> Result<(), C
             "exceeds the static identity membership limit",
         ));
     }
+    validate_policy_identity_subjects(config, &authority, &principal_ids, &group_ids)?;
 
     let mut token_ids = BTreeSet::new();
     let mut source_variables = BTreeSet::new();
@@ -1767,6 +1816,135 @@ fn validate_identity(config: &super::authoring::AuthoringConfig) -> Result<(), C
                 format!("{name}.identity.mode"),
                 "identity over cleartext TCP requires a loopback listener",
             ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_policy_identity_shapes(
+    config: &super::authoring::AuthoringConfig,
+    enabled_listener: bool,
+    optional_listener: bool,
+) -> Result<(), ConfigCompileError> {
+    for (index, rule) in config.policy.rules.iter().enumerate() {
+        let prefix = format!("policy.rules[{index}]");
+        if let Some(states) = &rule.identity_states {
+            if states.is_empty() {
+                return Err(ConfigCompileError::at(
+                    format!("{prefix}.identity_states"),
+                    "must not be empty when present",
+                ));
+            }
+            let mut unique = BTreeSet::new();
+            for state in states {
+                if !unique.insert(*state) {
+                    return Err(ConfigCompileError::at(
+                        format!("{prefix}.identity_states"),
+                        "must not contain duplicates",
+                    ));
+                }
+            }
+            if states.contains(&IdentityStateConfig::Anonymous) && !optional_listener {
+                return Err(ConfigCompileError::at(
+                    format!("{prefix}.identity_states"),
+                    "anonymous identity requires at least one optional identity listener",
+                ));
+            }
+        }
+        if let Some(subjects) = &rule.identity_subjects {
+            if subjects.is_empty() {
+                return Err(ConfigCompileError::at(
+                    format!("{prefix}.identity_subjects"),
+                    "must not be empty when present",
+                ));
+            }
+            if rule.identity_states.as_deref() != Some(&[IdentityStateConfig::Authenticated]) {
+                return Err(ConfigCompileError::at(
+                    format!("{prefix}.identity_subjects"),
+                    "requires identity_states = [\"authenticated\"]",
+                ));
+            }
+            if !enabled_listener {
+                return Err(ConfigCompileError::at(
+                    format!("{prefix}.identity_subjects"),
+                    "authenticated subjects require at least one identity-enabled listener",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_policy_identity_subjects(
+    config: &super::authoring::AuthoringConfig,
+    resolver_authority: &AuthorityId,
+    principals: &BTreeSet<PrincipalId>,
+    groups: &BTreeSet<GroupId>,
+) -> Result<(), ConfigCompileError> {
+    for (rule_index, rule) in config.policy.rules.iter().enumerate() {
+        let Some(subjects) = &rule.identity_subjects else {
+            continue;
+        };
+        let path = format!("policy.rules[{rule_index}].identity_subjects");
+        let mut unique = BTreeSet::new();
+        for (subject_index, subject) in subjects.iter().enumerate() {
+            let subject_path = format!("{path}[{subject_index}]");
+            let compiled = match subject {
+                IdentitySubjectConfig::Principal { authority, id } => {
+                    let authority = AuthorityId::new(authority.clone()).map_err(|error| {
+                        ConfigCompileError::at(
+                            format!("{subject_path}.authority"),
+                            error.to_string(),
+                        )
+                    })?;
+                    if &authority != resolver_authority {
+                        return Err(ConfigCompileError::at(
+                            format!("{subject_path}.authority"),
+                            "must match the configured identity resolver authority",
+                        ));
+                    }
+                    let id = PrincipalId::new(id.clone()).map_err(|error| {
+                        ConfigCompileError::at(format!("{subject_path}.id"), error.to_string())
+                    })?;
+                    if !principals.contains(&id) {
+                        return Err(ConfigCompileError::at(
+                            format!("{subject_path}.id"),
+                            "references an unknown identity principal",
+                        ));
+                    }
+                    IdentitySubject::Principal { authority, id }
+                }
+                IdentitySubjectConfig::Group { authority, id } => {
+                    let authority = AuthorityId::new(authority.clone()).map_err(|error| {
+                        ConfigCompileError::at(
+                            format!("{subject_path}.authority"),
+                            error.to_string(),
+                        )
+                    })?;
+                    if &authority != resolver_authority {
+                        return Err(ConfigCompileError::at(
+                            format!("{subject_path}.authority"),
+                            "must match the configured identity resolver authority",
+                        ));
+                    }
+                    let id = GroupId::new(id.clone()).map_err(|error| {
+                        ConfigCompileError::at(format!("{subject_path}.id"), error.to_string())
+                    })?;
+                    if !groups.contains(&id) {
+                        return Err(ConfigCompileError::at(
+                            format!("{subject_path}.id"),
+                            "references an unknown identity group",
+                        ));
+                    }
+                    IdentitySubject::Group { authority, id }
+                }
+            };
+            if !unique.insert(compiled) {
+                return Err(ConfigCompileError::at(
+                    subject_path,
+                    "duplicates an earlier identity subject",
+                ));
+            }
         }
     }
     Ok(())
@@ -3537,6 +3715,8 @@ fn validate_policy(
         let predicate_count = rule.urls.len()
             + rule.methods.len()
             + rule.client_cidrs.len()
+            + rule.identity_states.as_ref().map_or(0, Vec::len)
+            + rule.identity_subjects.as_ref().map_or(0, Vec::len)
             + rule.headers.absent_any.len()
             + rule.headers.present_all.len()
             + rule.headers.all.len()
@@ -4073,7 +4253,13 @@ fn validate_provider_limits(
                     ));
                 }
                 if let Some(callback) = &config.authorization.callback {
-                    let minimum = minimum_webhook_request_bytes(&callback.public_url)?;
+                    let identity_member_bytes = if value.include_identity {
+                        maximum_provider_identity_member_bytes(config)?
+                    } else {
+                        0
+                    };
+                    let minimum =
+                        minimum_webhook_request_bytes(&callback.public_url, identity_member_bytes)?;
                     if value.max_request_bytes < minimum {
                         return Err(ConfigCompileError::at(
                             format!("authorization.providers.{name}.max_request_bytes"),
@@ -4159,15 +4345,43 @@ fn validate_provider_limits(
     Ok(())
 }
 
-fn minimum_webhook_request_bytes(callback_url: &str) -> Result<usize, ConfigCompileError> {
+fn minimum_webhook_request_bytes(
+    callback_url: &str,
+    identity_member_bytes: usize,
+) -> Result<usize, ConfigCompileError> {
     MIN_WEBHOOK_REQUEST_WITHOUT_CALLBACK_URL_BYTES
         .checked_add(callback_url.len())
+        .and_then(|value| value.checked_add(identity_member_bytes))
         .ok_or_else(|| {
             ConfigCompileError::at(
                 "authorization.callback.public_url",
                 "minimum webhook request-envelope arithmetic overflow",
             )
         })
+}
+
+fn maximum_provider_identity_member_bytes(
+    config: &super::authoring::AuthoringConfig,
+) -> Result<usize, ConfigCompileError> {
+    const DISABLED: &[u8] = br#"{"identity":{"state":"disabled"}}"#;
+    const ANONYMOUS: &[u8] = br#"{"identity":{"state":"anonymous"}}"#;
+
+    let complete_object_bytes = match compile_identity_plan(config.identity.as_ref())? {
+        Some(identity) => usize::try_from(identity.resources.max_provider_projection_bytes)
+            .map_err(|_| {
+                ConfigCompileError::at(
+                    "identity.resolver",
+                    "provider identity projection cannot be represented",
+                )
+            })?,
+        None => DISABLED.len().max(ANONYMOUS.len()),
+    };
+    complete_object_bytes.checked_sub(1).ok_or_else(|| {
+        ConfigCompileError::at(
+            "identity",
+            "provider identity projection is missing its outer object",
+        )
+    })
 }
 
 fn validate_process_environment(
@@ -6587,6 +6801,7 @@ fn compile_policy_rule_plan(
             })
             .collect::<Result<Vec<_>, _>>()?,
         client_cidrs: compile_client_cidrs(&value.client_cidrs, &format!("{prefix}.client_cidrs"))?,
+        identity: compile_identity_predicate_plan(value, &prefix)?,
         headers: compile_header_predicates_plan(&value.headers, &prefix)?,
         request_timeout: value.request_timeout.as_ref().map(|timeout| timeout.get()),
         allow_upgrades: value.allow_upgrades,
@@ -6605,6 +6820,61 @@ fn compile_policy_rule_plan(
             &format!("{prefix}.credential_actions"),
         )?,
     })
+}
+
+fn compile_identity_predicate_plan(
+    value: &PolicyRuleConfig,
+    prefix: &str,
+) -> Result<Option<IdentityPredicatePlan>, ConfigCompileError> {
+    let Some(authored_states) = &value.identity_states else {
+        return Ok(None);
+    };
+    let mut states = authored_states
+        .iter()
+        .map(|state| match state {
+            IdentityStateConfig::Disabled => IdentityState::Disabled,
+            IdentityStateConfig::Anonymous => IdentityState::Anonymous,
+            IdentityStateConfig::Authenticated => IdentityState::Authenticated,
+        })
+        .collect::<Vec<_>>();
+    states.sort_by_key(|state| match state {
+        IdentityState::Disabled => 0_u8,
+        IdentityState::Anonymous => 1,
+        IdentityState::Authenticated => 2,
+    });
+
+    let mut subjects = value
+        .identity_subjects
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .map(|(index, subject)| {
+            let path = format!("{prefix}.identity_subjects[{index}]");
+            match subject {
+                IdentitySubjectConfig::Principal { authority, id } => {
+                    Ok(IdentitySubject::Principal {
+                        authority: AuthorityId::new(authority.clone()).map_err(|error| {
+                            ConfigCompileError::at(format!("{path}.authority"), error.to_string())
+                        })?,
+                        id: PrincipalId::new(id.clone()).map_err(|error| {
+                            ConfigCompileError::at(format!("{path}.id"), error.to_string())
+                        })?,
+                    })
+                }
+                IdentitySubjectConfig::Group { authority, id } => Ok(IdentitySubject::Group {
+                    authority: AuthorityId::new(authority.clone()).map_err(|error| {
+                        ConfigCompileError::at(format!("{path}.authority"), error.to_string())
+                    })?,
+                    id: GroupId::new(id.clone()).map_err(|error| {
+                        ConfigCompileError::at(format!("{path}.id"), error.to_string())
+                    })?,
+                }),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    subjects.sort();
+    Ok(Some(IdentityPredicatePlan { states, subjects }))
 }
 
 /// Policy peers canonicalize IPv4-mapped socket addresses to IPv4. Authored
@@ -6846,6 +7116,7 @@ fn compile_provider_plan(
                     &value.include_headers,
                     &format!("{prefix}.include_headers"),
                 )?,
+                include_identity: value.include_identity,
                 max_request_bytes: value.max_request_bytes,
                 max_response_bytes: value.max_response_bytes,
                 outputs: compile_provider_outputs(&value.outputs, &format!("{prefix}.outputs"))?,
@@ -6870,6 +7141,7 @@ fn compile_provider_plan(
                     &value.include_headers,
                     &format!("{prefix}.include_headers"),
                 )?,
+                include_identity: value.include_identity,
                 include_request_body: value.include_request_body,
                 allow_request_body_replacement: value.allow_request_body_replacement,
                 max_request_body_bytes: value.max_request_body_bytes,
@@ -7530,6 +7802,7 @@ mod tests {
             1,
             http_access_types::BodyRepresentation::PreservedContentCoded,
             http_access_types::BodyObservation::unobserved(),
+            &access_identity::IdentityContext::Disabled,
         )
         .unwrap();
         snapshot.snapshot().evaluate(&input).unwrap()
@@ -7703,6 +7976,170 @@ default = "deny"
 
     fn file_identity_config(path: &str) -> String {
         identity_config(&format!("source = \"file\"\npath = {path:?}"))
+    }
+
+    fn identity_policy_config(mode: &str, states: &str, subjects: Option<&str>) -> String {
+        let subjects = subjects
+            .map(|value| format!("identity_subjects = {value}\n"))
+            .unwrap_or_default();
+        environment_identity_config("AW_IDENTITY_TOKEN")
+            .replace("mode = \"required\"", &format!("mode = {mode:?}"))
+            .replace(
+                "[policy]\ndefault = \"deny\"",
+                &format!(
+                    r#"[[identity.resolver.groups]]
+id = "developers"
+members = ["test-principal"]
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "identity-rule"
+decision = "allow"
+identity_states = {states}
+{subjects}"#
+                ),
+            )
+    }
+
+    #[test]
+    fn policy_identity_predicates_are_strict_canonical_or_sets() {
+        let valid = identity_policy_config(
+            "optional",
+            r#"["authenticated", "disabled", "anonymous"]"#,
+            None,
+        );
+        let compiled = compile(&valid).expect("all three identity states are a valid OR set");
+        let identity = compiled.reloadable_plan.policy.rules[0]
+            .identity
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            identity.states,
+            [
+                IdentityState::Disabled,
+                IdentityState::Anonymous,
+                IdentityState::Authenticated
+            ]
+        );
+        assert!(identity.subjects.is_empty());
+
+        for (input, expected) in [
+            (
+                identity_policy_config("required", "[]", None),
+                "must not be empty",
+            ),
+            (
+                identity_policy_config("required", r#"["authenticated", "authenticated"]"#, None),
+                "must not contain duplicates",
+            ),
+            (
+                identity_policy_config("required", r#"["authenticated"]"#, Some("[]")),
+                "must not be empty",
+            ),
+            (
+                identity_policy_config(
+                    "required",
+                    r#"["authenticated", "disabled"]"#,
+                    Some(
+                        r#"[{ kind = "principal", authority = "test-authority", id = "test-principal" }]"#,
+                    ),
+                ),
+                "requires identity_states",
+            ),
+            (
+                identity_policy_config(
+                    "required",
+                    r#"["authenticated"]"#,
+                    Some(
+                        r#"[
+  { kind = "group", authority = "test-authority", id = "developers" },
+  { kind = "group", authority = "test-authority", id = "developers" },
+]"#,
+                    ),
+                ),
+                "duplicates an earlier identity subject",
+            ),
+        ] {
+            let error = compile(&input).expect_err("invalid identity predicate must fail");
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?}, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_identity_subjects_are_exact_resolver_qualified_values() {
+        let valid = identity_policy_config(
+            "required",
+            r#"["authenticated"]"#,
+            Some(
+                r#"[
+  { kind = "group", authority = "test-authority", id = "developers" },
+  { kind = "principal", authority = "test-authority", id = "test-principal" },
+]"#,
+            ),
+        );
+        let compiled = compile(&valid).expect("known principal and group must compile");
+        let subjects = &compiled.reloadable_plan.policy.rules[0]
+            .identity
+            .as_ref()
+            .unwrap()
+            .subjects;
+        assert_eq!(subjects.len(), 2);
+        assert!(subjects.windows(2).all(|pair| pair[0] < pair[1]));
+
+        for (subjects, expected) in [
+            (
+                r#"[{ kind = "principal", authority = "other", id = "test-principal" }]"#,
+                "must match the configured identity resolver authority",
+            ),
+            (
+                r#"[{ kind = "principal", authority = "test-authority", id = "missing" }]"#,
+                "unknown identity principal",
+            ),
+            (
+                r#"[{ kind = "group", authority = "test-authority", id = "missing" }]"#,
+                "unknown identity group",
+            ),
+        ] {
+            let input = identity_policy_config("required", r#"["authenticated"]"#, Some(subjects));
+            let error = compile(&input).expect_err("unknown identity subject must fail");
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?}, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_identity_anonymous_state_requires_an_optional_listener() {
+        let required = identity_policy_config("required", r#"["anonymous"]"#, None);
+        let error = compile(&required).expect_err("required listeners cannot produce anonymous");
+        assert!(
+            error
+                .to_string()
+                .contains("anonymous identity requires at least one optional identity listener"),
+            "{error}"
+        );
+        compile(&identity_policy_config(
+            "optional",
+            r#"["anonymous"]"#,
+            None,
+        ))
+        .expect("an optional listener can produce anonymous identity");
+
+        let disabled_only = format!(
+            r#"{MINIMAL}
+[[policy.rules]]
+id = "disabled"
+decision = "allow"
+identity_states = ["disabled"]
+"#
+        );
+        compile(&disabled_only).expect("disabled identity has no reachability requirement");
     }
 
     #[test]
@@ -9087,6 +9524,86 @@ methods = ["POST"]
         )
     }
 
+    fn identity_webhook_config(max_request_bytes: usize) -> String {
+        webhook_config(max_request_bytes, MIN_CALLBACK_RESPONSE_BYTES)
+            .replace(
+                "url = \"https://approval.example.test/authorize\"",
+                "url = \"https://approval.example.test/authorize\"\ninclude_identity = true",
+            )
+            .replace(
+                "[listeners.explicit_http.connect]",
+                r#"[listeners.explicit_http.identity]
+mode = "required"
+
+[identity]
+max_pending_authentications = 8
+max_pending_authentications_per_connection = 2
+
+[identity.resolver]
+kind = "static"
+authority = "test-authority"
+
+[[identity.resolver.principals]]
+id = "test-principal"
+kind = "service_account"
+
+[[identity.resolver.groups]]
+id = "developers"
+members = ["test-principal"]
+
+[[identity.resolver.tokens]]
+id = "test-token"
+principal = "test-principal"
+source = "environment"
+variable = "AW_IDENTITY_TOKEN"
+
+[listeners.explicit_http.connect]"#,
+            )
+    }
+
+    #[test]
+    fn l05_provider_identity_projection_is_strictly_opt_in() {
+        for explicit_false in [false, true] {
+            let mut webhook = webhook_config(65_536, MIN_CALLBACK_RESPONSE_BYTES);
+            if explicit_false {
+                webhook = webhook.replace(
+                    "url = \"https://approval.example.test/authorize\"",
+                    "url = \"https://approval.example.test/authorize\"\ninclude_identity = false",
+                );
+            }
+            let compiled = compile(&webhook).expect("webhook provider must compile");
+            let AuthorizationProviderPlan::Webhook(provider) =
+                &compiled.reloadable_plan.authorization.providers["approval"]
+            else {
+                panic!("expected webhook provider");
+            };
+            assert!(!provider.include_identity);
+
+            let include_identity = if explicit_false {
+                "include_identity = false\n"
+            } else {
+                ""
+            };
+            let process = MINIMAL.replace(
+                "[policy]",
+                &format!(
+                    r#"[authorization.providers.local]
+kind = "process"
+command = "/bin/authorize"
+{include_identity}
+[policy]"#
+                ),
+            );
+            let compiled = compile(&process).expect("process provider must compile");
+            let AuthorizationProviderPlan::Process(provider) =
+                &compiled.reloadable_plan.authorization.providers["local"]
+            else {
+                panic!("expected process provider");
+            };
+            assert!(!provider.include_identity);
+        }
+    }
+
     #[test]
     fn webhook_minimum_request_envelope_limits_compile() {
         const CALLBACK_URL: &str = "http://127.0.0.1:8898/_acl-proxy/external-auth/callback";
@@ -9102,6 +9619,30 @@ methods = ["POST"]
         let error = compile(&webhook_config(minimum - 1, MIN_CALLBACK_RESPONSE_BYTES))
             .expect_err("one byte below the exact compact request envelope must fail");
         assert!(error.to_string().contains(&format!("at least {minimum}")));
+    }
+
+    #[test]
+    fn l05_webhook_identity_projection_uses_the_shared_exact_outer_object_bound() {
+        const CALLBACK_URL: &str = "http://127.0.0.1:8898/_acl-proxy/external-auth/callback";
+        let authored: super::super::authoring::AuthoringConfig =
+            toml::from_str(&identity_webhook_config(65_536)).unwrap();
+        let projection = compile_identity_plan(authored.identity.as_ref())
+            .unwrap()
+            .unwrap()
+            .resources
+            .max_provider_projection_bytes;
+        let identity_member = maximum_provider_identity_member_bytes(&authored).unwrap();
+        assert_eq!(u64::try_from(identity_member + 1).unwrap(), projection);
+
+        let minimum = minimum_webhook_request_bytes(CALLBACK_URL, identity_member).unwrap();
+        compile(&identity_webhook_config(minimum))
+            .expect("the exact complete identity projection boundary must compile");
+        let error = compile(&identity_webhook_config(minimum - 1))
+            .expect_err("one byte below the complete identity projection must fail");
+        assert!(
+            error.to_string().contains(&format!("at least {minimum}")),
+            "{error}"
+        );
     }
 
     #[test]
@@ -11458,6 +11999,55 @@ value = "invalid-framing""#
             let error = compile(&input).expect_err("protected header must fail compilation");
             assert!(error.to_string().contains("protected"), "{header}: {error}");
         }
+    }
+
+    #[test]
+    fn l05_identity_carrier_is_rejected_from_each_provider_header_projection() {
+        for provider in [
+            r#"[authorization.providers.local]
+kind = "process"
+command = "/bin/authorize"
+include_headers = ["x-aw-identity-token"]
+"#,
+            r#"[authorization.providers.local]
+kind = "webhook"
+url = "https://approval.example.test/authorize"
+include_headers = ["x-aw-identity-token"]
+"#,
+        ] {
+            let input = MINIMAL.replace("[policy]", &format!("{provider}\n[policy]"));
+            let error =
+                compile(&input).expect_err("identity bearer must not enter provider headers");
+            assert!(
+                error
+                    .to_string()
+                    .contains("provider may not receive a protected header"),
+                "{error}"
+            );
+        }
+
+        let provider_output = MINIMAL.replace(
+            "[policy]",
+            r#"[credentials]
+allowed_custom_headers = ["x-aw-identity-token"]
+
+[authorization.providers.local]
+kind = "process"
+command = "/bin/authorize"
+
+[authorization.providers.local.outputs.identity]
+kind = "custom_header"
+header = "x-aw-identity-token"
+transport_security = "tls_required"
+
+[policy]"#,
+        );
+        let error = compile(&provider_output)
+            .expect_err("provider output cannot target the identity carrier");
+        assert!(
+            error.to_string().contains("reserved by the proxy"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -172,6 +172,17 @@ fn sanitized_production_role_structure_matches_difference_record() {
             .and_then(TomlValue::as_str),
         Some("gitlab_acl")
     );
+    assert_eq!(strings(delegate, "identity_states"), ["authenticated"]);
+    assert_eq!(
+        delegate
+            .get("identity_subjects")
+            .and_then(TomlValue::as_array)
+            .and_then(|subjects| subjects.first())
+            .and_then(TomlValue::as_table)
+            .and_then(|subject| subject.get("id"))
+            .and_then(TomlValue::as_str),
+        Some("fixture-developers")
+    );
 
     let host_patterns: BTreeSet<_> = rules(&host)
         .iter()
@@ -211,6 +222,18 @@ fn sanitized_production_role_structure_matches_difference_record() {
         all_provider_names,
         BTreeSet::from(["agent_runner_acl", "gitlab_acl"])
     );
+    for provider in ["gitlab_acl", "agent_runner_acl"] {
+        assert_eq!(
+            table(
+                table(&host, "authorization").get("providers").unwrap(),
+                provider,
+            )
+            .get("include_identity")
+            .and_then(TomlValue::as_bool),
+            Some(true),
+            "{provider} must receive only the checked identity projection"
+        );
+    }
 
     let uds = parse_fixture("host-proxy-uds.toml");
     let listeners = table(&uds, "listeners");
@@ -434,40 +457,100 @@ fn assert_provider_parity(fixture: ProviderFixture) {
 
 #[test]
 fn production_gitlab_process_provider_parity() {
-    assert_provider_parity(ProviderFixture {
+    let fixture = ProviderFixture {
         script: "gitlab_acl.py",
         config: "gitlab_acl.json",
         allowed: json!({
             "id": "git-allow",
+            "requestId": "git-request-allow",
+            "ruleId": "prod-host-r42-gitlab-delegate",
             "type": "request",
             "url": "https://gitlab.example.test/group/internal.git",
+            "identity": {
+                "state": "authenticated",
+                "principal": {
+                    "authority": "aw-workstation",
+                    "id": "fixture-container",
+                    "kind": "service_account"
+                },
+                "groups": [
+                    {"authority": "aw-workstation", "id": "fixture-agent-runners"},
+                    {"authority": "aw-workstation", "id": "fixture-developers"}
+                ]
+            },
             "headers": {
-                "x-aw-identity-token": ["fixture-internal-identity"],
                 "x-aw-policy-context": ["fixture-internal"]
             }
         }),
         denied: json!({
             "id": "git-deny",
+            "requestId": "git-request-deny",
+            "ruleId": "prod-host-r42-gitlab-delegate",
             "type": "request",
             "url": "https://gitlab.example.test/group/private.git",
-            "headers": {"x-aw-identity-token": ["fixture-internal-identity"]}
+            "identity": {
+                "state": "authenticated",
+                "principal": {
+                    "authority": "aw-workstation",
+                    "id": "fixture-container",
+                    "kind": "service_account"
+                },
+                "groups": [
+                    {"authority": "aw-workstation", "id": "fixture-developers"}
+                ]
+            },
+            "headers": {"x-aw-policy-context": ["fixture-internal"]}
         }),
         missing_identity: json!({
             "id": "git-missing",
+            "requestId": "git-request-missing",
+            "ruleId": "prod-host-r42-gitlab-delegate",
             "type": "request",
             "url": "https://gitlab.example.test/group/internal.git",
             "headers": {"x-aw-policy-context": ["fixture-internal"]}
         }),
         unknown_identity: json!({
             "id": "git-unknown",
+            "requestId": "git-request-unknown",
+            "ruleId": "prod-host-r42-gitlab-delegate",
             "type": "request",
             "url": "https://gitlab.example.test/group/internal.git",
+            "identity": {
+                "state": "authenticated",
+                "principal": {
+                    "authority": "other-authority",
+                    "id": "unknown",
+                    "kind": "service_account"
+                },
+                "groups": []
+            },
             "headers": {
-                "x-aw-identity-token": ["fixture-unknown"],
                 "x-aw-policy-context": ["fixture-internal"]
             }
         }),
-    });
+    };
+    let mut common = fixture.allowed.clone();
+    common["id"] = json!("git-common-allow");
+    common["requestId"] = json!("git-request-common-allow");
+    common["url"] = json!("https://gitlab.example.test/group/public.git");
+    common.as_object_mut().unwrap().remove("headers");
+    let mut protected_websocket = common.clone();
+    protected_websocket["id"] = json!("git-ws-allow");
+    protected_websocket["requestId"] = json!("git-request-ws-allow");
+    protected_websocket["ruleId"] = json!("p11-ws-protected");
+    protected_websocket["url"] =
+        json!("https://gitlab.example.test:8443/group/public.git/parent-protected");
+    let response = invoke_provider(
+        &fixture,
+        &[
+            serde_json::to_string(&common).unwrap(),
+            serde_json::to_string(&protected_websocket).unwrap(),
+        ],
+    );
+    assert_eq!(response[0].get("decision"), Some(&json!("allow")));
+    assert_eq!(response[1].get("decision"), Some(&json!("allow")));
+
+    assert_provider_parity(fixture);
 }
 
 #[test]
@@ -477,27 +560,60 @@ fn production_agent_runner_process_provider_parity() {
         config: "agent_runner_acl.json",
         allowed: json!({
             "id": "runner-allow",
+            "requestId": "runner-request-allow",
+            "ruleId": "fixture-agent-runner-delegate",
             "type": "request",
             "url": "https://runner.example.test/jobs/42",
-            "headers": {"x-aw-identity-token": ["fixture-runner-identity"]}
+            "identity": {
+                "state": "authenticated",
+                "principal": {
+                    "authority": "aw-workstation",
+                    "id": "fixture-container",
+                    "kind": "service_account"
+                },
+                "groups": [
+                    {"authority": "aw-workstation", "id": "fixture-agent-runners"}
+                ]
+            }
         }),
         denied: json!({
             "id": "runner-deny",
+            "requestId": "runner-request-deny",
+            "ruleId": "fixture-agent-runner-delegate",
             "type": "request",
             "url": "https://runner.example.test/admin",
-            "headers": {"x-aw-identity-token": ["fixture-runner-identity"]}
+            "identity": {
+                "state": "authenticated",
+                "principal": {
+                    "authority": "aw-workstation",
+                    "id": "fixture-container",
+                    "kind": "service_account"
+                },
+                "groups": []
+            }
         }),
         missing_identity: json!({
             "id": "runner-missing",
+            "requestId": "runner-request-missing",
+            "ruleId": "fixture-agent-runner-delegate",
             "type": "request",
-            "url": "https://runner.example.test/jobs/42",
-            "headers": {}
+            "url": "https://runner.example.test/jobs/42"
         }),
         unknown_identity: json!({
             "id": "runner-unknown",
+            "requestId": "runner-request-unknown",
+            "ruleId": "fixture-agent-runner-delegate",
             "type": "request",
             "url": "https://runner.example.test/jobs/42",
-            "headers": {"x-aw-identity-token": ["fixture-unknown"]}
+            "identity": {
+                "state": "authenticated",
+                "principal": {
+                    "authority": "aw-workstation",
+                    "id": "unknown",
+                    "kind": "service_account"
+                },
+                "groups": []
+            }
         }),
     });
 }

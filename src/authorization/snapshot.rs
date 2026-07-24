@@ -51,6 +51,7 @@ pub(crate) struct AuthorizationActivation {
 #[derive(Clone, Copy)]
 pub(crate) struct AuthorizationProviderMetadata<'snapshot> {
     pub(crate) include_headers: &'snapshot [HeaderName],
+    pub(crate) include_identity: bool,
     pub(crate) include_request_body: bool,
     pub(crate) max_request_body_bytes: usize,
     pub(crate) max_decoded_request_body_bytes: usize,
@@ -311,6 +312,7 @@ impl ProductAuthorizationSnapshot {
         match self.providers.get(provider.get())? {
             ActiveProvider::Process(process) => Some(AuthorizationProviderMetadata {
                 include_headers: process.include_headers(),
+                include_identity: process.include_identity(),
                 include_request_body: process.include_request_body(),
                 max_request_body_bytes: process.max_request_body_bytes(),
                 max_decoded_request_body_bytes: process.max_decoded_request_body_bytes(),
@@ -318,6 +320,7 @@ impl ProductAuthorizationSnapshot {
             }),
             ActiveProvider::Webhook(webhook) => Some(AuthorizationProviderMetadata {
                 include_headers: webhook.include_headers(),
+                include_identity: webhook.include_identity(),
                 include_request_body: false,
                 max_request_body_bytes: 0,
                 max_decoded_request_body_bytes: 0,
@@ -732,6 +735,7 @@ mod tests {
             environment: BTreeMap::new(),
             blocked_environment: vec![],
             include_headers: vec![],
+            include_identity: false,
             include_request_body: false,
             allow_request_body_replacement: false,
             max_request_body_bytes: 1024,
@@ -799,6 +803,7 @@ mod tests {
                         timeout: Duration::from_secs(1),
                         on_failure: CompiledProviderFailureMode::Deny,
                         include_headers: vec![],
+                        include_identity: false,
                         max_request_bytes: 1024,
                         max_response_bytes: 1024,
                         outputs: BTreeMap::new(),
@@ -894,9 +899,11 @@ mod tests {
     fn request(id: &str) -> ProviderRequest<'_> {
         ProviderRequest {
             request_id: id,
+            rule_id: "rule-1",
             url: "https://example.test/resource",
             method: "GET",
             client_ip: "192.0.2.10",
+            identity: None,
             headers: None,
             body: None,
         }
@@ -995,6 +1002,7 @@ mod tests {
                     timeout: Duration::from_secs(2),
                     on_failure: CompiledProviderFailureMode::Deny,
                     include_headers: vec![HeaderName::from_static("x-context")],
+                    include_identity: false,
                     max_request_bytes: 8192,
                     max_response_bytes: 4096,
                     outputs: BTreeMap::new(),
@@ -1048,6 +1056,7 @@ mod tests {
                     timeout: Duration::from_secs(2),
                     on_failure: CompiledProviderFailureMode::Deny,
                     include_headers: vec![],
+                    include_identity: false,
                     max_request_bytes: 8192,
                     max_response_bytes: 4096,
                     outputs: BTreeMap::from([(

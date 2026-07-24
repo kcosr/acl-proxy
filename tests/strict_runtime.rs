@@ -262,7 +262,11 @@ fn proxy_request(proxy: SocketAddr, method: &str, url: &str, body: &[u8]) -> Htt
         method,
         url,
         host,
-        &[("Content-Type", "text/plain"), ("X-Test-Input", "included")],
+        &[
+            ("Content-Type", "text/plain"),
+            ("X-Test-Input", "included"),
+            ("X-Aw-Identity-Token", "abcdefghijklmnopqrstuvwxyzABCDEF"),
+        ],
         body,
         true,
     )
@@ -366,7 +370,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with open(event_file, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(request, sort_keys=True, separators=(",", ":")) + "\n")
             path = urllib.parse.urlsplit(request["url"]).path
-            decision = {
+            identity = request.get("identity", {})
+            principal = identity.get("principal", {})
+            groups = identity.get("groups", [])
+            valid_identity = (
+                request.get("ruleId") == "webhook"
+                and identity.get("state") == "authenticated"
+                and principal.get("authority") == "strict-runtime"
+                and principal.get("id") == "fixture-agent"
+                and {"authority": "strict-runtime", "id": "operators"} in groups
+            )
+            decision = "deny" if not valid_identity else {
                 "/webhook-deny": "deny",
                 "/webhook-pass": "pass",
             }.get(path, "allow")
@@ -409,7 +423,17 @@ import urllib.parse
 for line in sys.stdin:
     request = json.loads(line)
     path = urllib.parse.urlsplit(request["url"]).path
-    decision = {
+    identity = request.get("identity", {})
+    principal = identity.get("principal", {})
+    groups = identity.get("groups", [])
+    valid_identity = (
+        request.get("ruleId") == "process"
+        and identity.get("state") == "authenticated"
+        and principal.get("authority") == "strict-runtime"
+        and principal.get("id") == "fixture-agent"
+        and {"authority": "strict-runtime", "id": "operators"} in groups
+    )
+    decision = "deny" if not valid_identity else {
         "/provider-deny": "deny",
         "/provider-pass": "pass",
     }.get(path, "allow")
@@ -459,8 +483,33 @@ request_header_timeout = "2s"
 max_connections = 32
 max_concurrent_streams = 32
 
+[listeners.explicit_http.identity]
+mode = "optional"
+
 [listeners.explicit_http.connect]
 http1 = "deny"
+
+[identity]
+max_pending_authentications = 16
+max_pending_authentications_per_connection = 4
+
+[identity.resolver]
+kind = "static"
+authority = "strict-runtime"
+
+[[identity.resolver.principals]]
+id = "fixture-agent"
+kind = "service_account"
+
+[[identity.resolver.groups]]
+id = "operators"
+members = ["fixture-agent"]
+
+[[identity.resolver.tokens]]
+id = "fixture-token"
+principal = "fixture-agent"
+source = "environment"
+variable = "AW_TEST_IDENTITY_TOKEN"
 
 [authorization.callback]
 public_url = "http://{control}/_acl-proxy/external-auth/callback"
@@ -474,6 +523,7 @@ args = ["{}"]
 timeout = "2s"
 inherit_environment = false
 include_headers = ["x-test-input"]
+include_identity = true
 include_request_body = true
 allow_request_body_replacement = true
 max_request_body_bytes = 65536
@@ -494,6 +544,7 @@ kind = "webhook"
 url = "http://{origin}/authorize"
 timeout = "3s"
 on_failure = "error"
+include_identity = true
 max_request_bytes = 65536
 max_response_bytes = 65536
 
@@ -547,6 +598,10 @@ urls = [
 ]
 authorization_provider = "local"
 redaction_profile = "wire"
+identity_states = ["authenticated"]
+identity_subjects = [
+  {{ kind = "group", authority = "strict-runtime", id = "operators" }},
+]
 
 [[policy.rules.response_headers]]
 operation = "set"
@@ -575,6 +630,10 @@ urls = [
   "http://{origin}/webhook-pass",
 ]
 authorization_provider = "approval"
+identity_states = ["authenticated"]
+identity_subjects = [
+  {{ kind = "group", authority = "strict-runtime", id = "operators" }},
+]
 
 [[policy.rules.response_headers]]
 operation = "set"
@@ -655,6 +714,7 @@ fn start_proxy(config: &Path) -> ChildGuard {
     let child = Command::new(assert_cmd::cargo::cargo_bin!("acl-proxy"))
         .args(["run", "--config"])
         .arg(config)
+        .env("AW_TEST_IDENTITY_TOKEN", "abcdefghijklmnopqrstuvwxyzABCDEF")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -834,7 +894,10 @@ fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
         "GET",
         &allow_url,
         &origin.to_string(),
-        &[("X-Provider-Token", DECISION_LOG_SECRET)],
+        &[
+            ("X-Provider-Token", DECISION_LOG_SECRET),
+            ("X-Aw-Identity-Token", "abcdefghijklmnopqrstuvwxyzABCDEF"),
+        ],
         &[],
         true,
     );
@@ -949,6 +1012,19 @@ fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
         ]
     );
     assert!(events.iter().all(|event| event["type"] == "request"));
+    assert!(events.iter().all(|event| event["ruleId"] == "webhook"));
+    assert!(events.iter().all(|event| {
+        event["identity"]["state"] == "authenticated"
+            && event["identity"]["principal"]["authority"] == "strict-runtime"
+            && event["identity"]["principal"]["id"] == "fixture-agent"
+            && event["identity"]["groups"]
+                .as_array()
+                .is_some_and(|groups| {
+                    groups.iter().any(|group| {
+                        group["authority"] == "strict-runtime" && group["id"] == "operators"
+                    })
+                })
+    }));
     assert!(events
         .iter()
         .all(|event| event.get("body").is_none() && event.get("requestBody").is_none()));
@@ -994,7 +1070,7 @@ fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
         "GET",
         &reload_url,
         &origin.to_string(),
-        &[],
+        &[("X-Aw-Identity-Token", "abcdefghijklmnopqrstuvwxyzABCDEF")],
         &[],
         false,
     );
@@ -1021,7 +1097,7 @@ fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
         "GET",
         &reload_url,
         &origin.to_string(),
-        &[],
+        &[("X-Aw-Identity-Token", "abcdefghijklmnopqrstuvwxyzABCDEF")],
         &[],
         false,
     );

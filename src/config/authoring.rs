@@ -756,6 +756,12 @@ pub(super) struct PolicyRuleConfig {
     pub client_cidrs: Vec<IpNet>,
 
     #[serde(default)]
+    pub identity_states: Option<Vec<IdentityStateConfig>>,
+
+    #[serde(default)]
+    pub identity_subjects: Option<Vec<IdentitySubjectConfig>>,
+
+    #[serde(default)]
     pub headers: HeaderPredicatesConfig,
 
     #[serde(default)]
@@ -778,6 +784,21 @@ pub(super) struct PolicyRuleConfig {
 
     #[serde(default)]
     pub credential_actions: Vec<CredentialActionConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum IdentityStateConfig {
+    Disabled,
+    Anonymous,
+    Authenticated,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum IdentitySubjectConfig {
+    Principal { authority: String, id: String },
+    Group { authority: String, id: String },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -904,6 +925,9 @@ pub(super) struct WebhookProviderConfig {
     #[serde(default)]
     pub include_headers: Vec<String>,
 
+    #[serde(default)]
+    pub include_identity: bool,
+
     #[serde(default = "default_webhook_max_request_bytes")]
     pub max_request_bytes: usize,
 
@@ -952,6 +976,9 @@ pub(super) struct ProcessProviderConfig {
 
     #[serde(default)]
     pub include_headers: Vec<String>,
+
+    #[serde(default)]
+    pub include_identity: bool,
 
     #[serde(default)]
     pub include_request_body: bool,
@@ -2033,6 +2060,57 @@ directory = "certs"
 
         let obsolete = MINIMAL.replace("inject = true", "enabled = true\ninject = true");
         assert!(toml::from_str::<AuthoringConfig>(&obsolete).is_err());
+    }
+
+    #[test]
+    fn policy_identity_predicates_use_only_the_strict_plural_typed_shape() {
+        let valid = format!(
+            r#"{MINIMAL}
+
+[[policy.rules]]
+id = "identity"
+decision = "allow"
+identity_states = ["disabled", "anonymous", "authenticated"]
+identity_subjects = [
+  {{ kind = "principal", authority = "workstation", id = "agent" }},
+  {{ kind = "group", authority = "workstation", id = "developers" }},
+]
+"#
+        );
+        let parsed: AuthoringConfig = toml::from_str(&valid).unwrap();
+        assert_eq!(
+            parsed.policy.rules[0].identity_states.as_deref(),
+            Some(
+                [
+                    IdentityStateConfig::Disabled,
+                    IdentityStateConfig::Anonymous,
+                    IdentityStateConfig::Authenticated,
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(
+            parsed.policy.rules[0]
+                .identity_subjects
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        for invalid in [
+            valid.replace("identity_states =", "identity_state ="),
+            valid.replace("\"authenticated\"", "\"unknown\""),
+            valid.replace(
+                "id = \"agent\" }",
+                "id = \"agent\", unexpected = \"value\" }",
+            ),
+        ] {
+            assert!(
+                toml::from_str::<AuthoringConfig>(&invalid).is_err(),
+                "invalid identity predicate shape was accepted"
+            );
+        }
     }
 
     #[test]

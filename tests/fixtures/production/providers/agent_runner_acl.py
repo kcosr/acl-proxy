@@ -6,21 +6,30 @@ import json
 import sys
 
 
-def header_value(headers, name):
-    value = headers.get(name)
-    if isinstance(value, list):
-        return value[0] if len(value) == 1 and isinstance(value[0], str) else None
-    return value if isinstance(value, str) else None
+def checked_principal(request, authority):
+    identity = request.get("identity")
+    if not isinstance(identity, dict) or identity.get("state") != "authenticated":
+        return None
+    principal = identity.get("principal")
+    if (
+        not isinstance(principal, dict)
+        or principal.get("authority") != authority
+        or not isinstance(principal.get("id"), str)
+    ):
+        return None
+    return principal["id"]
 
 
 def decide(request, config):
     if request.get("type") != "request" or not isinstance(request.get("id"), str):
         return "deny"
-    headers = request.get("headers")
-    if not isinstance(headers, dict):
+    rule = config["rules"].get(request.get("ruleId"))
+    if not isinstance(rule, dict):
         return "deny"
-    identity = header_value(headers, "x-aw-identity-token")
-    patterns = config["identities"].get(identity, [])
+    principal = checked_principal(request, config["authority"])
+    if principal is None:
+        return "deny"
+    patterns = rule.get("principals", {}).get(principal, [])
     raw_url = request.get("url", "")
     return "allow" if any(fnmatch.fnmatchcase(raw_url, pattern) for pattern in patterns) else "deny"
 

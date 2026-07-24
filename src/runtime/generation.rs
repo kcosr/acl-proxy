@@ -169,7 +169,6 @@ pub(crate) trait AuthorizationSnapshot: Send + Sync {
 }
 
 pub(crate) struct AuthorizationDispatchContext<'a> {
-    rule_id: &'a str,
     request: crate::authorization::protocol::ProviderRequest<'a>,
     invocation_mode: AuthorizationInvocationMode,
     generation: &'a GenerationLease,
@@ -189,7 +188,6 @@ impl<'a> AuthorizationDispatchContext<'a> {
         self,
     ) -> Result<
         (
-            &'a str,
             crate::authorization::protocol::ProviderRequest<'a>,
             AuthorizationInvocationMode,
             GenerationRetention,
@@ -197,7 +195,7 @@ impl<'a> AuthorizationDispatchContext<'a> {
         GenerationRetentionError,
     > {
         let retention = self.generation.retain_for_operation()?;
-        Ok((self.rule_id, self.request, self.invocation_mode, retention))
+        Ok((self.request, self.invocation_mode, retention))
     }
 }
 
@@ -490,7 +488,6 @@ impl GenerationLease {
     pub(crate) fn dispatch_authorization<'a>(
         &'a self,
         provider: ProviderIndex,
-        rule_id: &'a str,
         request: crate::authorization::protocol::ProviderRequest<'a>,
         invocation_mode: AuthorizationInvocationMode,
         guard: &'a crate::safety::HttpWireBodyGuard,
@@ -505,7 +502,6 @@ impl GenerationLease {
         self.generation.authorization.dispatch(
             provider,
             AuthorizationDispatchContext {
-                rule_id,
                 request,
                 invocation_mode,
                 generation: self,

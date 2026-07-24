@@ -41,6 +41,7 @@ struct Inner {
     response_schema: ProcessResponseSchema,
     failure_mode: CompiledProviderFailureMode,
     include_headers: Box<[HeaderName]>,
+    include_identity: bool,
     include_request_body: bool,
     max_request_body_bytes: usize,
     max_decoded_request_body_bytes: usize,
@@ -226,6 +227,7 @@ impl ProcessProvider {
             environment,
             blocked_environment,
             include_headers,
+            include_identity,
             include_request_body,
             allow_request_body_replacement,
             max_request_body_bytes,
@@ -269,6 +271,7 @@ impl ProcessProvider {
             response_schema,
             failure_mode: on_failure,
             include_headers: include_headers.into_boxed_slice(),
+            include_identity,
             include_request_body,
             max_request_body_bytes,
             max_decoded_request_body_bytes,
@@ -319,6 +322,10 @@ impl ProcessProvider {
 
     pub(crate) fn include_headers(&self) -> &[HeaderName] {
         &self.inner.include_headers
+    }
+
+    pub(crate) fn include_identity(&self) -> bool {
+        self.inner.include_identity
     }
 
     pub(crate) fn failure_mode(&self) -> CompiledProviderFailureMode {
@@ -1540,6 +1547,7 @@ mod tests {
             environment: Default::default(),
             blocked_environment: vec![],
             include_headers: vec![],
+            include_identity: false,
             include_request_body: false,
             allow_request_body_replacement: false,
             max_request_body_bytes: 1024,
@@ -1555,9 +1563,11 @@ mod tests {
     fn request(id: &str) -> ProviderRequest<'_> {
         ProviderRequest {
             request_id: id,
+            rule_id: "rule-1",
             url: "https://example.test/resource",
             method: "GET",
             client_ip: "192.0.2.10",
+            identity: None,
             headers: None,
             body: None,
         }
@@ -1616,9 +1626,11 @@ mod tests {
             .decide_effects_allowed_for_test(
                 ProviderRequest {
                     request_id,
+                    rule_id: "rule-1",
                     url,
                     method: "GET",
                     client_ip: "198.18.1.10",
+                    identity: None,
                     headers: Some(&headers),
                     body: None,
                 },

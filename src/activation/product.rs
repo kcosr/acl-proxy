@@ -1041,6 +1041,7 @@ path = "/missing/acl-proxy-product-reload-identity-token"
             1,
             http_access_types::BodyRepresentation::PreservedContentCoded,
             http_access_types::BodyObservation::unobserved(),
+            &access_identity::IdentityContext::Disabled,
         )
         .unwrap();
         let policy = activated

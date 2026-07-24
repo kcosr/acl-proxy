@@ -453,6 +453,7 @@ mod tests {
             BodyRepresentation::PreservedContentCoded,
             body,
             absolute_deadline_millis,
+            Arc::new(access_identity::IdentityContext::Disabled),
         )
         .unwrap();
         let lineage = request.begin_provider_invocation();

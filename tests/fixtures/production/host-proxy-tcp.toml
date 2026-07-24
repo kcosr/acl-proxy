@@ -48,6 +48,14 @@ authority = "aw-workstation"
 id = "fixture-container"
 kind = "service_account"
 
+[[identity.resolver.groups]]
+id = "fixture-developers"
+members = ["fixture-container"]
+
+[[identity.resolver.groups]]
+id = "fixture-agent-runners"
+members = ["fixture-container"]
+
 [[identity.resolver.tokens]]
 id = "fixture-container-primary"
 principal = "fixture-container"
@@ -491,6 +499,10 @@ description = "Sanitized source rule 42: Git provider validates identity/context
 decision = "delegate"
 urls = ["https://gitlab.example.test/**"]
 client_cidrs = ["198.18.0.0/15"]
+identity_states = ["authenticated"]
+identity_subjects = [
+  { kind = "group", authority = "aw-workstation", id = "fixture-developers" },
+]
 authorization_provider = "gitlab_acl"
 
 [[policy.rules]]
@@ -514,6 +526,7 @@ on_failure = "deny"
 inherit_environment = false
 environment = { PATH = "/usr/bin:/bin" }
 include_headers = ["x-aw-policy-context"]
+include_identity = true
 include_request_body = false
 allow_request_body_replacement = false
 max_pending_requests = 256
@@ -529,6 +542,7 @@ on_failure = "deny"
 inherit_environment = false
 environment = { PATH = "/usr/bin:/bin" }
 include_headers = []
+include_identity = true
 include_request_body = false
 allow_request_body_replacement = false
 max_pending_requests = 256

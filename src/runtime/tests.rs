@@ -844,6 +844,7 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
                 timeout: Duration::from_secs(5),
                 on_failure: CompiledProviderFailureMode::Deny,
                 include_headers: vec![],
+                include_identity: false,
                 max_request_bytes: 8192,
                 max_response_bytes: 4096,
                 outputs: std::collections::BTreeMap::new(),
@@ -911,15 +912,16 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
     );
     let request = ProviderRequest {
         request_id: "request-1",
+        rule_id: "rule-1",
         url: "https://example.test/resource",
         method: "GET",
         client_ip: "192.0.2.10",
+        identity: None,
         headers: None,
         body: None,
     };
     let dispatch = lease.dispatch_authorization(
         provider,
-        "rule-1",
         request,
         crate::runtime::AuthorizationInvocationMode::EffectsAllowed,
         &body_guard,
@@ -972,12 +974,13 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
     let rejected = lease
         .dispatch_authorization(
             provider,
-            "rule-after-shutdown",
             ProviderRequest {
                 request_id: "request-after-shutdown",
+                rule_id: "rule-after-shutdown",
                 url: "https://example.test/resource",
                 method: "GET",
                 client_ip: "192.0.2.10",
+                identity: None,
                 headers: None,
                 body: None,
             },
