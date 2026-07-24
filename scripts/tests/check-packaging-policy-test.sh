@@ -4,32 +4,144 @@ set -Eeuo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 GATE="$ROOT/scripts/check-packaging-policy.py"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/acl-proxy-packaging-policy.XXXXXX")
-trap 'rm -rf "$TMP"' EXIT
+RUNTIME_REPOSITORY=$(git -C "$ROOT/../access-runtime" rev-parse --show-toplevel)
+RUNTIME_COMMIT=$(python3 - "$GATE" <<'PY'
+from pathlib import Path
+import runpy
+import sys
 
-BASELINE="$TMP/baseline"
+value = runpy.run_path(Path(sys.argv[1]))["RUNTIME_COMMIT"]
+if not isinstance(value, str) or len(value) != 40:
+    raise SystemExit("packaging gate has no exact runtime commit")
+print(value)
+PY
+)
+readonly RUNTIME_COMMIT
+RUNTIME_FIXTURE="$TMP/workspace/access-runtime"
+
+cleanup() {
+    git -C "$RUNTIME_REPOSITORY" worktree remove --force "$RUNTIME_FIXTURE" \
+        >/dev/null 2>&1 || true
+    rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+BASELINE="$TMP/workspace/acl-proxy"
 mkdir -p "$BASELINE/scripts"
 mkdir -p "$BASELINE/crates/access-flow-relay"
+mkdir -p "$BASELINE/src/bin"
+mkdir -p "$BASELINE/crates/access-flow-relay/src"
+git -C "$RUNTIME_REPOSITORY" worktree add --detach "$RUNTIME_FIXTURE" "$RUNTIME_COMMIT" \
+    >/dev/null
 for file in Cargo.toml Cargo.lock README.md acl-proxy.sample.toml deny.toml PROVENANCE.md THIRD_PARTY_NOTICES; do
     cp "$ROOT/$file" "$BASELINE/$file"
 done
 cp "$ROOT/crates/access-flow-relay/Cargo.toml" "$BASELINE/crates/access-flow-relay/"
 cp "$ROOT/scripts/check-packaging-policy.sh" "$BASELINE/scripts/"
 cp "$ROOT/scripts/release.mjs" "$BASELINE/scripts/"
-cargo metadata --locked --offline --format-version 1 >"$BASELINE/metadata.json"
+printf '%s\n' '// metadata-only fixture' >"$BASELINE/src/lib.rs"
+printf '%s\n' 'fn main() {}' >"$BASELINE/src/bin/extract-capture-body.rs"
+printf '%s\n' '// metadata-only fixture' >"$BASELINE/crates/access-flow-relay/src/lib.rs"
+(
+    cd "$BASELINE"
+    cargo metadata --locked --offline --format-version 1 >metadata.json
+)
 
 run_gate() {
     local fixture=$1
-    python3 "$GATE" --root "$fixture" --metadata "$fixture/metadata.json"
+    local resolved_metadata
+    resolved_metadata=$(mktemp "$TMP/resolved-metadata.XXXXXX.json")
+    python3 - "$fixture/metadata.json" "$resolved_metadata" "$BASELINE" "$fixture" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+source, destination, old_root, new_root = map(Path, sys.argv[1:])
+document = json.loads(source.read_text(encoding="utf-8"))
+
+def rebase(value):
+    if isinstance(value, dict):
+        return {key: rebase(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [rebase(item) for item in value]
+    if isinstance(value, str):
+        return value.replace(str(old_root), str(new_root))
+    return value
+
+destination.write_text(json.dumps(rebase(document)), encoding="utf-8")
+PY
+    python3 "$GATE" --root "$fixture" --metadata "$resolved_metadata"
 }
 
 run_gate "$BASELINE"
+
+MISMATCHED_ROOT="$TMP/workspace/metadata-root-mismatch"
+cp -a "$BASELINE" "$MISMATCHED_ROOT"
+if python3 "$GATE" --root "$MISMATCHED_ROOT" --metadata "$BASELINE/metadata.json" \
+    >"$TMP/metadata-root-mismatch.out" 2>&1; then
+    printf '%s\n' 'packaging mismatched metadata/root mutation unexpectedly passed' >&2
+    exit 1
+fi
+grep -Fq \
+    'locked metadata acl-proxy manifest root differs from the validated product root' \
+    "$TMP/metadata-root-mismatch.out" \
+    || {
+        printf '%s\n' 'packaging mismatched metadata/root mutation failed for the wrong reason' >&2
+        cat "$TMP/metadata-root-mismatch.out" >&2
+        exit 1
+    }
+
+reset_runtime_fixture() {
+    git -C "$RUNTIME_REPOSITORY" worktree remove --force "$RUNTIME_FIXTURE" \
+        >/dev/null
+    git -C "$RUNTIME_REPOSITORY" worktree add --detach "$RUNTIME_FIXTURE" "$RUNTIME_COMMIT" \
+        >/dev/null
+}
+
+expect_runtime_rejected() {
+    local name=$1
+    local expected=$2
+    if run_gate "$BASELINE" >"$TMP/$name.out" 2>&1; then
+        printf 'packaging runtime mutation unexpectedly passed: %s\n' "$name" >&2
+        exit 1
+    fi
+    if ! grep -Fq "$expected" "$TMP/$name.out"; then
+        printf 'packaging runtime mutation failed for the wrong reason: %s\n' "$name" >&2
+        cat "$TMP/$name.out" >&2
+        exit 1
+    fi
+    reset_runtime_fixture
+    run_gate "$BASELINE" >/dev/null
+}
+
+git -C "$RUNTIME_REPOSITORY" worktree remove --force "$RUNTIME_FIXTURE" >/dev/null
+git -C "$RUNTIME_REPOSITORY" worktree add --detach "$RUNTIME_FIXTURE" "$RUNTIME_COMMIT^" \
+    >/dev/null
+expect_runtime_rejected runtime-wrong-head \
+    'canonical sibling runtime HEAD differs from the accepted runtime commit'
+
+printf '\n// tracked runtime mutation\n' \
+    >>"$RUNTIME_FIXTURE/crates/http-access-types/src/lib.rs"
+expect_runtime_rejected runtime-dirty-tracked \
+    'canonical sibling runtime worktree or index is not clean'
+
+printf '\n// indexed runtime mutation\n' \
+    >>"$RUNTIME_FIXTURE/crates/http-access-types/src/lib.rs"
+git -C "$RUNTIME_FIXTURE" add crates/http-access-types/src/lib.rs
+expect_runtime_rejected runtime-dirty-index \
+    'canonical sibling runtime worktree or index is not clean'
+
+printf '%s\n' '// untracked runtime source mutation' \
+    >"$RUNTIME_FIXTURE/crates/http-access-types/src/untracked_release_input.rs"
+expect_runtime_rejected runtime-untracked-source \
+    'canonical sibling runtime worktree or index is not clean'
 
 expect_rejected() {
     local name=$1
     local old=$2
     local new=$3
     local file=$4
-    local fixture="$TMP/$name"
+    local fixture="$TMP/workspace/$name"
     cp -a "$BASELINE" "$fixture"
     python3 - "$fixture/$file" "$old" "$new" <<'PY'
 from pathlib import Path
@@ -54,7 +166,7 @@ expect_metadata_rejected() {
     local package=$2
     local field=$3
     local value=$4
-    local fixture="$TMP/$name"
+    local fixture="$TMP/workspace/$name"
     cp -a "$BASELINE" "$fixture"
     python3 - "$fixture/metadata.json" "$package" "$field" "$value" <<'PY'
 from pathlib import Path
@@ -81,7 +193,7 @@ PY
 expect_metadata_duplicate_rejected() {
     local name=$1
     local package=$2
-    local fixture="$TMP/$name"
+    local fixture="$TMP/workspace/$name"
     cp -a "$BASELINE" "$fixture"
     python3 - "$fixture/metadata.json" "$package" <<'PY'
 from pathlib import Path
@@ -107,7 +219,7 @@ PY
 expect_created_path_rejected() {
     local name=$1
     local path=$2
-    local fixture="$TMP/$name"
+    local fixture="$TMP/workspace/$name"
     cp -a "$BASELINE" "$fixture"
     mkdir -p "$(dirname -- "$fixture/$path")"
     printf 'obsolete\n' >"$fixture/$path"
@@ -121,7 +233,7 @@ expect_obsolete_surface_rejected() {
     local name=$1
     local file=$2
     local marker=$3
-    local fixture="$TMP/$name"
+    local fixture="$TMP/workspace/$name"
     cp -a "$BASELINE" "$fixture"
     printf '\n%s\n' "$marker" >>"$fixture/$file"
     if run_gate "$fixture" >"$fixture.out" 2>&1; then
@@ -182,7 +294,14 @@ expect_rejected brotli-copyright 'Copyright (c) 2009, 2010, 2013-2016 by the Bro
 expect_rejected dropbox-copyright 'Copyright (c) 2016 Dropbox, Inc.' 'Copyright removed from Dropbox brotli.' THIRD_PARTY_NOTICES
 expect_rejected zstd-copyright 'Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.' 'Copyright removed from Zstandard.' THIRD_PARTY_NOTICES
 expect_rejected hyper-license-copyright 'Copyright (c) 2014-2026 Sean McArthur' 'Copyright removed from Hyper.' THIRD_PARTY_NOTICES
-expect_rejected provenance-runtime '0373a1b0f192927a6b8abaa05af8847f18a90546' 'wrong-runtime-commit' PROVENANCE.md
+expect_rejected provenance-runtime "$RUNTIME_COMMIT" 'wrong-runtime-commit' PROVENANCE.md
+runtime_record=$(printf -- '- Accepted runtime commit:\n  `%s`' "$RUNTIME_COMMIT")
+runtime_duplicate_record=$(printf -- '%s\n- Accepted runtime commit:\n  `%s`' \
+    "$runtime_record" 1111111111111111111111111111111111111111)
+expect_rejected provenance-runtime-record \
+    "$runtime_record" \
+    "$runtime_duplicate_record" \
+    PROVENANCE.md
 expect_rejected provenance-brotli-license 'Google Brotli C implementation it compiles is MIT' 'Google Brotli C implementation has the wrong license' PROVENANCE.md
 expect_rejected provenance-zstd-license 'Zstandard source under BSD-3-Clause' 'Zstandard source has the wrong license' PROVENANCE.md
 expect_rejected archive-notices 'README, `LICENSE`, `THIRD_PARTY_NOTICES`' 'README, `LICENSE`, `REMOVED_NOTICES`' README.md

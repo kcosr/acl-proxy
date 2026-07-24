@@ -16,6 +16,7 @@ use credential_core::{
 };
 use http::header::{HeaderName, HeaderValue};
 use http::Method;
+use http_access_policy_acl::MAX_IDENTITY_SUBJECTS_PER_SNAPSHOT;
 #[cfg(test)]
 use http_access_redaction::MAX_MATCHER_SCRATCH_BYTES;
 use http_access_redaction::{
@@ -42,6 +43,7 @@ use crate::authorization::protocol::{
     PROCESS_PROVIDER_MIN_DECISION_RESPONSE_BYTES, PROCESS_PROVIDER_RESPONSE_PREFIX_BYTES,
     PROCESS_PROVIDER_RESPONSE_TERMINATOR_BYTES,
 };
+use crate::authorization::MAX_PROVIDER_RULE_ID_BYTES;
 use crate::capture::{CaptureSinkSpec, CaptureSinkSpecError};
 use crate::credential_buffers::ProductCredentialProjectionContext;
 use crate::credential_resolver::projected_product_adapter_bytes;
@@ -1826,6 +1828,7 @@ fn validate_policy_identity_shapes(
     enabled_listener: bool,
     optional_listener: bool,
 ) -> Result<(), ConfigCompileError> {
+    let mut aggregate_identity_subjects = 0usize;
     for (index, rule) in config.policy.rules.iter().enumerate() {
         let prefix = format!("policy.rules[{index}]");
         if let Some(states) = &rule.identity_states {
@@ -1852,6 +1855,23 @@ fn validate_policy_identity_shapes(
             }
         }
         if let Some(subjects) = &rule.identity_subjects {
+            aggregate_identity_subjects = aggregate_identity_subjects
+                .checked_add(subjects.len())
+                .ok_or_else(|| {
+                ConfigCompileError::at(
+                    format!("{prefix}.identity_subjects"),
+                    "aggregate identity subject count overflowed",
+                )
+            })?;
+            if aggregate_identity_subjects > MAX_IDENTITY_SUBJECTS_PER_SNAPSHOT {
+                return Err(ConfigCompileError::at(
+                    format!("{prefix}.identity_subjects"),
+                    format!(
+                        "would exceed the aggregate policy limit of \
+                         {MAX_IDENTITY_SUBJECTS_PER_SNAPSHOT} identity subjects"
+                    ),
+                ));
+            }
             if subjects.is_empty() {
                 return Err(ConfigCompileError::at(
                     format!("{prefix}.identity_subjects"),
@@ -3710,6 +3730,14 @@ fn validate_policy(
             return Err(ConfigCompileError::at(
                 format!("{prefix}.id"),
                 "must be nonempty and unique",
+            ));
+        }
+        if rule.id.len() > MAX_PROVIDER_RULE_ID_BYTES {
+            return Err(ConfigCompileError::at(
+                format!("{prefix}.id"),
+                format!(
+                    "must be at most {MAX_PROVIDER_RULE_ID_BYTES} bytes for authorization-provider dispatch"
+                ),
             ));
         }
         let predicate_count = rule.urls.len()
@@ -8003,6 +8031,57 @@ identity_states = {states}
             )
     }
 
+    fn aggregate_identity_subjects_config(subject_count: usize) -> String {
+        let mut config = environment_identity_config("AW_IDENTITY_TOKEN").replace(
+            "[policy]\ndefault = \"deny\"",
+            r#"[[identity.resolver.groups]]
+id = "developers"
+members = ["test-principal"]
+
+[policy]
+default = "deny""#,
+        );
+        for index in 0..subject_count {
+            config.push_str(&format!(
+                r#"
+
+[[policy.rules]]
+id = "identity-{index}"
+decision = "allow"
+identity_states = ["authenticated"]
+identity_subjects = [
+  {{ kind = "group", authority = "test-authority", id = "developers" }},
+]
+"#
+            ));
+        }
+        config
+    }
+
+    #[test]
+    fn aggregate_policy_identity_subject_bound_is_validated_before_projection() {
+        compile(&aggregate_identity_subjects_config(
+            MAX_IDENTITY_SUBJECTS_PER_SNAPSHOT,
+        ))
+        .expect("the exact shared identity-subject aggregate bound must compile");
+
+        let error = compile(&aggregate_identity_subjects_config(
+            MAX_IDENTITY_SUBJECTS_PER_SNAPSHOT + 1,
+        ))
+        .expect_err("one identity subject over the shared aggregate bound must fail");
+        let expected_path = format!(
+            "policy.rules[{}].identity_subjects",
+            MAX_IDENTITY_SUBJECTS_PER_SNAPSHOT
+        );
+        assert!(error.to_string().contains(&expected_path), "{error}");
+        assert!(
+            error.to_string().contains(&format!(
+                "aggregate policy limit of {MAX_IDENTITY_SUBJECTS_PER_SNAPSHOT} identity subjects"
+            )),
+            "{error}"
+        );
+    }
+
     #[test]
     fn policy_identity_predicates_are_strict_canonical_or_sets() {
         let valid = identity_policy_config(
@@ -8643,15 +8722,20 @@ values = {values:?}
     }
 
     #[test]
-    fn structural_preflight_checks_rule_stable_id_boundaries() {
-        let exact = "r".repeat(StableId::MAX_LEN);
-        compile(&policy_rule_with_id(&exact)).expect("the exact stable ID boundary is valid");
+    fn policy_validation_checks_provider_rule_id_boundaries() {
+        assert_eq!(MAX_PROVIDER_RULE_ID_BYTES, StableId::MAX_LEN);
+        let exact = "r".repeat(MAX_PROVIDER_RULE_ID_BYTES);
+        compile(&policy_rule_with_id(&exact))
+            .expect("the exact provider dispatch rule-ID boundary is valid");
 
-        let oversized = "r".repeat(StableId::MAX_LEN + 1);
+        let oversized = "r".repeat(MAX_PROVIDER_RULE_ID_BYTES + 1);
         let error = compile(&policy_rule_with_id(&oversized))
-            .expect_err("an oversized rule stable ID must fail structural compilation");
+            .expect_err("an oversized rule ID must fail policy validation");
+        assert!(error.to_string().contains("policy.rules[0].id"), "{error}");
         assert!(
-            error.to_string().contains("invalid compiled ACL"),
+            error.to_string().contains(&format!(
+                "at most {MAX_PROVIDER_RULE_ID_BYTES} bytes for authorization-provider dispatch"
+            )),
             "{error}"
         );
 

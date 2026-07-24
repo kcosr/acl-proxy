@@ -22,7 +22,7 @@ ALLOWED_LICENSES = {
 }
 REGISTRY = "https://github.com/rust-lang/crates.io-index"
 PRODUCT_VERSION = "0.3.0-rc.1"
-RUNTIME_COMMIT = "0373a1b0f192927a6b8abaa05af8847f18a90546"
+RUNTIME_COMMIT = "e9b77c5f78cabacd0b969f6e21f1e2375332221b"
 PRODUCT_INITIAL_COMMIT = "a829f43552c7118d1f206b9e4112b3c747eecd50"
 TRANSPORT_PACKAGES = {
     "h2": ("0.4.15", True),
@@ -173,6 +173,29 @@ def load_metadata(root: Path, supplied: Path | None) -> dict[str, Any]:
         fail(f"cannot load locked offline Cargo metadata: {error}")
 
 
+def resolved_product_package(root: Path, metadata: dict[str, Any]) -> dict[str, Any]:
+    packages = metadata.get("packages")
+    resolve = metadata.get("resolve")
+    if not isinstance(packages, list) or not isinstance(resolve, dict):
+        fail("locked metadata lacks packages or the resolve graph")
+    root_id = resolve.get("root")
+    if not isinstance(root_id, str):
+        fail("locked metadata lacks the product root resolution")
+    product = [
+        package
+        for package in packages
+        if package.get("id") == root_id
+        and package.get("name") == "acl-proxy"
+        and isinstance(package.get("manifest_path"), str)
+    ]
+    if len(product) != 1:
+        fail("locked metadata lacks one resolved acl-proxy root package")
+    metadata_root = Path(product[0]["manifest_path"]).resolve().parent
+    if metadata_root != root:
+        fail("locked metadata acl-proxy manifest root differs from the validated product root")
+    return product[0]
+
+
 def check_manifest(root: Path) -> None:
     if (root / "crates/transparent-uds-relay").exists():
         fail("obsolete transparent UDS relay crate is present")
@@ -286,7 +309,11 @@ def check_manifest(root: Path) -> None:
                 fail("h2 must remain the canonical root development-only dependency")
 
 
-def check_transport_resolution(root: Path, metadata: dict[str, Any]) -> None:
+def check_transport_resolution(
+    root: Path,
+    metadata: dict[str, Any],
+    product: dict[str, Any],
+) -> None:
     packages = metadata.get("packages")
     if not isinstance(packages, list):
         fail("locked metadata lacks package records")
@@ -304,19 +331,17 @@ def check_transport_resolution(root: Path, metadata: dict[str, Any]) -> None:
         elif source is not None:
             fail("locked Hyper 1.10.1 must be source-less and resolve from the runtime fork")
 
-    product = [package for package in packages if package.get("name") == "acl-proxy"]
-    if len(product) != 1 or not isinstance(product[0].get("manifest_path"), str):
-        fail("locked metadata lacks one canonical acl-proxy manifest path")
-    if product[0].get("version") != PRODUCT_VERSION:
+    if product.get("version") != PRODUCT_VERSION:
         fail(f"locked metadata must resolve acl-proxy {PRODUCT_VERSION}")
-    if product[0].get("publish") != []:
+    if product.get("publish") != []:
         fail("locked metadata must retain the acl-proxy publication guard")
     hyper = next(package for package in packages if package.get("name") == "hyper")
     manifest_path = hyper.get("manifest_path")
     if not isinstance(manifest_path, str):
         fail("locked Hyper 1.10.1 lacks its resolved manifest path")
-    product_root = Path(product[0]["manifest_path"]).parent
-    expected = (product_root.parent / "access-runtime" / "third_party" / "hyper" / "Cargo.toml").resolve()
+    expected = (
+        root.parent / "access-runtime" / "third_party" / "hyper" / "Cargo.toml"
+    ).resolve()
     if Path(manifest_path).resolve() != expected:
         fail("locked Hyper 1.10.1 does not resolve to the canonical sibling runtime fork")
 
@@ -333,6 +358,70 @@ def check_transport_resolution(root: Path, metadata: dict[str, Any]) -> None:
             fail(f"Cargo.lock {name} {version} must resolve from crates.io")
         if not registry and source is not None:
             fail("Cargo.lock Hyper 1.10.1 must be source-less")
+
+
+def check_runtime_source(
+    root: Path,
+    metadata: dict[str, Any],
+    product: dict[str, Any],
+) -> None:
+    packages = metadata.get("packages")
+    if not isinstance(packages, list):
+        fail("locked metadata lacks package records")
+    if Path(product["manifest_path"]).resolve().parent != root:
+        fail("validated acl-proxy metadata root changed before runtime verification")
+    runtime_root = (root.parent / "access-runtime").resolve()
+
+    local_manifests = []
+    for package in packages:
+        if package.get("source") is not None:
+            continue
+        manifest = package.get("manifest_path")
+        if not isinstance(manifest, str):
+            fail("locked metadata contains a source-less package without a manifest path")
+        manifest_path = Path(manifest).resolve()
+        if manifest_path.is_relative_to(root):
+            continue
+        if not manifest_path.is_relative_to(runtime_root):
+            fail("locked metadata resolves a local package outside the canonical sibling runtime")
+        local_manifests.append(manifest_path)
+    if not local_manifests:
+        fail("locked metadata resolves no canonical sibling runtime packages")
+
+    try:
+        top_level = subprocess.run(
+            ["git", "-C", str(runtime_root), "rev-parse", "--show-toplevel"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        head = subprocess.run(
+            ["git", "-C", str(runtime_root), "rev-parse", "--verify", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        status = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(runtime_root),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        fail(f"cannot verify canonical sibling runtime source state: {error}")
+    if Path(top_level).resolve() != runtime_root:
+        fail("canonical sibling runtime is not one complete Git worktree")
+    if head != RUNTIME_COMMIT:
+        fail("canonical sibling runtime HEAD differs from the accepted runtime commit")
+    if status:
+        fail("canonical sibling runtime worktree or index is not clean")
 
 
 def check_deny_policy(root: Path) -> None:
@@ -479,6 +568,12 @@ def check_provenance(root: Path) -> None:
             fail(f"PROVENANCE.md lacks required marker: {marker}")
     if provenance.count(RUNTIME_COMMIT) != 1:
         fail("PROVENANCE.md must name the exact accepted runtime commit once")
+    accepted_runtime_commits = re.findall(
+        r"(?m)^- Accepted runtime commit:\s*\n\s*`([0-9a-f]{40})`$",
+        provenance,
+    )
+    if accepted_runtime_commits != [RUNTIME_COMMIT]:
+        fail("PROVENANCE.md must contain one exact accepted runtime commit record")
 
 
 def check_shipped_docs(root: Path) -> None:
@@ -559,7 +654,9 @@ def main() -> int:
         check_manifest(root)
         check_deny_policy(root)
         metadata = load_metadata(root, args.metadata)
-        check_transport_resolution(root, metadata)
+        product = resolved_product_package(root, metadata)
+        check_transport_resolution(root, metadata, product)
+        check_runtime_source(root, metadata, product)
         check_notices(root, metadata)
         check_provenance(root)
         check_shipped_docs(root)

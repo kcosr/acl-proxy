@@ -17,6 +17,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "access-flow-conformance"
+version = "0.1.0"
+dependencies = [
+ "access-flow",
+ "access-flow-relay",
+ "access-flow-unix",
+ "access-identity",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "access-flow-relay"
 version = "0.1.0"
 dependencies = [
@@ -118,6 +130,8 @@ name = "acl-proxy-access-flow-relay"
 version = "0.3.0-rc.1"
 dependencies = [
  "access-async-contracts",
+ "access-flow",
+ "access-flow-conformance",
  "access-flow-relay",
  "access-flow-unix",
  "access-identity",

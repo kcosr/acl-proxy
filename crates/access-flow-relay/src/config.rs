@@ -100,6 +100,13 @@ impl Config {
     }
 
     pub fn validate(self) -> Result<ValidatedConfig, ConfigError> {
+        self.validate_with_socket_probe(probe_unix_socket_leaf)
+    }
+
+    fn validate_with_socket_probe(
+        self,
+        mut socket_probe: impl FnMut(&str, &str) -> Result<(), ConfigError>,
+    ) -> Result<ValidatedConfig, ConfigError> {
         if self.drain_timeout.is_zero() || self.drain_timeout > MAX_DRAIN_TIMEOUT {
             return Err(invalid(
                 "drainTimeout must be greater than zero and at most 10m",
@@ -137,7 +144,7 @@ impl Config {
                     endpoint
                         .validate_for(UnixExecutionTarget::Linux)
                         .map_err(map_execution_error)?;
-                    probe_unix_socket_leaf(endpoint.path().as_str(), &route.name)?;
+                    socket_probe(endpoint.path().as_str(), &route.name)?;
                     endpoint
                 }
             };
@@ -302,9 +309,70 @@ fn invalid(message: impl Into<String>) -> ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use access_flow_conformance::{
+        load_adapter_parity_fixture, load_awaf_vector_suite, project_relay_plan, AwafVector,
+        NormalizedAccessFlowTransport,
+    };
     use std::net::SocketAddrV4;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::{fs::symlink, net::UnixListener};
+
+    const PRODUCTION_FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/production/access-flow-relay.json"
+    );
+    const CONFORMANCE_VARIABLE: &str = "AW_ACCESS_FLOW_CONFORMANCE_VECTOR";
+    const CONFORMANCE_BEARER: &str = "abcdefghijklmnopqrstuvwxyzABCDEF";
+    const PRODUCT_HTTP_PATH: &str = "/run/acl-proxy/transparent-http.sock";
+    const PRODUCT_HTTPS_PATH: &str = "/run/acl-proxy/transparent-https.sock";
+
+    struct EnvironmentCleanup(&'static str);
+
+    impl Drop for EnvironmentCleanup {
+        fn drop(&mut self) {
+            std::env::remove_var(self.0);
+        }
+    }
+
+    fn no_socket_probe(_path: &str, _route: &str) -> Result<(), ConfigError> {
+        Ok(())
+    }
+
+    fn load_production_config() -> Config {
+        Config::load(Path::new(PRODUCTION_FIXTURE)).unwrap()
+    }
+
+    fn normalized_product_transport(
+        endpoint: &UnixAccessFlowEndpoint,
+    ) -> Result<NormalizedAccessFlowTransport, &'static str> {
+        let normalized = match endpoint.path().as_str() {
+            PRODUCT_HTTP_PATH => "/run/access-flow/conformance-http.sock",
+            PRODUCT_HTTPS_PATH => "/run/access-flow/conformance-https.sock",
+            _ => return Err("unrecognized product Access Flow transport"),
+        };
+        NormalizedAccessFlowTransport::unix(normalized)
+            .map_err(|_| "invalid normalized Access Flow transport")
+    }
+
+    fn validated_config_for_vector(vector: &AwafVector) -> ValidatedConfig {
+        let mut config = load_production_config();
+        config.presentation = match vector.name() {
+            "absent" => Presentation::Disabled {},
+            "anonymous" => Presentation::Anonymous {},
+            "bearer" => {
+                let _cleanup = EnvironmentCleanup(CONFORMANCE_VARIABLE);
+                std::env::set_var(CONFORMANCE_VARIABLE, CONFORMANCE_BEARER);
+                config.presentation = Presentation::BearerEnvironment {
+                    variable: CONFORMANCE_VARIABLE.to_owned(),
+                };
+                let validated = config.validate_with_socket_probe(no_socket_probe).unwrap();
+                assert!(std::env::var_os(CONFORMANCE_VARIABLE).is_none());
+                return validated;
+            }
+            _ => panic!("unexpected required AWAF vector"),
+        };
+        config.validate_with_socket_probe(no_socket_probe).unwrap()
+    }
 
     fn config_for(path: &Path) -> Config {
         Config {
@@ -325,13 +393,73 @@ mod tests {
     }
 
     #[test]
-    fn shipped_production_fixture_parses_strictly() {
-        let config: Config = serde_json::from_str(include_str!(
-            "../../../tests/fixtures/production/access-flow-relay.json"
-        ))
-        .unwrap();
-        assert_eq!(config.routes.len(), 2);
-        assert_eq!(config.max_connections, 1024);
+    fn shipped_production_fixture_compiles_to_exact_shared_adapter_plan() {
+        let validated = load_production_config()
+            .validate_with_socket_probe(no_socket_probe)
+            .unwrap();
+        let routes = validated.plan.routes();
+        assert_eq!(
+            routes
+                .iter()
+                .map(|route| route.name().as_str())
+                .collect::<Vec<_>>(),
+            ["http", "https"]
+        );
+        assert_eq!(routes[0].endpoint().path().as_str(), PRODUCT_HTTP_PATH);
+        assert_eq!(routes[1].endpoint().path().as_str(), PRODUCT_HTTPS_PATH);
+
+        let actual = project_relay_plan(&validated.plan, validated.drain_timeout, |endpoint| {
+            normalized_product_transport(endpoint).unwrap()
+        });
+        let expected = load_adapter_parity_fixture().unwrap();
+        assert_eq!(&actual, expected.relay_plan());
+
+        let unknown = UnixAccessFlowEndpoint::new(
+            NormalizedUnixSocketPath::new("/run/acl-proxy/unknown.sock").unwrap(),
+        );
+        let error = normalized_product_transport(&unknown).unwrap_err();
+        assert_eq!(error, "unrecognized product Access Flow transport");
+        assert!(!error.contains(unknown.path().as_str()));
+    }
+
+    #[tokio::test]
+    async fn product_presentations_encode_exact_required_awaf_vectors() {
+        let fixture = load_adapter_parity_fixture().unwrap();
+        let suite = load_awaf_vector_suite().unwrap();
+        assert_eq!(CONFORMANCE_BEARER.len(), 32);
+        assert_eq!(
+            suite
+                .vectors()
+                .iter()
+                .map(AwafVector::name)
+                .collect::<Vec<_>>(),
+            fixture
+                .required_awaf_vectors()
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            fixture
+                .required_awaf_vectors()
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>(),
+            ["absent", "anonymous", "bearer"]
+        );
+
+        for vector in suite.vectors() {
+            let validated = validated_config_for_vector(vector);
+            let mut actual = Zeroizing::new(Vec::new());
+            access_flow::write_access_flow_preface(
+                &mut *actual,
+                vector.destination(),
+                validated.plan.presentation(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(actual.as_slice(), vector.wire(), "{}", vector.name());
+        }
     }
 
     #[test]

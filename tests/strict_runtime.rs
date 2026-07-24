@@ -378,7 +378,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 and identity.get("state") == "authenticated"
                 and principal.get("authority") == "strict-runtime"
                 and principal.get("id") == "fixture-agent"
-                and {"authority": "strict-runtime", "id": "operators"} in groups
+                and principal.get("kind") == "service_account"
+                and groups == [
+                    {"authority": "strict-runtime", "id": "auditors"},
+                    {"authority": "strict-runtime", "id": "operators"},
+                ]
             )
             decision = "deny" if not valid_identity else {
                 "/webhook-deny": "deny",
@@ -431,7 +435,11 @@ for line in sys.stdin:
         and identity.get("state") == "authenticated"
         and principal.get("authority") == "strict-runtime"
         and principal.get("id") == "fixture-agent"
-        and {"authority": "strict-runtime", "id": "operators"} in groups
+        and principal.get("kind") == "service_account"
+        and groups == [
+            {"authority": "strict-runtime", "id": "auditors"},
+            {"authority": "strict-runtime", "id": "operators"},
+        ]
     )
     decision = "deny" if not valid_identity else {
         "/provider-deny": "deny",
@@ -503,6 +511,10 @@ kind = "service_account"
 
 [[identity.resolver.groups]]
 id = "operators"
+members = ["fixture-agent"]
+
+[[identity.resolver.groups]]
+id = "auditors"
 members = ["fixture-agent"]
 
 [[identity.resolver.tokens]]
@@ -1017,12 +1029,15 @@ fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
         event["identity"]["state"] == "authenticated"
             && event["identity"]["principal"]["authority"] == "strict-runtime"
             && event["identity"]["principal"]["id"] == "fixture-agent"
+            && event["identity"]["principal"]["kind"] == "service_account"
             && event["identity"]["groups"]
                 .as_array()
                 .is_some_and(|groups| {
-                    groups.iter().any(|group| {
-                        group["authority"] == "strict-runtime" && group["id"] == "operators"
-                    })
+                    groups
+                        == &[
+                            json!({"authority": "strict-runtime", "id": "auditors"}),
+                            json!({"authority": "strict-runtime", "id": "operators"}),
+                        ]
                 })
     }));
     assert!(events

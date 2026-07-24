@@ -6,7 +6,7 @@ use crate::authorization::protocol::{ProviderRequest, ProviderRequestHeaders};
 use crate::safety::wire_body::{ReservedGuardedBodyBuilder, WireBodyBufferError};
 use crate::safety::{GuardedBody, HttpWireBodyGuard};
 
-const MAX_IDENTIFIER_BYTES: usize = 4096;
+const MAX_WEBHOOK_REQUEST_ID_BYTES: usize = 4096;
 
 /// Body-free request projected specifically for the callback webhook protocol.
 pub(crate) struct WebhookRequest<'a> {
@@ -132,9 +132,9 @@ impl WebhookRequest<'_> {
 
     fn validate(&self) -> Result<(), WebhookRequestError> {
         if self.request_id.is_empty()
-            || self.request_id.len() > MAX_IDENTIFIER_BYTES
+            || self.request_id.len() > MAX_WEBHOOK_REQUEST_ID_BYTES
             || self.rule_id.is_empty()
-            || self.rule_id.len() > MAX_IDENTIFIER_BYTES
+            || self.rule_id.len() > super::super::MAX_PROVIDER_RULE_ID_BYTES
             || self.url.is_empty()
             || self.method.is_empty()
             || !self.method.bytes().all(|byte| {

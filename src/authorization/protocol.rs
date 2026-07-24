@@ -1062,7 +1062,7 @@ impl ProviderRequest<'_> {
         if self.request_id.is_empty()
             || self.request_id.len() > MAX_PROVIDER_REQUEST_ID_BYTES
             || self.rule_id.is_empty()
-            || self.rule_id.len() > MAX_PROVIDER_REQUEST_ID_BYTES
+            || self.rule_id.len() > super::MAX_PROVIDER_RULE_ID_BYTES
         {
             return Err(RequestShapeError::RequestId);
         }
@@ -2285,6 +2285,9 @@ impl Drop for SecretBytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use access_identity::{
+        AuthorityId, GroupId, GroupRef, PrincipalId, PrincipalKind, ProviderPrincipalProjection,
+    };
     use http::header::CONTENT_TYPE;
     use std::net::{IpAddr, Ipv4Addr};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2617,6 +2620,82 @@ mod tests {
 
             assert_eq!(asynchronous, synchronous, "body length {body_len}");
             drop(body);
+            assert_eq!(guard.live_bytes(), 0);
+            assert_eq!(pool.global_charge(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn async_process_request_exactly_matches_sync_for_every_identity_state() {
+        let authority = AuthorityId::new("parity-authority").unwrap();
+        let identities = [
+            ProviderIdentityProjection::Disabled,
+            ProviderIdentityProjection::Anonymous,
+            ProviderIdentityProjection::Authenticated {
+                principal: ProviderPrincipalProjection {
+                    authority: authority.clone(),
+                    id: PrincipalId::new("parity-principal").unwrap(),
+                    kind: PrincipalKind::System,
+                },
+                groups: vec![
+                    GroupRef::new(authority.clone(), GroupId::new("auditors").unwrap()),
+                    GroupRef::new(authority, GroupId::new("operators").unwrap()),
+                ]
+                .into_boxed_slice(),
+            },
+        ];
+        let expected = [
+            serde_json::json!({"state": "disabled"}),
+            serde_json::json!({"state": "anonymous"}),
+            serde_json::json!({
+                "state": "authenticated",
+                "principal": {
+                    "authority": "parity-authority",
+                    "id": "parity-principal",
+                    "kind": "system"
+                },
+                "groups": [
+                    {"authority": "parity-authority", "id": "auditors"},
+                    {"authority": "parity-authority", "id": "operators"}
+                ]
+            }),
+        ];
+
+        for (identity, expected_identity) in identities.iter().zip(expected) {
+            let request = ProviderRequest {
+                request_id: "request-1",
+                rule_id: "rule-1",
+                url: "https://example.test/identity",
+                method: "GET",
+                client_ip: "127.0.0.1",
+                identity: Some(identity),
+                headers: None,
+                body: None,
+            };
+            let mut synchronous = Vec::new();
+            request
+                .write_compact(TEST_CORRELATION_ID, &mut synchronous)
+                .unwrap();
+
+            let allocation =
+                crate::safety::wire_body::guarded_body_allocation_bytes(64 * 1024).unwrap();
+            let pool = WireBodyPool::new(allocation, allocation);
+            let guard = pool.begin_for_test(
+                allocation,
+                WireBodyQuotaKey::from_peer(IpAddr::V4(Ipv4Addr::LOCALHOST), |_| false),
+            );
+            let mut scratch = guard.stream_scratch().unwrap();
+            let mut asynchronous = Vec::new();
+            let commit = request
+                .stream_before_commit(TEST_CORRELATION_ID, &mut asynchronous, &mut scratch)
+                .await
+                .unwrap();
+            drop(scratch);
+            commit.commit(&mut asynchronous).await.unwrap();
+
+            assert_eq!(asynchronous, synchronous);
+            let encoded: serde_json::Value = serde_json::from_slice(&asynchronous).unwrap();
+            assert_eq!(encoded["identity"], expected_identity);
             assert_eq!(guard.live_bytes(), 0);
             assert_eq!(pool.global_charge(), 0);
         }

@@ -22,4 +22,6 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "json"] }
 zeroize = "1.8"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
+access-flow = { path = "../../../access-runtime/crates/access-flow", version = "=0.1.0" }
+access-flow-conformance = { path = "../../../access-runtime/crates/access-flow-conformance", version = "=0.1.0" }
 tempfile = "3.10"
