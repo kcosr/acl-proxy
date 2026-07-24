@@ -221,14 +221,16 @@ pub fn relay_descriptor_budget() -> Result<u64, ConfigError> {
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
         return Err(ConfigError::ResourceLimit(std::io::Error::last_os_error()));
     }
-    limit
-        .rlim_cur
-        .checked_sub(CONSUMER_DESCRIPTOR_RESERVE)
-        .ok_or_else(|| {
-            invalid(format!(
-                "RLIMIT_NOFILE must exceed the {CONSUMER_DESCRIPTOR_RESERVE}-descriptor consumer reserve"
-            ))
-        })
+    relay_descriptor_budget_from_limit(limit.rlim_cur)
+}
+
+fn relay_descriptor_budget_from_limit(soft_limit: u64) -> Result<u64, ConfigError> {
+    if soft_limit <= CONSUMER_DESCRIPTOR_RESERVE {
+        return Err(invalid(format!(
+            "RLIMIT_NOFILE must exceed the {CONSUMER_DESCRIPTOR_RESERVE}-descriptor consumer reserve"
+        )));
+    }
+    Ok(soft_limit - CONSUMER_DESCRIPTOR_RESERVE)
 }
 
 pub const fn relay_memory_budget() -> u64 {
@@ -258,9 +260,21 @@ fn reject_removed_shape(bytes: &[u8]) -> Result<(), ConfigError> {
     }
     let mut removed = removed.into_iter().collect::<Vec<_>>();
     removed.sort_unstable();
+    let mut replacements = Vec::new();
+    if removed.contains(&"allowedOriginalPorts") {
+        replacements.push("replace allowedOriginalPorts with allowedDestinationPorts");
+    }
+    if removed.contains(&"upstreamSocket") {
+        replacements
+            .push("replace upstreamSocket with transport {\"kind\":\"unix\",\"path\":\"...\"}");
+    }
+    if removed.contains(&"identity") {
+        replacements.push("replace route identity with top-level presentation");
+    }
     Err(invalid(format!(
-        "removed field(s) {}: replace allowedOriginalPorts with allowedDestinationPorts and upstreamSocket with transport {{\"kind\":\"unix\",\"path\":\"...\"}}",
-        removed.join(", ")
+        "removed field(s) {}: {}",
+        removed.join(", "),
+        replacements.join("; ")
     )))
 }
 
@@ -311,7 +325,7 @@ mod tests {
     use super::*;
     use access_flow_conformance::{
         load_adapter_parity_fixture, load_awaf_vector_suite, project_relay_plan, AwafVector,
-        NormalizedAccessFlowTransport,
+        FixturePresentationKind, NormalizedAccessFlowTransport,
     };
     use std::net::SocketAddrV4;
     use std::os::unix::fs::PermissionsExt;
@@ -354,12 +368,12 @@ mod tests {
             .map_err(|_| "invalid normalized Access Flow transport")
     }
 
-    fn validated_config_for_vector(vector: &AwafVector) -> ValidatedConfig {
+    fn validated_config_for_vector(presentation: FixturePresentationKind) -> ValidatedConfig {
         let mut config = load_production_config();
-        config.presentation = match vector.name() {
-            "absent" => Presentation::Disabled {},
-            "anonymous" => Presentation::Anonymous {},
-            "bearer" => {
+        config.presentation = match presentation {
+            FixturePresentationKind::Disabled => Presentation::Disabled {},
+            FixturePresentationKind::Anonymous => Presentation::Anonymous {},
+            FixturePresentationKind::Bearer => {
                 let _cleanup = EnvironmentCleanup(CONFORMANCE_VARIABLE);
                 std::env::set_var(CONFORMANCE_VARIABLE, CONFORMANCE_BEARER);
                 config.presentation = Presentation::BearerEnvironment {
@@ -369,7 +383,6 @@ mod tests {
                 assert!(std::env::var_os(CONFORMANCE_VARIABLE).is_none());
                 return validated;
             }
-            _ => panic!("unexpected required AWAF vector"),
         };
         config.validate_with_socket_probe(no_socket_probe).unwrap()
     }
@@ -445,15 +458,54 @@ mod tests {
                 .iter()
                 .map(AsRef::as_ref)
                 .collect::<Vec<_>>(),
-            ["absent", "anonymous", "bearer"]
+            [
+                "absent",
+                "anonymous",
+                "bearer",
+                "unicast-before-multicast",
+                "reserved-after-multicast",
+                "high-unicast-before-broadcast",
+            ]
         );
 
         for vector in suite.vectors() {
-            let validated = validated_config_for_vector(vector);
+            let validated = validated_config_for_vector(vector.presentation());
+            let matching_routes = validated
+                .plan
+                .routes()
+                .iter()
+                .filter(|route| {
+                    route
+                        .allowed_destination_ports()
+                        .contains(&vector.destination().port())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matching_routes.len(),
+                1,
+                "{} must map to one product route",
+                vector.name()
+            );
+            let mapped_destination = access_flow::AccessFlowDestination::new(
+                vector.destination().address(),
+                matching_routes[0]
+                    .allowed_destination_ports()
+                    .iter()
+                    .find(|port| **port == vector.destination().port())
+                    .expect("matching route contains the vector port")
+                    .get(),
+            )
+            .unwrap();
+            assert_eq!(
+                mapped_destination,
+                vector.destination(),
+                "{}",
+                vector.name()
+            );
             let mut actual = Zeroizing::new(Vec::new());
             access_flow::write_access_flow_preface(
                 &mut *actual,
-                vector.destination(),
+                mapped_destination,
                 validated.plan.presentation(),
             )
             .await
@@ -471,6 +523,64 @@ mod tests {
             let error = reject_removed_shape(input).unwrap_err().to_string();
             assert!(error.contains("allowedOriginalPorts"), "{error}");
             assert!(error.contains("allowedDestinationPorts"), "{error}");
+        }
+
+        let identity = br#"{"routes":[{"name":"http","listen":"127.0.0.1:3128","allowedDestinationPorts":[80],"transport":{"kind":"unix","path":"/run/acl-proxy/http.sock"},"identity":{"kind":"disabled"}}],"presentation":{"kind":"disabled"},"setupTimeout":"2s","drainTimeout":"10s","maxConnections":1,"copyBufferBytesPerDirection":1024}"#;
+        let error = reject_removed_shape(identity).unwrap_err().to_string();
+        assert!(error.contains("removed field(s) identity"), "{error}");
+        assert!(error.contains("top-level presentation"), "{error}");
+    }
+
+    #[test]
+    fn strict_json_requires_presentation_and_rejects_remote_transport_fields() {
+        let base = r#"{"routes":[],"presentation":{"kind":"disabled"},"setupTimeout":"2s","drainTimeout":"10s","maxConnections":1,"copyBufferBytesPerDirection":1}"#;
+        let mut missing_presentation: serde_json::Value = serde_json::from_str(base).unwrap();
+        missing_presentation
+            .as_object_mut()
+            .unwrap()
+            .remove("presentation");
+        assert!(serde_json::from_value::<Config>(missing_presentation).is_err());
+
+        let route_base = serde_json::json!({
+            "routes": [{
+                "name": "http",
+                "listen": "127.0.0.1:3128",
+                "allowedDestinationPorts": [80],
+                "transport": {"kind": "unix", "path": "/run/x"},
+            }],
+            "presentation": {"kind": "disabled"},
+            "setupTimeout": "2s",
+            "drainTimeout": "10s",
+            "maxConnections": 1,
+            "copyBufferBytesPerDirection": 1,
+        });
+        for field in [
+            "remote",
+            "tls",
+            "cert",
+            "server_name",
+            "discovery",
+            "fallback",
+        ] {
+            let mut at_root = route_base.clone();
+            at_root
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_owned(), serde_json::json!(true));
+            assert!(
+                serde_json::from_value::<Config>(at_root).is_err(),
+                "accepted root field {field}"
+            );
+
+            let mut in_transport = route_base.clone();
+            in_transport["routes"][0]["transport"]
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_owned(), serde_json::json!(true));
+            assert!(
+                serde_json::from_value::<Config>(in_transport).is_err(),
+                "accepted transport field {field}"
+            );
         }
     }
 
@@ -685,6 +795,17 @@ mod tests {
         assert_eq!(
             relay_descriptor_budget().unwrap(),
             limit.rlim_cur - CONSUMER_DESCRIPTOR_RESERVE
+        );
+        for insufficient in [
+            0,
+            CONSUMER_DESCRIPTOR_RESERVE - 1,
+            CONSUMER_DESCRIPTOR_RESERVE,
+        ] {
+            assert!(relay_descriptor_budget_from_limit(insufficient).is_err());
+        }
+        assert_eq!(
+            relay_descriptor_budget_from_limit(CONSUMER_DESCRIPTOR_RESERVE + 1).unwrap(),
+            1
         );
     }
 }

@@ -159,10 +159,12 @@ mod tests {
     const BEARER: &[u8] = b"identity-file-bearer-000000000000";
 
     fn trusted_tempdir() -> tempfile::TempDir {
-        tempfile::Builder::new()
+        let directory = tempfile::Builder::new()
             .prefix(".identity-file-test-")
             .tempdir_in(std::env::var_os("HOME").unwrap())
-            .unwrap()
+            .unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        directory
     }
 
     fn write_leaf(path: &Path, value: &[u8]) {
@@ -175,6 +177,40 @@ mod tests {
         assert!(trusted_owner(0, 1000));
         assert!(trusted_owner(1000, 1000));
         assert!(!trusted_owner(1001, 1000));
+    }
+
+    #[test]
+    fn trusted_tempdir_mode_is_independent_of_process_umask() {
+        const CHILD: &str = "ACL_PROXY_IDENTITY_FILE_UMASK_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let original = unsafe { libc::umask(0) };
+            let directory = trusted_tempdir();
+            let mode = std::fs::metadata(directory.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            unsafe {
+                libc::umask(original);
+            }
+            assert_eq!(mode, 0o700);
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "identity_file::tests::trusted_tempdir_mode_is_independent_of_process_umask",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated umask proof failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

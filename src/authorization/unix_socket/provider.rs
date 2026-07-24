@@ -769,61 +769,111 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_response_is_sanitized_and_never_retried() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("provider.sock");
-        let provider = UnixSocketProvider::activate(provider_plan(
-            path.clone(),
+    async fn malformed_response_boundaries_are_sanitized_and_never_retried() {
+        let protocol = provider_plan(
+            PathBuf::from("/unused"),
             Duration::from_secs(1),
             1,
             None,
             false,
-        ))
-        .unwrap();
-        let listener = Arc::new(UnixListener::bind(&path).unwrap());
-        let server_listener = listener.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = server_listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            stream.read_to_end(&mut request).await.unwrap();
-            assert!(request.len() > FRAME_HEADER_LEN);
-            let mut response = b"NOPE".to_vec();
-            response.extend_from_slice(&[1, 2, 0, 0, 0, 2]);
-            response.extend_from_slice(b"{}");
-            stream.write_all(&response).await.unwrap();
-            stream.shutdown().await.unwrap();
-        });
-        let (_, guard) = guard();
-        let cancellation = http_access_runtime::ForwardingCancellation::new();
-        let result = provider
-            .decide(
-                request(),
-                AuthorizationInvocationMode::EffectsAllowed,
-                &cancellation,
-                &guard,
-                deadline(),
-            )
-            .await;
-        let Err(error) = result else {
-            panic!("malformed response unexpectedly succeeded");
-        };
-        assert_eq!(
-            error,
-            UnixSocketRequestError::Frame {
-                category: FrameError::WrongMagic,
-                request_may_have_been_written: true,
-            }
-        );
-        assert!(error.request_may_have_been_written());
-        assert!(!error
-            .to_string()
-            .contains(&path.to_string_lossy().to_string()));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), listener.accept())
-                .await
-                .is_err()
-        );
-        server.await.unwrap();
+        )
+        .frame_protocol;
+        let response_header = protocol
+            .header(FrameKind::Response, 2)
+            .unwrap()
+            .encode(protocol);
+        let early_eof_header = protocol
+            .header(FrameKind::Response, 4)
+            .unwrap()
+            .encode(protocol);
+        let malformed = [
+            (
+                "wrong magic",
+                [b"NOPE\x01\x02\x00\x00\x00\x02".as_slice(), b"{}"].concat(),
+                FrameError::WrongMagic,
+            ),
+            (
+                "early EOF",
+                [early_eof_header.as_slice(), b"{}"].concat(),
+                FrameError::EarlyEof,
+            ),
+            (
+                "trailing byte",
+                [response_header.as_slice(), b"{}x"].concat(),
+                FrameError::TrailingData,
+            ),
+            (
+                "second frame",
+                [
+                    response_header.as_slice(),
+                    b"{}",
+                    response_header.as_slice(),
+                    b"{}",
+                ]
+                .concat(),
+                FrameError::TrailingData,
+            ),
+        ];
+
+        for (name, response, category) in malformed {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("provider.sock");
+            let provider = UnixSocketProvider::activate(provider_plan(
+                path.clone(),
+                Duration::from_secs(1),
+                1,
+                None,
+                false,
+            ))
+            .unwrap();
+            let listener = Arc::new(UnixListener::bind(&path).unwrap());
+            let server_listener = listener.clone();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = server_listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).await.unwrap();
+                assert!(request.len() > FRAME_HEADER_LEN);
+                stream.write_all(&response).await.unwrap();
+                stream.shutdown().await.unwrap();
+            });
+            let (pool, guard) = guard();
+            let cancellation = http_access_runtime::ForwardingCancellation::new();
+            let result = provider
+                .decide(
+                    request(),
+                    AuthorizationInvocationMode::EffectsAllowed,
+                    &cancellation,
+                    &guard,
+                    deadline(),
+                )
+                .await;
+            let Err(error) = result else {
+                panic!("malformed response unexpectedly succeeded: {name}");
+            };
+            assert_eq!(
+                error,
+                UnixSocketRequestError::Frame {
+                    category,
+                    request_may_have_been_written: true,
+                },
+                "{name}"
+            );
+            assert!(error.request_may_have_been_written(), "{name}");
+            assert!(
+                !error
+                    .to_string()
+                    .contains(&path.to_string_lossy().to_string()),
+                "{name}"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err(),
+                "{name} was retried"
+            );
+            server.await.unwrap();
+            assert_eq!(pool.global_charge(), 0, "{name}");
+        }
     }
 
     #[tokio::test]

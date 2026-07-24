@@ -318,6 +318,8 @@ expect_rejected deny-gate-comment 'cargo deny --locked --offline check -D warnin
 expect_rejected gate-order $'cargo audit --no-fetch --no-yanked --deny warnings\ncargo deny --locked --offline check -D warnings licenses sources' $'cargo deny --locked --offline check -D warnings licenses sources\ncargo audit --no-fetch --no-yanked --deny warnings' scripts/check-packaging-policy.sh
 expect_rejected archive-root 'acl-proxy-<version>-<acl12>/' 'acl-proxy-release/' README.md
 expect_rejected archive-hardcoded-sha 'acl-proxy-<version>-<acl12>/' 'acl-proxy-0.3.0-rc.1-0123456789ab/' README.md
+expect_rejected archive-linux-name 'acl-proxy-<version>-<acl12>-linux-x86_64.tar.gz' 'acl-proxy-<version>-<acl12>-linux-amd64.tar.gz' README.md
+expect_rejected archive-macos-name 'acl-proxy-<version>-<acl12>-macos-arm64.tar.gz' 'acl-proxy-<version>-<acl12>-darwin-arm64.tar.gz' README.md
 expect_rejected candidate-doc-version 'The `0.3.0-rc.1` candidate requires' 'The `0.3.0-rc.2` candidate requires' README.md
 expect_created_path_rejected obsolete-demo demos/auth-plugin-stdio/README.md
 expect_created_path_rejected obsolete-relay-crate crates/transparent-uds-relay/Cargo.toml

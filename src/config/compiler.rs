@@ -150,6 +150,13 @@ pub(crate) const MAX_PROVIDER_OUTPUT_NAME_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_ENVIRONMENT_CREDENTIAL_NAME_BYTES: usize = 255;
 pub(crate) const MAX_CREDENTIAL_FILE_PATH_BYTES: usize = 4096;
 pub(crate) const MAX_CREDENTIAL_FILE_COMPONENT_BYTES: usize = 255;
+const MAX_PENDING_AUTHENTICATIONS: usize = 4_096;
+const MAX_PENDING_AUTHENTICATIONS_PER_CONNECTION: usize = 256;
+const MAX_IDENTITY_PRINCIPALS: usize = 4_096;
+const MAX_IDENTITY_GROUPS: usize = 4_096;
+const MAX_IDENTITY_TOKENS: usize = 8_192;
+const MAX_IDENTITY_MEMBERSHIPS: usize = 65_536;
+const MAX_IDENTITY_GROUPS_PER_PRINCIPAL: usize = 256;
 const PROVIDER_REPLACEMENT_STAGING_BYTES: usize = 64 * 1024;
 const WEBSOCKET_DEFLATE_SCRATCH_BYTES: usize = 64 * 1024;
 const PROVIDER_REQUEST_STREAM_SCRATCH_BYTES: usize = 64 * 1024;
@@ -1498,13 +1505,6 @@ fn validate_positive_limits(
 }
 
 fn validate_identity(config: &super::authoring::AuthoringConfig) -> Result<(), ConfigCompileError> {
-    const MAX_PENDING_AUTHENTICATIONS: usize = 4_096;
-    const MAX_PENDING_AUTHENTICATIONS_PER_CONNECTION: usize = 256;
-    const MAX_IDENTITY_PRINCIPALS: usize = 4096;
-    const MAX_IDENTITY_GROUPS: usize = 4096;
-    const MAX_IDENTITY_TOKENS: usize = 8192;
-    const MAX_IDENTITY_MEMBERSHIPS: usize = 65_536;
-    const MAX_IDENTITY_GROUPS_PER_PRINCIPAL: usize = 256;
     for (name, listener) in [
         (
             "listeners.transparent_http",
@@ -8278,6 +8278,62 @@ default = "deny"
         identity_config(&format!("source = \"file\"\npath = {path:?}"))
     }
 
+    fn authored_identity_config() -> super::super::authoring::AuthoringConfig {
+        toml::from_str(&environment_identity_config("AW_IDENTITY_TOKEN")).unwrap()
+    }
+
+    fn validate_and_project_identity(
+        config: &super::super::authoring::AuthoringConfig,
+    ) -> Result<(), ConfigCompileError> {
+        validate_identity(config)?;
+        compile_identity_plan(config.identity.as_ref()).map(|_| ())
+    }
+
+    fn identity_principal(
+        id: impl Into<String>,
+    ) -> super::super::authoring::StaticIdentityPrincipalConfig {
+        super::super::authoring::StaticIdentityPrincipalConfig {
+            id: id.into(),
+            kind: IdentityPrincipalKindConfig::ServiceAccount,
+        }
+    }
+
+    fn identity_group(
+        id: impl Into<String>,
+        members: Vec<String>,
+    ) -> super::super::authoring::StaticIdentityGroupConfig {
+        super::super::authoring::StaticIdentityGroupConfig {
+            id: id.into(),
+            members,
+        }
+    }
+
+    fn identity_environment_token(
+        id: impl Into<String>,
+        principal: impl Into<String>,
+        variable: impl Into<String>,
+    ) -> super::super::authoring::StaticIdentityTokenConfig {
+        super::super::authoring::StaticIdentityTokenConfig::Environment {
+            id: id.into(),
+            principal: principal.into(),
+            variable: variable.into(),
+        }
+    }
+
+    fn identity_principals(
+        count: usize,
+    ) -> Vec<super::super::authoring::StaticIdentityPrincipalConfig> {
+        (0..count)
+            .map(|index| {
+                identity_principal(if index == 0 {
+                    "test-principal".to_owned()
+                } else {
+                    format!("principal-{index}")
+                })
+            })
+            .collect()
+    }
+
     fn identity_policy_config(mode: &str, states: &str, subjects: Option<&str>) -> String {
         let subjects = subjects
             .map(|value| format!("identity_subjects = {value}\n"))
@@ -8671,6 +8727,448 @@ path = "relative/token"
             error
                 .to_string()
                 .contains("requires at least one optional or required identity listener"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn identity_listener_resolver_and_subject_cross_requirements_are_strict() {
+        let baseline = authored_identity_config();
+        validate_identity(&baseline).expect("the loopback identity baseline must validate");
+
+        let mut missing_resolver = baseline.clone();
+        missing_resolver.identity = None;
+        let error = validate_identity(&missing_resolver)
+            .expect_err("an identity-enabled listener requires a resolver");
+        assert!(
+            error
+                .to_string()
+                .contains("identity: is required when a listener enables identity"),
+            "{error}"
+        );
+
+        let mut unused_resolver = baseline.clone();
+        unused_resolver
+            .listeners
+            .explicit_http
+            .as_mut()
+            .unwrap()
+            .identity = None;
+        let error =
+            validate_identity(&unused_resolver).expect_err("an unused resolver must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("requires at least one optional or required identity listener"),
+            "{error}"
+        );
+
+        let mut unreachable_subjects: super::super::authoring::AuthoringConfig =
+            toml::from_str(&identity_policy_config(
+                "required",
+                r#"["authenticated"]"#,
+                Some(
+                    r#"[{ kind = "principal", authority = "test-authority", id = "test-principal" }]"#,
+                ),
+            ))
+            .unwrap();
+        unreachable_subjects
+            .listeners
+            .explicit_http
+            .as_mut()
+            .unwrap()
+            .identity = None;
+        let error = validate_identity(&unreachable_subjects)
+            .expect_err("authenticated subjects require an identity-enabled listener");
+        assert!(
+            error
+                .to_string()
+                .contains("authenticated subjects require at least one identity-enabled listener"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn identity_subjects_reject_omitted_identity_states() {
+        let input = identity_policy_config(
+            "required",
+            r#"["authenticated"]"#,
+            Some(
+                r#"[{ kind = "principal", authority = "test-authority", id = "test-principal" }]"#,
+            ),
+        )
+        .replace("identity_states = [\"authenticated\"]\n", "");
+        let error = compile(&input).expect_err("subjects without identity_states must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("requires identity_states = [\"authenticated\"]"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn cleartext_identity_requires_loopback_and_accepts_loopback() {
+        let loopback = authored_identity_config();
+        validate_identity(&loopback).expect("loopback cleartext identity must validate");
+
+        let mut non_loopback = loopback;
+        let listener = non_loopback.listeners.explicit_http.as_mut().unwrap();
+        listener.endpoint = ListenerEndpointConfig::Tcp {
+            address: "192.0.2.10:8881".parse().unwrap(),
+        };
+        let error = validate_identity(&non_loopback)
+            .expect_err("non-loopback cleartext identity must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("identity over cleartext TCP requires a loopback listener"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn generic_parent_rejects_every_identity_presentation_source() {
+        for presentation in [
+            r#"
+[egress.parent_proxy.presentation]
+kind = "bearer_environment"
+variable = "AW_IDENTITY_TOKEN"
+"#,
+            r#"
+[egress.parent_proxy.presentation]
+kind = "bearer_file"
+path = "/etc/acl-proxy/identity-token"
+"#,
+        ] {
+            let input = MINIMAL.replace(
+                "[policy]",
+                &format!(
+                    r#"[egress]
+route = "parent_proxy"
+
+[egress.parent_proxy]
+kind = "generic"
+url = "http://192.0.2.10:8080"
+{presentation}
+[policy]"#
+                ),
+            );
+            let error = compile(&input).expect_err("generic parent presentation must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("presentation: is valid only for an ACL Proxy parent"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn static_identity_record_limits_accept_exact_bound_and_reject_bound_plus_one() {
+        let mut principals = authored_identity_config();
+        principals.identity.as_mut().unwrap().resolver.principals =
+            identity_principals(MAX_IDENTITY_PRINCIPALS);
+        validate_and_project_identity(&principals)
+            .expect("the exact principal bound must validate and project");
+        principals
+            .identity
+            .as_mut()
+            .unwrap()
+            .resolver
+            .principals
+            .push(identity_principal("principal-over-limit"));
+        let error =
+            validate_identity(&principals).expect_err("one principal over the bound must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the static identity principal limit"),
+            "{error}"
+        );
+
+        let mut groups = authored_identity_config();
+        groups.identity.as_mut().unwrap().resolver.groups = (0..MAX_IDENTITY_GROUPS)
+            .map(|index| identity_group(format!("group-{index}"), Vec::new()))
+            .collect();
+        validate_and_project_identity(&groups)
+            .expect("the exact group bound must validate and project");
+        groups
+            .identity
+            .as_mut()
+            .unwrap()
+            .resolver
+            .groups
+            .push(identity_group("group-over-limit", Vec::new()));
+        let error = validate_identity(&groups).expect_err("one group over the bound must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the static identity group limit"),
+            "{error}"
+        );
+
+        let mut tokens = authored_identity_config();
+        tokens.identity.as_mut().unwrap().resolver.tokens = (0..MAX_IDENTITY_TOKENS)
+            .map(|index| {
+                identity_environment_token(
+                    format!("token-{index}"),
+                    "test-principal",
+                    format!("AW_T{index}_IDENTITY_TOKEN"),
+                )
+            })
+            .collect();
+        validate_and_project_identity(&tokens)
+            .expect("the exact token-record bound must validate and project");
+        tokens
+            .identity
+            .as_mut()
+            .unwrap()
+            .resolver
+            .tokens
+            .push(identity_environment_token(
+                "token-over-limit",
+                "test-principal",
+                "AW_OVER_LIMIT_IDENTITY_TOKEN",
+            ));
+        let error =
+            validate_identity(&tokens).expect_err("one token record over the bound must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the static identity token-record limit"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn static_identity_membership_limits_accept_exact_bound_and_reject_bound_plus_one() {
+        let principal_ids = (0..=MAX_IDENTITY_GROUPS_PER_PRINCIPAL)
+            .map(|index| format!("member-{index}"))
+            .collect::<Vec<_>>();
+        let exact_members = principal_ids[..MAX_IDENTITY_GROUPS_PER_PRINCIPAL].to_vec();
+        let mut memberships = authored_identity_config();
+        let resolver = &mut memberships.identity.as_mut().unwrap().resolver;
+        resolver.principals = principal_ids
+            .iter()
+            .map(|id| identity_principal(id.clone()))
+            .collect();
+        resolver.tokens = vec![identity_environment_token(
+            "member-primary",
+            &principal_ids[0],
+            "AW_MEMBERSHIP_IDENTITY_TOKEN",
+        )];
+        resolver.groups = (0..MAX_IDENTITY_GROUPS_PER_PRINCIPAL)
+            .map(|index| identity_group(format!("membership-group-{index}"), exact_members.clone()))
+            .collect();
+        validate_and_project_identity(&memberships).expect(
+            "the exact total and per-principal membership bounds must validate and project",
+        );
+
+        let mut total_over = memberships.clone();
+        total_over
+            .identity
+            .as_mut()
+            .unwrap()
+            .resolver
+            .groups
+            .push(identity_group(
+                "membership-over-limit",
+                vec![principal_ids[MAX_IDENTITY_GROUPS_PER_PRINCIPAL].clone()],
+            ));
+        let error = validate_identity(&total_over)
+            .expect_err("one aggregate membership over the bound must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the static identity membership limit"),
+            "{error}"
+        );
+
+        let mut per_principal_over = authored_identity_config();
+        per_principal_over
+            .identity
+            .as_mut()
+            .unwrap()
+            .resolver
+            .groups = (0..=MAX_IDENTITY_GROUPS_PER_PRINCIPAL)
+            .map(|index| {
+                identity_group(
+                    format!("principal-group-{index}"),
+                    vec!["test-principal".to_owned()],
+                )
+            })
+            .collect();
+        let error = validate_identity(&per_principal_over)
+            .expect_err("one group per principal over the bound must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the static identity group-membership limit"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn static_identity_records_reject_empty_duplicate_unknown_and_reused_sources() {
+        let mut empty_principals = authored_identity_config();
+        empty_principals
+            .identity
+            .as_mut()
+            .unwrap()
+            .resolver
+            .principals
+            .clear();
+        let error =
+            validate_identity(&empty_principals).expect_err("empty principals must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("identity.resolver.principals: must not be empty"),
+            "{error}"
+        );
+
+        let mut empty_tokens = authored_identity_config();
+        empty_tokens
+            .identity
+            .as_mut()
+            .unwrap()
+            .resolver
+            .tokens
+            .clear();
+        let error = validate_identity(&empty_tokens).expect_err("empty tokens must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("identity.resolver.tokens: must not be empty"),
+            "{error}"
+        );
+
+        let mut duplicate_principal = authored_identity_config();
+        duplicate_principal
+            .identity
+            .as_mut()
+            .unwrap()
+            .resolver
+            .principals
+            .push(identity_principal("test-principal"));
+        let error = validate_identity(&duplicate_principal)
+            .expect_err("duplicate principal IDs must be rejected");
+        assert!(error
+            .to_string()
+            .contains("duplicates an earlier principal"));
+
+        let mut duplicate_group = authored_identity_config();
+        duplicate_group.identity.as_mut().unwrap().resolver.groups = vec![
+            identity_group("developers", vec!["test-principal".to_owned()]),
+            identity_group("developers", Vec::new()),
+        ];
+        let error =
+            validate_identity(&duplicate_group).expect_err("duplicate group IDs must be rejected");
+        assert!(error.to_string().contains("duplicates an earlier group"));
+
+        let mut duplicate_member = authored_identity_config();
+        duplicate_member.identity.as_mut().unwrap().resolver.groups = vec![identity_group(
+            "developers",
+            vec!["test-principal".to_owned(), "test-principal".to_owned()],
+        )];
+        let error = validate_identity(&duplicate_member)
+            .expect_err("duplicate group members must be rejected");
+        assert!(error.to_string().contains("duplicates an earlier member"));
+
+        let mut unknown_member = authored_identity_config();
+        unknown_member.identity.as_mut().unwrap().resolver.groups = vec![identity_group(
+            "developers",
+            vec!["unknown-principal".to_owned()],
+        )];
+        let error =
+            validate_identity(&unknown_member).expect_err("unknown group members must be rejected");
+        assert!(error
+            .to_string()
+            .contains("references an unknown principal"));
+
+        let mut duplicate_token = authored_identity_config();
+        duplicate_token
+            .identity
+            .as_mut()
+            .unwrap()
+            .resolver
+            .tokens
+            .push(identity_environment_token(
+                "test-token",
+                "test-principal",
+                "AW_SECONDARY_IDENTITY_TOKEN",
+            ));
+        let error =
+            validate_identity(&duplicate_token).expect_err("duplicate token IDs must be rejected");
+        assert!(error
+            .to_string()
+            .contains("duplicates an earlier token record"));
+
+        let mut unknown_token_principal = authored_identity_config();
+        unknown_token_principal
+            .identity
+            .as_mut()
+            .unwrap()
+            .resolver
+            .tokens = vec![identity_environment_token(
+            "unknown-principal-token",
+            "unknown-principal",
+            "AW_UNKNOWN_IDENTITY_TOKEN",
+        )];
+        let error = validate_identity(&unknown_token_principal)
+            .expect_err("token records must reference known principals");
+        assert!(error
+            .to_string()
+            .contains("references an unknown principal"));
+
+        let mut duplicate_environment_source = authored_identity_config();
+        duplicate_environment_source
+            .identity
+            .as_mut()
+            .unwrap()
+            .resolver
+            .tokens
+            .push(identity_environment_token(
+                "secondary-token",
+                "test-principal",
+                "AW_IDENTITY_TOKEN",
+            ));
+        let error = validate_identity(&duplicate_environment_source)
+            .expect_err("identity environment sources must be unique");
+        assert!(error
+            .to_string()
+            .contains("duplicates an earlier identity environment source"));
+    }
+
+    #[test]
+    fn static_identity_configuration_reserves_anonymous_ids() {
+        let mut anonymous_principal = authored_identity_config();
+        anonymous_principal
+            .identity
+            .as_mut()
+            .unwrap()
+            .resolver
+            .principals[0]
+            .id = "anonymous".to_owned();
+        let error = validate_identity(&anonymous_principal)
+            .expect_err("anonymous must remain reserved as a principal ID");
+        assert!(
+            error
+                .to_string()
+                .contains("reserved anonymous identity identifier"),
+            "{error}"
+        );
+
+        let mut anonymous_group = authored_identity_config();
+        anonymous_group.identity.as_mut().unwrap().resolver.groups =
+            vec![identity_group("anonymous", Vec::new())];
+        let error = validate_identity(&anonymous_group)
+            .expect_err("anonymous must remain reserved as a group ID");
+        assert!(
+            error
+                .to_string()
+                .contains("reserved anonymous identity identifier"),
             "{error}"
         );
     }

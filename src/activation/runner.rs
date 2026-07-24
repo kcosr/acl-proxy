@@ -3307,6 +3307,10 @@ private_key = "missing-server-key.pem"
         include!("runner_listener_lifecycle_tests.rs");
     }
 
+    mod identity_product_tests {
+        include!("runner_identity_product_tests.rs");
+    }
+
     #[test]
     fn runner_module_and_api_names_are_versionless() {
         assert_eq!(Path::new(file!()).file_name().unwrap(), "runner.rs");

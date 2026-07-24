@@ -704,10 +704,14 @@ mod tests {
 
     #[cfg(unix)]
     fn trusted_tempdir(prefix: &str) -> tempfile::TempDir {
-        tempfile::Builder::new()
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::Builder::new()
             .prefix(prefix)
             .tempdir_in(std::env::var_os("HOME").unwrap())
-            .unwrap()
+            .unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        directory
     }
 
     fn environment_source(variable: &str) -> IdentitySourcePlan {
@@ -861,6 +865,56 @@ mod tests {
             assert!(std::env::var_os(variable).is_none());
             assert_eq!(registry.resolver_environment_entries_for_test(), 0);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_hardening_precedes_identity_source_reads_in_an_isolated_process() {
+        const CHILD: &str = "ACL_PROXY_IDENTITY_HARDENING_CHILD";
+        const TOKEN: &str = "AW_IDENTITY_HARDENING_ORDER_TOKEN";
+        if std::env::var_os(CHILD).is_some() {
+            unsafe {
+                std::env::set_var(TOKEN, BEARER_A);
+            }
+            #[cfg(target_os = "linux")]
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) }, 0);
+
+            let registry = IdentitySourceRegistry::activate().unwrap();
+            let mut core = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_CORE, core.as_mut_ptr()) },
+                0
+            );
+            let core = unsafe { core.assume_init() };
+            assert_eq!((core.rlim_cur, core.rlim_max), (0, 0));
+            #[cfg(target_os = "linux")]
+            assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE) }, 0);
+            assert_eq!(std::env::var(TOKEN).unwrap(), BEARER_A);
+
+            registry
+                .preload_selected_environment_sources(
+                    std::collections::BTreeSet::from([environment_source(TOKEN)]),
+                    None,
+                )
+                .unwrap();
+            assert!(std::env::var_os(TOKEN).is_none());
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "identity::tests::process_hardening_precedes_identity_source_reads_in_an_isolated_process",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated hardening proof failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[cfg(unix)]
@@ -1169,5 +1223,123 @@ mod tests {
             &active,
             lock(&publisher.state).generation.as_ref().unwrap()
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_cancels_the_active_generation_and_closes_admission() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = trusted_tempdir(".identity-shutdown-");
+        let path = directory.path().join("token");
+        std::fs::write(&path, BEARER_A).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let source = IdentitySourcePlan::File { path };
+        let sources = IdentitySourceRegistry::activate().unwrap();
+        sources
+            .preload_selected_environment_sources(Default::default(), None)
+            .unwrap();
+        let publisher = IdentityPublisher::activate().unwrap();
+        let (lease, _) = publisher
+            .stage(Some(plan(source)), connection_capacity(2), None, &sources)
+            .unwrap();
+        lease.publication_guard().commit();
+        let generation = lock(&publisher.state).generation.clone().unwrap();
+
+        publisher.begin_shutdown();
+        publisher.begin_shutdown();
+
+        assert!(!publisher.accepting.load(Ordering::Acquire));
+        assert!(generation.cancellation.is_cancelled());
+        assert!(generation.capacity.is_closed());
+        let cancellation = ForwardingCancellation::new();
+        assert_eq!(
+            publisher
+                .resolve(
+                    SensitiveBearer::new(BEARER_A.as_bytes()).unwrap(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                    &cancellation,
+                )
+                .await
+                .err(),
+            Some(HttpBearerAdmissionError::Unavailable)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disabled_and_anonymous_access_flows_do_not_consume_authentication_capacity() {
+        use access_flow::AccessFlowDestination;
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = trusted_tempdir(".identity-pool-");
+        let path = directory.path().join("token");
+        std::fs::write(&path, BEARER_A).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let sources = IdentitySourceRegistry::activate().unwrap();
+        sources
+            .preload_selected_environment_sources(Default::default(), None)
+            .unwrap();
+        let publisher = IdentityPublisher::activate().unwrap();
+        let mut identity_plan = plan(IdentitySourcePlan::File { path });
+        identity_plan.max_pending_authentications = 1;
+        let (lease, _) = publisher
+            .stage(Some(identity_plan), connection_capacity(2), None, &sources)
+            .unwrap();
+        lease.publication_guard().commit();
+        let gate = IdentityAdmissionGate::new();
+        publisher.set_admission_gate_for_test(Arc::clone(&gate));
+        let resolving = {
+            let publisher = Arc::clone(&publisher);
+            tokio::spawn(async move {
+                let cancellation = ForwardingCancellation::new();
+                publisher
+                    .resolve(
+                        SensitiveBearer::new(BEARER_A.as_bytes()).unwrap(),
+                        std::time::Instant::now() + std::time::Duration::from_secs(2),
+                        &cancellation,
+                    )
+                    .await
+            })
+        };
+        gate.wait_for_entries(1).await;
+        assert_eq!(
+            lock(&publisher.state)
+                .generation
+                .as_ref()
+                .unwrap()
+                .capacity
+                .available_permits(),
+            0
+        );
+
+        let destination = AccessFlowDestination::new("203.0.113.8".parse().unwrap(), 80).unwrap();
+        let cancellation = ForwardingCancellation::new();
+        for presentation in [
+            IdentityPresentation::Disabled,
+            IdentityPresentation::Anonymous,
+        ] {
+            let admitted = <IdentityPublisher as AccessFlowAdmission<()>>::admit(
+                publisher.as_ref(),
+                AccessFlowAdmissionInput {
+                    destination,
+                    presentation: &presentation,
+                    channel_facts: &(),
+                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+                    cancellation: &cancellation,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                admitted.context(),
+                access_identity::IdentityContext::Disabled
+                    | access_identity::IdentityContext::Anonymous
+            ));
+        }
+        assert_eq!(gate.entered.load(Ordering::Acquire), 1);
+
+        gate.release(1);
+        assert!(resolving.await.unwrap().is_ok());
     }
 }

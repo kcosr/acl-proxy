@@ -2235,6 +2235,50 @@ identity_subjects = [
     }
 
     #[test]
+    fn static_identity_tokens_reject_literal_sources_and_values() {
+        let environment = format!(
+            r#"{MINIMAL}
+
+[identity]
+max_pending_authentications = 8
+max_pending_authentications_per_connection = 2
+
+[identity.resolver]
+kind = "static"
+authority = "workstation"
+
+[[identity.resolver.principals]]
+id = "agent"
+kind = "service_account"
+
+[[identity.resolver.tokens]]
+id = "agent-primary"
+principal = "agent"
+source = "environment"
+variable = "AW_IDENTITY_TOKEN"
+"#
+        );
+        toml::from_str::<AuthoringConfig>(&environment)
+            .expect("the environment descriptor is the canonical token source");
+
+        for invalid in [
+            environment.replace(
+                "source = \"environment\"\nvariable = \"AW_IDENTITY_TOKEN\"",
+                "source = \"literal\"\nvalue = \"not-allowed\"",
+            ),
+            environment.replace(
+                "variable = \"AW_IDENTITY_TOKEN\"",
+                "variable = \"AW_IDENTITY_TOKEN\"\nvalue = \"not-allowed\"",
+            ),
+        ] {
+            assert!(
+                toml::from_str::<AuthoringConfig>(&invalid).is_err(),
+                "literal token material was accepted by the authoring schema"
+            );
+        }
+    }
+
+    #[test]
     fn redaction_unsupported_extensions_is_typed_and_defaults_to_deny() {
         for (authored, expected) in [
             ("", UnsupportedExtensions::Deny),

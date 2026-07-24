@@ -1,6 +1,7 @@
 use std::fs;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -429,6 +430,113 @@ async fn connect_mitm_rejects_origin_form_host_mismatch_without_dialing_decoy() 
             .await
             .is_err(),
         "mismatched inner Host dialed the decoy origin"
+    );
+
+    drop(tunnel);
+    product.shutdown().await;
+    assert!(StdTcpListener::bind(proxy).is_ok());
+}
+
+#[tokio::test]
+async fn connect_mitm_rejects_an_inner_identity_carrier_without_dialing_origin() {
+    let _test = super::super::super::LISTENER_TEST_LOCK.lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let identity_directory = tempfile::Builder::new()
+        .prefix(".connect-identity-")
+        .tempdir_in(std::env::var_os("HOME").unwrap())
+        .unwrap();
+    fs::set_permissions(
+        identity_directory.path(),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let identity_path = identity_directory.path().join("token");
+    const BEARER: &str = "connect-mitm-identity-bearer-000000000000000";
+    fs::write(&identity_path, BEARER).unwrap();
+    fs::set_permissions(&identity_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let identity_path = fs::canonicalize(identity_path).unwrap();
+
+    let origin = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let origin_address = origin.local_addr().unwrap();
+    let (proxy, listener) = prebound_listener();
+    let target = format!("localhost:{}", origin_address.port());
+    let ca = initialize_generated_ca(&directory.path().join("mitm"));
+    let identity = format!(
+        r#"[identity]
+max_pending_authentications = 2
+max_pending_authentications_per_connection = 1
+
+[identity.resolver]
+kind = "static"
+authority = "connect-test"
+
+[[identity.resolver.principals]]
+id = "connect-workload"
+kind = "service_account"
+
+[[identity.resolver.tokens]]
+id = "connect-workload-primary"
+principal = "connect-workload"
+source = "file"
+path = {identity_path:?}
+"#
+    );
+    let text = connect_config(
+        proxy,
+        &target,
+        "explicit_http",
+        "[listeners.explicit_http.identity]\nmode = \"required\"",
+        "identity_states = [\"authenticated\"]",
+        &identity,
+    );
+    let network = mapped_network(proxy, &format!("https://{target}/"), origin_address);
+    let product = start_product(&directory, &text, listener, Some(network)).await;
+
+    let mut stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nx-aw-identity-token: {BEARER}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let response = read_http_message(&mut stream).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 200 "),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+
+    let connector = tls_connector(ca, &[b"http/1.1"]);
+    let mut tunnel = connector
+        .connect(ServerName::try_from("localhost").unwrap(), stream)
+        .await
+        .unwrap();
+    tunnel
+        .write_all(
+            format!(
+                "GET /inner-carrier HTTP/1.1\r\nHost: {target}\r\nx-aw-identity-token: {BEARER}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let inner_response = read_http_message(&mut tunnel).await;
+    assert!(
+        inner_response.starts_with(b"HTTP/1.1 403 "),
+        "{}",
+        String::from_utf8_lossy(&inner_response)
+    );
+    assert!(inner_response.ends_with(b"\r\n\r\nidentity invalid\n"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), origin.accept())
+            .await
+            .is_err(),
+        "inner identity carrier dialed the origin"
     );
 
     drop(tunnel);

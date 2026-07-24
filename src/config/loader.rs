@@ -128,6 +128,15 @@ pub(super) enum ConfigLoadError {
         "configuration file {path} uses the removed data-listener field `bind`; use `endpoint = {{ kind = \"tcp\", address = \"127.0.0.1:8881\" }}` instead"
     )]
     LegacyListenerBind { path: PathBuf },
+
+    #[error(
+        "configuration file {path} uses removed configuration surface `{surface}`; {replacement}"
+    )]
+    RemovedConfigSurface {
+        path: PathBuf,
+        surface: String,
+        replacement: &'static str,
+    },
 }
 
 pub(super) fn load_config(explicit_path: Option<&Path>) -> Result<LoadedConfig, ConfigLoadError> {
@@ -218,7 +227,13 @@ pub(super) fn parse_config_text(
         });
     }
     toml::from_str(text).map_err(|source| {
-        if contains_legacy_listener_bind(text) {
+        if let Some((surface, replacement)) = removed_config_surface(text) {
+            ConfigLoadError::RemovedConfigSurface {
+                path: path.to_path_buf(),
+                surface,
+                replacement,
+            }
+        } else if contains_legacy_listener_bind(text) {
             ConfigLoadError::LegacyListenerBind {
                 path: path.to_path_buf(),
             }
@@ -229,6 +244,71 @@ pub(super) fn parse_config_text(
             }
         }
     })
+}
+
+fn removed_config_surface(text: &str) -> Option<(String, &'static str)> {
+    let config = toml::from_str::<toml::Value>(text).ok()?;
+    if let Some(listeners) = config.get("listeners").and_then(toml::Value::as_table) {
+        for name in [
+            "explicit_http",
+            "transparent_http",
+            "explicit_https",
+            "transparent_https",
+        ] {
+            let Some(listener) = listeners.get(name).and_then(toml::Value::as_table) else {
+                continue;
+            };
+            if let Some(endpoint) = listener.get("endpoint").and_then(toml::Value::as_table) {
+                match endpoint.get("kind").and_then(toml::Value::as_str) {
+                    Some("unix_proxy_v2") => {
+                        return Some((
+                            format!("listeners.{name}.endpoint.kind = \"unix_proxy_v2\""),
+                            "use `endpoint.kind = \"access_flow\"` with a nested `endpoint.transport.kind = \"unix\"` instead",
+                        ));
+                    }
+                    Some("unix_proxy_v2_identity") => {
+                        return Some((
+                            format!(
+                                "listeners.{name}.endpoint.kind = \"unix_proxy_v2_identity\""
+                            ),
+                            "use `endpoint.kind = \"access_flow\"` with a nested `endpoint.transport.kind = \"unix\"` and configure `identity.mode` on the listener instead",
+                        ));
+                    }
+                    _ => {}
+                }
+                if endpoint.contains_key("proxy_header_timeout") {
+                    return Some((
+                        format!("listeners.{name}.endpoint.proxy_header_timeout"),
+                        "use `endpoint.admission_timeout` instead",
+                    ));
+                }
+            }
+            if listener.contains_key("proxy_header_timeout") {
+                return Some((
+                    format!("listeners.{name}.proxy_header_timeout"),
+                    "use `endpoint.admission_timeout` instead",
+                ));
+            }
+        }
+    }
+    if let Some(rules) = config
+        .get("policy")
+        .and_then(|policy| policy.get("rules"))
+        .and_then(toml::Value::as_array)
+    {
+        for (index, rule) in rules.iter().enumerate() {
+            if rule
+                .as_table()
+                .is_some_and(|rule| rule.contains_key("identity_state"))
+            {
+                return Some((
+                    format!("policy.rules[{index}].identity_state"),
+                    "use the plural `identity_states = [...]` field instead",
+                ));
+            }
+        }
+    }
+    None
 }
 
 fn contains_legacy_listener_bind(text: &str) -> bool {
@@ -533,6 +613,68 @@ literal_environment_variables = ["MISSING_CONFIG_LOADER_REDACTION_SECRET"]
         assert!(legacy_bind
             .to_string()
             .contains("endpoint = { kind = \"tcp\""));
+    }
+
+    #[test]
+    fn removed_identity_and_access_flow_shapes_have_actionable_loader_diagnostics() {
+        let directory = tempdir().unwrap();
+        let config_path = directory.path().join("removed.toml");
+        for (input, surface, replacement) in [
+            (
+                MINIMAL_CONFIG.replace(
+                    "endpoint.kind = \"tcp\"",
+                    "endpoint.kind = \"unix_proxy_v2\"",
+                ),
+                "listeners.explicit_http.endpoint.kind = \"unix_proxy_v2\"",
+                "endpoint.kind = \"access_flow\"",
+            ),
+            (
+                MINIMAL_CONFIG.replace(
+                    "endpoint.kind = \"tcp\"",
+                    "endpoint.kind = \"unix_proxy_v2_identity\"",
+                ),
+                "listeners.explicit_http.endpoint.kind = \"unix_proxy_v2_identity\"",
+                "identity.mode",
+            ),
+            (
+                MINIMAL_CONFIG.replace(
+                    "http_versions = [\"http1\"]",
+                    "http_versions = [\"http1\"]\nproxy_header_timeout = \"2s\"",
+                ),
+                "listeners.explicit_http.proxy_header_timeout",
+                "endpoint.admission_timeout",
+            ),
+            (
+                MINIMAL_CONFIG.replace(
+                    "endpoint.address = \"127.0.0.1:8881\"",
+                    "endpoint.address = \"127.0.0.1:8881\"\nendpoint.proxy_header_timeout = \"2s\"",
+                ),
+                "listeners.explicit_http.endpoint.proxy_header_timeout",
+                "endpoint.admission_timeout",
+            ),
+            (
+                format!(
+                    r#"{MINIMAL_CONFIG}
+
+[[policy.rules]]
+id = "removed-singular"
+decision = "deny"
+identity_state = "authenticated"
+"#
+                ),
+                "policy.rules[0].identity_state",
+                "identity_states = [...]",
+            ),
+        ] {
+            fs::write(&config_path, input).unwrap();
+            let error = load_path(&config_path).unwrap_err();
+            assert!(
+                matches!(error, ConfigLoadError::RemovedConfigSurface { .. }),
+                "{error}"
+            );
+            assert!(error.to_string().contains(surface), "{error}");
+            assert!(error.to_string().contains(replacement), "{error}");
+        }
     }
 
     #[test]

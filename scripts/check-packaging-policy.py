@@ -605,9 +605,16 @@ def check_shipped_docs(root: Path) -> None:
     )
     if any(entry not in readme for entry in required_layout):
         fail("README lacks the exact versioned release layout")
+    archive_names = (
+        "Published archive filenames are "
+        "`acl-proxy-<version>-<acl12>-linux-x86_64.tar.gz` and "
+        "`acl-proxy-<version>-<acl12>-macos-arm64.tar.gz`."
+    )
+    if archive_names not in normalized:
+        fail("README lacks the exact platform archive filenames")
     platform_inventory = (
-        "Linux archives have the three shown `bin/` entries; non-Linux archives "
-        "omit the Linux-only relay and have the other two."
+        "The Linux archive has the three shown `bin/` entries; the macOS archive "
+        "omits the Linux-only relay and has the other two."
     )
     if platform_inventory not in normalized:
         fail("README lacks the platform-specific relay archive contract")

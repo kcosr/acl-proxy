@@ -375,9 +375,6 @@ impl<'a> JsonCursor<'a> {
                 32..=126 => {
                     self.position += 1;
                     decoded_len = checked_add(decoded_len, 1)?;
-                    if byte == 127 {
-                        credential_valid = false;
-                    }
                 }
                 127 => {
                     self.position += 1;

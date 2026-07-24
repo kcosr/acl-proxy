@@ -16,6 +16,10 @@ Release archives contain `acl-proxy`, the capture-body extraction helper, this
 README, `LICENSE`, `THIRD_PARTY_NOTICES`, and `acl-proxy.sample.toml`. Linux
 archives also contain the Linux-only Access Flow relay. To build locally:
 
+Published archive filenames are
+`acl-proxy-<version>-<acl12>-linux-x86_64.tar.gz` and
+`acl-proxy-<version>-<acl12>-macos-arm64.tar.gz`.
+
 ```text
 acl-proxy-<version>-<acl12>/
   bin/acl-proxy
@@ -29,8 +33,8 @@ acl-proxy-<version>-<acl12>/
 
 `<version>` is the exact Cargo package version and `<acl12>` is the first 12
 lowercase hexadecimal characters of the packaged `acl-proxy` commit. That
-directory is the archive root. Linux archives have the three shown `bin/`
-entries; non-Linux archives omit the Linux-only relay and have the other two.
+directory is the archive root. The Linux archive has the three shown `bin/`
+entries; the macOS archive omits the Linux-only relay and has the other two.
 
 The `0.3.0-rc.1` candidate requires `schema_version = 3`; configurations for
 the `0.2.x` contract must be rewritten rather than migrated through aliases or
@@ -256,8 +260,8 @@ acl-proxy-access-flow-relay --config /etc/acl-proxy/access-flow-relay.json
 
 See `examples/access-flow-relay.json` for the complete schema and
 `examples/acl-proxy-access-flow.toml` for the paired host listeners. Relay
-listener addresses must be unprivileged IPv4 loopback addresses. Route names,
-listeners are unique. `setupTimeout` covers both the Unix connection and
+listener addresses must be nonzero IPv4 loopback addresses. Route names and
+listen addresses must each be unique. `setupTimeout` covers both the Unix connection and
 complete AW Access Flow preface write. `maxConnections` is global across routes.
 Existing relay configurations require a one-time rewrite:
 `allowedOriginalPorts` becomes `allowedDestinationPorts`, and

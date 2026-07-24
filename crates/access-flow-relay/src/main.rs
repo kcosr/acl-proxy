@@ -100,14 +100,14 @@ async fn shutdown_signal() -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-async fn run(validated: ValidatedConfig) -> Result<(), String> {
+async fn run(validated: ValidatedConfig, descriptor_budget: u64) -> Result<(), String> {
     // Signal resources are initialized before relay preparation and are covered
     // by the fixed consumer descriptor reserve.
     let signal = shutdown_signal();
     tokio::pin!(signal);
 
     let budget = AccessFlowRelayResourceBudget {
-        descriptors: relay_descriptor_budget().map_err(|error| error.to_string())?,
+        descriptors: descriptor_budget,
         memory_bytes: relay_memory_budget(),
     };
     let relay = AccessFlowRelay::new(
@@ -212,11 +212,12 @@ fn main() -> ExitCode {
             .map_err(|error| error.to_string())?
             .validate()
             .map_err(|error| error.to_string())?;
+        let descriptor_budget = relay_descriptor_budget().map_err(|error| error.to_string())?;
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|error| format!("failed to initialize runtime: {error}"))?
-            .block_on(run(validated))
+            .block_on(run(validated, descriptor_budget))
     });
     match result {
         Ok(()) => ExitCode::SUCCESS,
