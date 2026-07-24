@@ -8,11 +8,11 @@ trap 'rm -rf "$TMP"' EXIT
 
 BASELINE="$TMP/baseline"
 mkdir -p "$BASELINE/scripts"
-mkdir -p "$BASELINE/crates/transparent-uds-relay"
+mkdir -p "$BASELINE/crates/access-flow-relay"
 for file in Cargo.toml Cargo.lock README.md acl-proxy.sample.toml deny.toml PROVENANCE.md THIRD_PARTY_NOTICES; do
     cp "$ROOT/$file" "$BASELINE/$file"
 done
-cp "$ROOT/crates/transparent-uds-relay/Cargo.toml" "$BASELINE/crates/transparent-uds-relay/"
+cp "$ROOT/crates/access-flow-relay/Cargo.toml" "$BASELINE/crates/access-flow-relay/"
 cp "$ROOT/scripts/check-packaging-policy.sh" "$BASELINE/scripts/"
 cp "$ROOT/scripts/release.mjs" "$BASELINE/scripts/"
 cargo metadata --locked --offline --format-version 1 >"$BASELINE/metadata.json"
@@ -132,9 +132,11 @@ expect_obsolete_surface_rejected() {
 
 expect_rejected product-version 'version = "0.3.0-rc.1"' 'version = "0.3.0-rc.2"' Cargo.toml
 expect_rejected product-version-inheritance 'version.workspace = true' 'version = "0.3.0-rc.1"' Cargo.toml
-expect_rejected relay-version-inheritance 'version.workspace = true' 'version = "0.3.0-rc.1"' crates/transparent-uds-relay/Cargo.toml
-expect_rejected relay-workspace-member $'[workspace]\nmembers = [".", "crates/transparent-uds-relay"]' $'[workspace]\nmembers = ["."]' Cargo.toml
-expect_rejected relay-default-member 'default-members = [".", "crates/transparent-uds-relay"]' 'default-members = ["."]' Cargo.toml
+expect_rejected relay-version-inheritance 'version.workspace = true' 'version = "0.3.0-rc.1"' crates/access-flow-relay/Cargo.toml
+expect_rejected relay-workspace-member $'[workspace]\nmembers = [".", "crates/access-flow-relay"]' $'[workspace]\nmembers = ["."]' Cargo.toml
+expect_rejected relay-default-member 'default-members = [".", "crates/access-flow-relay"]' 'default-members = ["."]' Cargo.toml
+expect_rejected relay-shared-engine 'access-flow-relay = {' 'removed-access-flow-relay = {' crates/access-flow-relay/Cargo.toml
+expect_rejected relay-unix-adapter 'access-flow-unix = {' 'removed-access-flow-unix = {' crates/access-flow-relay/Cargo.toml
 expect_rejected release-repository 'kcosr/acl-proxy-access-runtime' 'kcosr/acl-proxy' scripts/release.mjs
 expect_rejected release-remote 'const RELEASE_REMOTE = "access-runtime";' 'const RELEASE_REMOTE = "origin";' scripts/release.mjs
 expect_rejected publish-guard 'publish = false' 'publish = true' Cargo.toml
@@ -180,7 +182,7 @@ expect_rejected brotli-copyright 'Copyright (c) 2009, 2010, 2013-2016 by the Bro
 expect_rejected dropbox-copyright 'Copyright (c) 2016 Dropbox, Inc.' 'Copyright removed from Dropbox brotli.' THIRD_PARTY_NOTICES
 expect_rejected zstd-copyright 'Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.' 'Copyright removed from Zstandard.' THIRD_PARTY_NOTICES
 expect_rejected hyper-license-copyright 'Copyright (c) 2014-2026 Sean McArthur' 'Copyright removed from Hyper.' THIRD_PARTY_NOTICES
-expect_rejected provenance-runtime 'bca85d11787afe988dc63cad817f20434523cf66' 'wrong-runtime-commit' PROVENANCE.md
+expect_rejected provenance-runtime '52ad634fc1efccb62bf967f441a0047d56c1f425' 'wrong-runtime-commit' PROVENANCE.md
 expect_rejected provenance-brotli-license 'Google Brotli C implementation it compiles is MIT' 'Google Brotli C implementation has the wrong license' PROVENANCE.md
 expect_rejected provenance-zstd-license 'Zstandard source under BSD-3-Clause' 'Zstandard source has the wrong license' PROVENANCE.md
 expect_rejected archive-notices 'README, `LICENSE`, `THIRD_PARTY_NOTICES`' 'README, `LICENSE`, `REMOVED_NOTICES`' README.md
@@ -199,6 +201,7 @@ expect_rejected archive-root 'acl-proxy-<version>-<acl12>/' 'acl-proxy-release/'
 expect_rejected archive-hardcoded-sha 'acl-proxy-<version>-<acl12>/' 'acl-proxy-0.3.0-rc.1-0123456789ab/' README.md
 expect_rejected candidate-doc-version 'The `0.3.0-rc.1` candidate requires' 'The `0.3.0-rc.2` candidate requires' README.md
 expect_created_path_rejected obsolete-demo demos/auth-plugin-stdio/README.md
+expect_created_path_rejected obsolete-relay-crate crates/transparent-uds-relay/Cargo.toml
 obsolete_markers=(
     'policy.external_auth_profiles'
     'policy.approval_macros'
@@ -215,7 +218,7 @@ for file in README.md acl-proxy.sample.toml; do
     done
 done
 expect_rejected archive-bin '  bin/acl-proxy-extract-capture-body' '  acl-proxy-extract-capture-body' README.md
-expect_rejected archive-relay-bin '  bin/acl-proxy-transparent-uds-relay  # Linux archives only' '  acl-proxy-transparent-uds-relay' README.md
+expect_rejected archive-relay-bin '  bin/acl-proxy-access-flow-relay  # Linux archives only' '  acl-proxy-access-flow-relay' README.md
 expect_rejected sample-export 'acl-proxy export-ca' 'ca-cert.pem' acl-proxy.sample.toml
 
 printf 'packaging policy mutation suite passed\n'

@@ -108,7 +108,7 @@ impl StandaloneRequestFactory for ProductStandaloneRequestFactory {
                 request_id,
                 listener_transport = match listener_transport {
                     http_access_runtime::ListenerTransport::Tcp => "tcp",
-                    http_access_runtime::ListenerTransport::UnixProxyV2 => "unix_proxy_v2",
+                    http_access_runtime::ListenerTransport::AccessFlow => "access_flow",
                 },
                 ingress_mode = ?facts.ingress_mode(),
                 "proxy request admitted"

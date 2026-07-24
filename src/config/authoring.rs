@@ -352,12 +352,17 @@ pub(super) enum ListenerEndpointConfig {
     Tcp {
         address: SocketAddr,
     },
-    UnixProxyV2 {
-        path: PathBuf,
-        mode: String,
-        proxy_header_timeout: PositiveDuration,
+    AccessFlow {
+        admission_timeout: PositiveDuration,
         allowed_destination_ports: Vec<u16>,
+        transport: AccessFlowTransportConfig,
     },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum AccessFlowTransportConfig {
+    Unix { path: PathBuf, mode: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]

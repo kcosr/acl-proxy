@@ -55,12 +55,13 @@ use http_access_runtime::http1::PARSER_STORE_BYTES;
 use http_access_url::{canonicalize_http_url, CompiledUrlPattern};
 
 use super::authoring::{
-    AuthorizationConfig, AuthorizationProviderConfig, CredentialActionConfig,
-    CredentialSourceConfig, CredentialsConfig, EgressConfig, EgressRoute, HeaderEffectConfig,
-    HeaderEffectWhen, Http1ConnectPolicy, HttpVersion, ListenerEndpointConfig, ListenersConfig,
-    MitmConfig, ObservationConfig, ParentProxyKind, PolicyConfig, PolicyRuleConfig,
-    RedactionConfig, RedactionPayloads, RuleDecision, SafetyConfig, StaticTlsIdentityConfig,
-    TlsTrust, TransportSecurity, TransportTlsConfig, UnsupportedExtensions,
+    AccessFlowTransportConfig, AuthorizationConfig, AuthorizationProviderConfig,
+    CredentialActionConfig, CredentialSourceConfig, CredentialsConfig, EgressConfig, EgressRoute,
+    HeaderEffectConfig, HeaderEffectWhen, Http1ConnectPolicy, HttpVersion, ListenerEndpointConfig,
+    ListenersConfig, MitmConfig, ObservationConfig, ParentProxyKind, PolicyConfig,
+    PolicyRuleConfig, RedactionConfig, RedactionPayloads, RuleDecision, SafetyConfig,
+    StaticTlsIdentityConfig, TlsTrust, TransportSecurity, TransportTlsConfig,
+    UnsupportedExtensions,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -214,12 +215,17 @@ pub(crate) enum StaticListenerEndpoint {
     Tcp {
         address: SocketAddr,
     },
-    UnixProxyV2 {
-        path: PathBuf,
-        mode: u32,
-        proxy_header_timeout: Duration,
+    AccessFlow {
+        admission_timeout: Duration,
         allowed_destination_ports: Vec<u16>,
+        transport: StaticAccessFlowTransport,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum StaticAccessFlowTransport {
+    Unix { path: PathBuf, mode: u32 },
 }
 
 pub(crate) fn unix_listener_lock_path(path: &Path) -> PathBuf {
@@ -1036,12 +1042,16 @@ fn normalize_authored_paths(
     ]
     .into_iter()
     .zip([
-        "listeners.explicit_http.endpoint.path",
-        "listeners.transparent_http.endpoint.path",
-        "listeners.explicit_https.endpoint.path",
-        "listeners.transparent_https.endpoint.path",
+        "listeners.explicit_http.endpoint.transport.path",
+        "listeners.transparent_http.endpoint.transport.path",
+        "listeners.explicit_https.endpoint.transport.path",
+        "listeners.transparent_https.endpoint.transport.path",
     ]) {
-        if let Some(ListenerEndpointConfig::UnixProxyV2 { path, .. }) = endpoint {
+        if let Some(ListenerEndpointConfig::AccessFlow {
+            transport: AccessFlowTransportConfig::Unix { path, .. },
+            ..
+        }) = endpoint
+        {
             if !path.is_absolute() {
                 return Err(ConfigCompileError::at(field, "must be an absolute path"));
             }
@@ -1483,7 +1493,7 @@ fn control_parser_arena_bytes(
 struct ListenerFacts {
     binds: BTreeSet<SocketAddr>,
     unix_artifact_paths: BTreeSet<PathBuf>,
-    uses_unix_proxy_v2: bool,
+    uses_access_flow: bool,
     mitm_required: bool,
 }
 
@@ -1582,12 +1592,12 @@ fn validate_listener_control_mitm_matrix(
         )?;
         facts.mitm_required = true;
     }
-    if facts.uses_unix_proxy_v2 {
+    if facts.uses_access_flow {
         for (index, rule) in config.policy.rules.iter().enumerate() {
             if !rule.client_cidrs.is_empty() {
                 return Err(ConfigCompileError::at(
                     format!("policy.rules[{index}].client_cidrs"),
-                    "must be empty when a unix_proxy_v2 listener uses the local-workstation principal",
+                    "must be empty when an access_flow listener uses the local-workstation principal",
                 ));
             }
         }
@@ -1666,22 +1676,21 @@ fn validate_listener_endpoint(
             let bind = validate_bind(*address, &path, false)?;
             insert_unique_bind(&mut facts.binds, bind, &path)?;
         }
-        ListenerEndpointConfig::UnixProxyV2 {
-            path,
-            mode,
-            proxy_header_timeout: _,
+        ListenerEndpointConfig::AccessFlow {
+            admission_timeout: _,
             allowed_destination_ports,
+            transport,
         } => {
             if !allow_unix {
                 return Err(ConfigCompileError::at(
                     format!("{prefix}.endpoint.kind"),
-                    "unix_proxy_v2 is valid only for transparent HTTP and HTTPS listeners",
+                    "access_flow is valid only for transparent HTTP and HTTPS listeners",
                 ));
             }
             if cfg!(not(unix)) {
                 return Err(ConfigCompileError::at(
                     format!("{prefix}.endpoint.kind"),
-                    "unix_proxy_v2 is not supported on this platform",
+                    "access_flow with a Unix transport is not supported on this platform",
                 ));
             }
             if allowed_destination_ports.is_empty() {
@@ -1700,7 +1709,8 @@ fn validate_listener_endpoint(
                     "must contain unique nonzero destination ports",
                 ));
             }
-            let path_field = format!("{prefix}.endpoint.path");
+            let AccessFlowTransportConfig::Unix { path, mode } = transport;
+            let path_field = format!("{prefix}.endpoint.transport.path");
             if !path.is_absolute() {
                 return Err(ConfigCompileError::at(
                     path_field,
@@ -1719,7 +1729,7 @@ fn validate_listener_endpoint(
                     format!("must be at most {MAX_UNIX_SOCKET_PATH_BYTES} bytes"),
                 ));
             }
-            parse_socket_mode(mode, &format!("{prefix}.endpoint.mode"))?;
+            parse_socket_mode(mode, &format!("{prefix}.endpoint.transport.mode"))?;
             let lock_path = unix_listener_lock_path(path);
             if !facts.unix_artifact_paths.insert(path.clone())
                 || !facts.unix_artifact_paths.insert(lock_path)
@@ -1729,7 +1739,7 @@ fn validate_listener_endpoint(
                     "collides with another Unix proxy listener socket or lock path",
                 ));
             }
-            facts.uses_unix_proxy_v2 = true;
+            facts.uses_access_flow = true;
         }
     }
     Ok(())
@@ -6448,20 +6458,24 @@ fn compile_listener_endpoint(value: &ListenerEndpointConfig) -> StaticListenerEn
         ListenerEndpointConfig::Tcp { address } => StaticListenerEndpoint::Tcp {
             address: canonical_socket_addr(*address),
         },
-        ListenerEndpointConfig::UnixProxyV2 {
-            path,
-            mode,
-            proxy_header_timeout,
+        ListenerEndpointConfig::AccessFlow {
+            admission_timeout,
             allowed_destination_ports,
+            transport,
         } => {
             let mut allowed_destination_ports = allowed_destination_ports.clone();
             allowed_destination_ports.sort_unstable();
-            StaticListenerEndpoint::UnixProxyV2 {
-                path: path.clone(),
-                mode: u32::from_str_radix(mode, 8)
-                    .expect("Unix listener mode was validated before compilation"),
-                proxy_header_timeout: proxy_header_timeout.get(),
+            let transport = match transport {
+                AccessFlowTransportConfig::Unix { path, mode } => StaticAccessFlowTransport::Unix {
+                    path: path.clone(),
+                    mode: u32::from_str_radix(mode, 8)
+                        .expect("Unix listener mode was validated before compilation"),
+                },
+            };
+            StaticListenerEndpoint::AccessFlow {
+                admission_timeout: admission_timeout.get(),
                 allowed_destination_ports,
+                transport,
             }
         }
     }
@@ -10077,18 +10091,21 @@ trust = "system"
 
     #[cfg(unix)]
     #[test]
-    fn unix_proxy_v2_listener_contract_is_strict_and_fingerprinted() {
+    fn access_flow_listener_contract_is_strict_and_fingerprinted() {
         let socket = "/tmp/acl-proxy-transparent-http.sock";
         let unix = format!(
             r#"{MINIMAL}
 
 [listeners.transparent_http]
-endpoint.kind = "unix_proxy_v2"
-endpoint.path = "{socket}"
-endpoint.mode = "0606"
-endpoint.proxy_header_timeout = "2s"
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
 endpoint.allowed_destination_ports = [80, 8080]
 http_versions = ["http1"]
+
+[listeners.transparent_http.endpoint.transport]
+kind = "unix"
+path = "{socket}"
+mode = "0606"
 "#
         );
         let compiled = compile(&unix).expect("valid Unix transparent endpoint should compile");
@@ -10100,15 +10117,14 @@ http_versions = ["http1"]
             .unwrap();
         assert!(matches!(
             &listener.endpoint,
-            StaticListenerEndpoint::UnixProxyV2 {
-                path,
-                mode,
-                proxy_header_timeout,
+            StaticListenerEndpoint::AccessFlow {
+                admission_timeout,
                 allowed_destination_ports,
-            } if path == Path::new(socket)
-                && *mode == 0o606
-                && *proxy_header_timeout == Duration::from_secs(2)
+                transport: StaticAccessFlowTransport::Unix { path, mode },
+            } if *admission_timeout == Duration::from_secs(2)
                 && allowed_destination_ports == &[80, 8080]
+                && path == Path::new(socket)
+                && *mode == 0o606
         ));
 
         let tcp_only = compile(MINIMAL).unwrap();
@@ -10117,8 +10133,8 @@ http_versions = ["http1"]
         for (name, input, expected) in [
             (
                 "missing timeout",
-                unix.replace("endpoint.proxy_header_timeout = \"2s\"\n", ""),
-                "proxy_header_timeout",
+                unix.replace("endpoint.admission_timeout = \"2s\"\n", ""),
+                "admission_timeout",
             ),
             (
                 "missing destination ports",
@@ -10129,9 +10145,37 @@ http_versions = ["http1"]
                 "obsolete sibling timeout",
                 MINIMAL.replace(
                     "http_versions = [\"http1\"]",
-                    "proxy_header_timeout = \"1s\"\nhttp_versions = [\"http1\"]",
+                    "admission_timeout = \"1s\"\nhttp_versions = [\"http1\"]",
                 ),
-                "proxy_header_timeout",
+                "admission_timeout",
+            ),
+        ] {
+            let error =
+                toml::from_str::<super::super::authoring::AuthoringConfig>(&input).unwrap_err();
+            assert!(error.to_string().contains(expected), "{name}: {error}");
+        }
+
+        for (name, input, expected) in [
+            (
+                "removed endpoint kind",
+                unix.replace("endpoint.kind = \"access_flow\"", "endpoint.kind = \"unix_proxy_v2\""),
+                "unix_proxy_v2",
+            ),
+            (
+                "mixed flat path",
+                unix.replace(
+                    "endpoint.allowed_destination_ports = [80, 8080]",
+                    "endpoint.allowed_destination_ports = [80, 8080]\nendpoint.path = \"/tmp/legacy.sock\"",
+                ),
+                "path",
+            ),
+            (
+                "remote transport",
+                unix.replace(
+                    "kind = \"unix\"\npath =",
+                    "kind = \"tls_tcp\"\ncertificate = \"secret.pem\"\npath =",
+                ),
+                "tls_tcp",
             ),
         ] {
             let error =
@@ -10158,7 +10202,7 @@ http_versions = ["http1"]
             ),
             (
                 "invalid mode",
-                unix.replace("endpoint.mode = \"0606\"", "endpoint.mode = \"606\""),
+                unix.replace("mode = \"0606\"", "mode = \"606\""),
                 "four-digit octal",
             ),
             (
@@ -10177,7 +10221,7 @@ http_versions = ["http1"]
                     .replace(
                         "endpoint.kind = \"tcp\"\nendpoint.address = \"127.0.0.1:8881\"",
                         &format!(
-                            "endpoint.kind = \"unix_proxy_v2\"\nendpoint.path = \"{socket}\"\nendpoint.mode = \"0600\"\nendpoint.proxy_header_timeout = \"2s\"\nendpoint.allowed_destination_ports = [80]"
+                            "endpoint.kind = \"access_flow\"\nendpoint.admission_timeout = \"2s\"\nendpoint.allowed_destination_ports = [80]\nendpoint.transport = {{ kind = \"unix\", path = \"{socket}\", mode = \"0600\" }}"
                         ),
                     ),
                 "valid only for transparent",
@@ -10190,22 +10234,20 @@ http_versions = ["http1"]
 
     #[cfg(unix)]
     #[test]
-    fn unix_proxy_v2_rejects_duplicate_paths_and_client_cidr_identity() {
+    fn access_flow_rejects_duplicate_paths_and_client_cidr_identity() {
         let listeners = r#"
 [listeners.transparent_http]
-endpoint.kind = "unix_proxy_v2"
-endpoint.path = "/tmp/acl-proxy-traffic.sock"
-endpoint.mode = "0600"
-endpoint.proxy_header_timeout = "2s"
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
 endpoint.allowed_destination_ports = [80]
+endpoint.transport = { kind = "unix", path = "/tmp/acl-proxy-traffic.sock", mode = "0600" }
 http_versions = ["http1"]
 
 [listeners.transparent_https]
-endpoint.kind = "unix_proxy_v2"
-endpoint.path = "/tmp/acl-proxy-traffic.sock"
-endpoint.mode = "0600"
-endpoint.proxy_header_timeout = "2s"
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
 endpoint.allowed_destination_ports = [443]
+endpoint.transport = { kind = "unix", path = "/tmp/acl-proxy-traffic.sock", mode = "0600" }
 http_versions = ["http1"]
 
 [mitm]
@@ -10220,12 +10262,12 @@ directory = "mitm"
         );
 
         let lock_collision = duplicate.replace(
-            "endpoint.path = \"/tmp/acl-proxy-traffic.sock\"",
-            "endpoint.path = \"/tmp/acl-proxy-traffic.sock.lock\"",
+            "path = \"/tmp/acl-proxy-traffic.sock\"",
+            "path = \"/tmp/acl-proxy-traffic.sock.lock\"",
         );
         let lock_collision = lock_collision.replacen(
-            "endpoint.path = \"/tmp/acl-proxy-traffic.sock.lock\"",
-            "endpoint.path = \"/tmp/acl-proxy-traffic.sock\"",
+            "path = \"/tmp/acl-proxy-traffic.sock.lock\"",
+            "path = \"/tmp/acl-proxy-traffic.sock\"",
             1,
         );
         let error = compile(&lock_collision).unwrap_err();
@@ -10233,11 +10275,10 @@ directory = "mitm"
 
         let cidr = r#"
 [listeners.transparent_http]
-endpoint.kind = "unix_proxy_v2"
-endpoint.path = "/tmp/acl-proxy-traffic.sock"
-endpoint.mode = "0600"
-endpoint.proxy_header_timeout = "2s"
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
 endpoint.allowed_destination_ports = [80]
+endpoint.transport = { kind = "unix", path = "/tmp/acl-proxy-traffic.sock", mode = "0600" }
 http_versions = ["http1"]
 
 [[policy.rules]]
@@ -10255,10 +10296,8 @@ client_cidrs = ["127.0.0.0/8"]
     #[cfg(unix)]
     #[test]
     fn shipped_unix_host_example_compiles_strictly() {
-        compile(include_str!(
-            "../../examples/acl-proxy-transparent-uds.toml"
-        ))
-        .expect("shipped Unix host example should remain a strict valid config");
+        compile(include_str!("../../examples/acl-proxy-access-flow.toml"))
+            .expect("shipped Unix host example should remain a strict valid config");
     }
 
     #[test]

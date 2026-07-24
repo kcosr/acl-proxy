@@ -1,0 +1,29 @@
+{
+  "routes": [
+    {
+      "name": "http",
+      "listen": "127.0.0.1:3128",
+      "allowedDestinationPorts": [80],
+      "transport": {
+        "kind": "unix",
+        "path": "/run/acl-proxy/transparent-http.sock"
+      }
+    },
+    {
+      "name": "https",
+      "listen": "127.0.0.1:3129",
+      "allowedDestinationPorts": [443],
+      "transport": {
+        "kind": "unix",
+        "path": "/run/acl-proxy/transparent-https.sock"
+      }
+    }
+  ],
+  "presentation": {
+    "kind": "disabled"
+  },
+  "setupTimeout": "2s",
+  "drainTimeout": "10s",
+  "maxConnections": 1024,
+  "copyBufferBytesPerDirection": 16384
+}

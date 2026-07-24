@@ -10,7 +10,8 @@ use crate::observation::ProductObservationRuntime;
 use crate::runtime::{GenerationId, Runtime, RuntimeError, StaticOwnership, StaticResources};
 
 use super::listeners::{
-    PreparedProxyListeners, ProxyListenerFailure, SystemOriginalDestinationProvider,
+    AccessFlowListenerRuntime, PreparedProxyListeners, ProductListenerRuntime,
+    ProxyListenerFailure, SystemOriginalDestinationProvider,
 };
 use super::source::FileCandidateSource;
 use super::static_resources::{ProductStaticResources, ProductStaticResourcesError};
@@ -67,7 +68,7 @@ impl ListenerFailureObserver for ProductListenerFailureObserver {
 fn listener_transport_name(transport: http_access_runtime::ListenerTransport) -> &'static str {
     match transport {
         http_access_runtime::ListenerTransport::Tcp => "tcp",
-        http_access_runtime::ListenerTransport::UnixProxyV2 => "unix_proxy_v2",
+        http_access_runtime::ListenerTransport::AccessFlow => "access_flow",
     }
 }
 
@@ -239,8 +240,8 @@ impl ProductRuntime {
             return Err(ProductRuntimeError::InitialGenerationNotPublished);
         }
         let prepared = self.take_prepared_proxy_listeners_for_start()?;
-        let (bundle, unix_socket_lifetimes) =
-            match prepared.into_shared_bundle_with_transparent_support(transparent_supported) {
+        let inputs =
+            match prepared.into_runtime_inputs_with_transparent_support(transparent_supported) {
                 Ok(bundle) => bundle,
                 Err(error) => {
                     self.shutdown().await;
@@ -248,7 +249,7 @@ impl ProductRuntime {
                 }
             };
         let assets = self.static_resources.ingress_assets();
-        let tls = ListenerTlsAcceptors::new(
+        let tcp_tls = ListenerTlsAcceptors::new(
             assets.static_https(),
             assets.plaintext_connect(),
             assets.tls_connect(),
@@ -261,27 +262,63 @@ impl ProductRuntime {
                 Arc::clone(assets),
                 self.static_resources.wire_body_pool(),
             );
-        let services = configure_services(ListenerServices::new(
-            original_destination,
-            self.static_resources.local_address_provider(),
-            Arc::new(ProductListenerFailureObserver {
-                static_resources: Arc::downgrade(&self.static_resources),
-            }),
-            tls,
-            request_factory,
+        let access_flow_service = http_access_runtime::HttpAccessFlowService::new(
+            ListenerTlsAcceptors::new(
+                assets.static_https(),
+                assets.plaintext_connect(),
+                assets.tls_connect(),
+                assets.transparent_https(),
+            ),
+            Arc::clone(&request_factory),
             self.static_resources.upgrade_runtime(),
-        ));
-        let listener_runtime = match ListenerRuntime::start(bundle, services) {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                self.shutdown().await;
-                return Err(error.into());
+        );
+        let shared_runtime = match inputs.tcp {
+            Some(bundle) => {
+                let services = configure_services(ListenerServices::new(
+                    original_destination,
+                    self.static_resources.local_address_provider(),
+                    Arc::new(ProductListenerFailureObserver {
+                        static_resources: Arc::downgrade(&self.static_resources),
+                    }),
+                    tcp_tls,
+                    request_factory,
+                    self.static_resources.upgrade_runtime(),
+                ));
+                match ListenerRuntime::start(bundle, services) {
+                    Ok(runtime) => Some(runtime),
+                    Err(error) => {
+                        self.shutdown().await;
+                        return Err(error.into());
+                    }
+                }
             }
+            None => None,
         };
+        let failure_resources = Arc::downgrade(&self.static_resources);
+        let access_flow_runtime = AccessFlowListenerRuntime::start(
+            inputs.access_flow,
+            access_flow_service,
+            Arc::new(move |error| {
+                let Some(resources) = failure_resources.upgrade() else {
+                    return;
+                };
+                tracing::error!(error = %error, "Access Flow listener failed");
+                resources.record_listener_failure(error);
+                StaticResources::begin_shutdown(resources.as_ref());
+            }),
+        );
+        let listener_runtime =
+            match ProductListenerRuntime::new(shared_runtime, access_flow_runtime) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    self.shutdown().await;
+                    return Err(error.into());
+                }
+            };
         before_adoption();
         if let Err(error) = self
             .static_resources
-            .adopt_listener_runtime(listener_runtime, unix_socket_lifetimes)
+            .adopt_listener_runtime(listener_runtime, inputs.unix_socket_lifetimes)
         {
             self.shutdown().await;
             return Err(error.into());
@@ -365,6 +402,8 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
+    use access_flow::{write_access_flow_preface, AccessFlowDestination};
+    use access_identity::IdentityPresentation;
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use http_access_mitm::{GeneratedCertificateAuthority, PrivateStorageRoot};
@@ -1145,7 +1184,7 @@ value = "policy"
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn unix_proxy_v2_transparent_http_uses_the_existing_product_pipeline() {
+    async fn access_flow_transparent_http_uses_the_existing_product_pipeline() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
         let directory = tempdir().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -1163,12 +1202,15 @@ request_timeout = "5s"
 shutdown_drain_timeout = "1s"
 
 [listeners.transparent_http]
-endpoint.kind = "unix_proxy_v2"
-endpoint.path = {:?}
-endpoint.mode = "0600"
-endpoint.proxy_header_timeout = "2s"
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
 endpoint.allowed_destination_ports = [80]
 http_versions = ["http1"]
+
+[listeners.transparent_http.endpoint.transport]
+kind = "unix"
+path = {:?}
+mode = "0600"
 
 [egress]
 route = "direct"
@@ -1224,16 +1266,13 @@ header = "x-test-loop"
         });
 
         let mut client = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
-        let mut proxy = [0_u8; 28];
-        proxy[..12].copy_from_slice(b"\r\n\r\n\0\r\nQUIT\n");
-        proxy[12] = 0x21;
-        proxy[13] = 0x11;
-        proxy[14..16].copy_from_slice(&12_u16.to_be_bytes());
-        proxy[16..20].copy_from_slice(&[198, 51, 100, 77]);
-        proxy[20..24].copy_from_slice(&[203, 0, 113, 8]);
-        proxy[24..26].copy_from_slice(&40_000_u16.to_be_bytes());
-        proxy[26..28].copy_from_slice(&80_u16.to_be_bytes());
-        client.write_all(&proxy).await.unwrap();
+        write_access_flow_preface(
+            &mut client,
+            AccessFlowDestination::new("203.0.113.8".parse().unwrap(), 80).unwrap(),
+            &IdentityPresentation::Disabled,
+        )
+        .await
+        .unwrap();
         client
             .write_all(
                 b"GET /uds HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
@@ -1256,7 +1295,405 @@ header = "x-test-loop"
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn unix_proxy_v2_transparent_https_performs_mitm_in_the_existing_product_pipeline() {
+    async fn access_flow_stalled_preface_does_not_block_a_second_admission() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let socket_path = directory.path().join("concurrent-admission.sock");
+        let config_path = directory.path().join("acl-proxy.toml");
+        let origin = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let text = format!(
+            r#"schema_version = 3
+
+[service]
+request_timeout = "5s"
+shutdown_drain_timeout = "1s"
+
+[listeners.transparent_http]
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
+endpoint.allowed_destination_ports = [80]
+http_versions = ["http1"]
+max_connections = 2
+
+[listeners.transparent_http.endpoint.transport]
+kind = "unix"
+path = {:?}
+mode = "0600"
+
+[egress]
+route = "direct"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "unix-concurrent-admission"
+decision = "allow"
+urls = ["http://origin.example.test/second"]
+methods = ["GET"]
+"#,
+            socket_path
+        );
+        fs::write(&config_path, text).unwrap();
+        let loaded = load_and_compile_exact_config(&config_path).unwrap();
+        let origin_url =
+            http_access_url::canonicalize_http_url("http://origin.example.test/").unwrap();
+        let network = Arc::new(
+            http_access_runtime::ForwardingDevHarness::new(
+                http_access_runtime::ForwardingNetworkFacts::new(Vec::new(), None, None, None)
+                    .unwrap(),
+            )
+            .map_prebound(&origin_url, origin_address)
+            .unwrap()
+            .into_standalone_guard(),
+        );
+        let product = ProductRuntime::prepare_from_prebound_with_forwarding_network(
+            loaded,
+            Vec::new(),
+            network,
+        )
+        .await
+        .unwrap();
+        product.activate_initial().await.unwrap();
+        product.start_listeners().await.unwrap();
+
+        let mut stalled = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        stalled.write_all(b"AWAF").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let request = read_http_message(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\naccepted",
+                )
+                .await
+                .unwrap();
+            request
+        });
+        let mut second = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        write_access_flow_preface(
+            &mut second,
+            AccessFlowDestination::new("203.0.113.8".parse().unwrap(), 80).unwrap(),
+            &IdentityPresentation::Disabled,
+        )
+        .await
+        .unwrap();
+        second
+            .write_all(
+                b"GET /second HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(1), read_http_message(&mut second))
+            .await
+            .expect("stalled first preface serialized a later Access Flow admission");
+        assert!(response.starts_with(b"HTTP/1.1 200 "));
+        let request = origin_task.await.unwrap();
+        assert!(request.starts_with(b"GET /second HTTP/1.1\r\n"));
+
+        drop(stalled);
+        drop(second);
+        product.shutdown().await;
+        assert!(socket_path.exists());
+        fs::remove_file(&socket_path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn access_flow_shutdown_closes_admission_before_deadline_bound_connection_join() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let socket_path = directory.path().join("shutdown.sock");
+        let config_path = directory.path().join("acl-proxy.toml");
+        let origin = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let text = format!(
+            r#"schema_version = 3
+
+[service]
+request_timeout = "5s"
+shutdown_drain_timeout = "1s"
+
+[listeners.transparent_http]
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
+endpoint.allowed_destination_ports = [80]
+http_versions = ["http1"]
+
+[listeners.transparent_http.endpoint.transport]
+kind = "unix"
+path = {:?}
+mode = "0600"
+
+[egress]
+route = "direct"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "unix-shutdown"
+decision = "allow"
+urls = ["http://origin.example.test/stalled"]
+methods = ["GET"]
+"#,
+            socket_path
+        );
+        fs::write(&config_path, text).unwrap();
+        let loaded = load_and_compile_exact_config(&config_path).unwrap();
+        let origin_url =
+            http_access_url::canonicalize_http_url("http://origin.example.test/").unwrap();
+        let network = Arc::new(
+            http_access_runtime::ForwardingDevHarness::new(
+                http_access_runtime::ForwardingNetworkFacts::new(Vec::new(), None, None, None)
+                    .unwrap(),
+            )
+            .map_prebound(&origin_url, origin_address)
+            .unwrap()
+            .into_standalone_guard(),
+        );
+        let product = ProductRuntime::prepare_from_prebound_with_forwarding_network(
+            loaded,
+            Vec::new(),
+            network,
+        )
+        .await
+        .unwrap();
+        product.activate_initial().await.unwrap();
+        product.start_listeners().await.unwrap();
+
+        let (origin_active_send, origin_active_receive) = oneshot::channel();
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let request = read_http_message(&mut stream).await;
+            assert!(request.starts_with(b"GET /stalled HTTP/1.1\r\n"));
+            origin_active_send.send(()).unwrap();
+            let mut byte = [0_u8; 1];
+            stream.read(&mut byte).await.unwrap_or(0)
+        });
+
+        let mut client = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        write_access_flow_preface(
+            &mut client,
+            AccessFlowDestination::new("203.0.113.8".parse().unwrap(), 80).unwrap(),
+            &IdentityPresentation::Disabled,
+        )
+        .await
+        .unwrap();
+        client
+            .write_all(
+                b"GET /stalled HTTP/1.1\r\nHost: origin.example.test\r\nConnection: keep-alive\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), origin_active_receive)
+            .await
+            .expect("Access Flow request did not reach the stalled origin")
+            .unwrap();
+
+        let runtime = product.static_resources.listener_runtime_for_test();
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            runtime.stop_admission_and_wait_closed(),
+        )
+        .await
+        .expect("Access Flow admission closure waited for the active connection");
+        assert!(
+            tokio::net::UnixStream::connect(&socket_path).await.is_err(),
+            "Access Flow Unix listener still admitted connections after closure"
+        );
+        assert!(
+            !origin_task.is_finished(),
+            "active connection ended while only listener admission was closed"
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(150);
+        let shutdown = tokio::spawn(async move {
+            runtime.shutdown_and_wait(Some(deadline)).await;
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !shutdown.is_finished(),
+            "active Access Flow connection drained before the caller deadline"
+        );
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("Access Flow connection join exceeded its caller deadline")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), origin_task)
+            .await
+            .expect("forced Access Flow cancellation did not close the origin connection")
+            .unwrap();
+
+        let mut byte = [0_u8; 1];
+        let _ = tokio::time::timeout(Duration::from_secs(1), client.read(&mut byte))
+            .await
+            .expect("forced Access Flow cancellation did not close the client connection");
+        product.shutdown().await;
+        assert!(socket_path.exists());
+        fs::remove_file(&socket_path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn access_flow_websocket_upgrade_uses_the_existing_product_pipeline() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let socket_path = directory.path().join("websocket.sock");
+        let config_path = directory.path().join("acl-proxy.toml");
+        let origin = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let text = format!(
+            r#"schema_version = 3
+
+[service]
+request_timeout = "5s"
+shutdown_drain_timeout = "1s"
+
+[listeners.transparent_http]
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
+endpoint.allowed_destination_ports = [80]
+http_versions = ["http1"]
+
+[listeners.transparent_http.endpoint.transport]
+kind = "unix"
+path = {:?}
+mode = "0600"
+
+[egress]
+route = "direct"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "unix-websocket"
+decision = "allow"
+urls = ["http://origin.example.test/socket"]
+methods = ["GET"]
+allow_upgrades = true
+"#,
+            socket_path
+        );
+        fs::write(&config_path, text).unwrap();
+        let loaded = load_and_compile_exact_config(&config_path).unwrap();
+        let origin_url =
+            http_access_url::canonicalize_http_url("http://origin.example.test/").unwrap();
+        let network = Arc::new(
+            http_access_runtime::ForwardingDevHarness::new(
+                http_access_runtime::ForwardingNetworkFacts::new(Vec::new(), None, None, None)
+                    .unwrap(),
+            )
+            .map_prebound(&origin_url, origin_address)
+            .unwrap()
+            .into_standalone_guard(),
+        );
+        let product = ProductRuntime::prepare_from_prebound_with_forwarding_network(
+            loaded,
+            Vec::new(),
+            network,
+        )
+        .await
+        .unwrap();
+        product.activate_initial().await.unwrap();
+        product.start_listeners().await.unwrap();
+
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let request = read_http_message(&mut stream).await;
+            let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            assert!(request.starts_with("get /socket http/1.1\r\n"));
+            assert!(request.contains("\r\nconnection: upgrade\r\n"));
+            assert!(request.contains("\r\nupgrade: websocket\r\n"));
+            assert!(request.contains("\r\nsec-websocket-key: dghlihnhbxbszsbub25jzq==\r\n"));
+            assert!(request.contains("\r\nsec-websocket-version: 13\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            let mut masked_text_frame = [0_u8; 11];
+            stream.read_exact(&mut masked_text_frame).await.unwrap();
+            assert_eq!(&masked_text_frame[..6], &[0x81, 0x85, 1, 2, 3, 4]);
+            let decoded = masked_text_frame[6..]
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| byte ^ [1, 2, 3, 4][index % 4])
+                .collect::<Vec<_>>();
+            assert_eq!(decoded, b"hello");
+            stream.write_all(&[0x81, 0x05]).await.unwrap();
+            stream.write_all(b"world").await.unwrap();
+        });
+
+        let mut client = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        write_access_flow_preface(
+            &mut client,
+            AccessFlowDestination::new("203.0.113.8".parse().unwrap(), 80).unwrap(),
+            &IdentityPresentation::Disabled,
+        )
+        .await
+        .unwrap();
+        client
+            .write_all(
+                b"GET /socket HTTP/1.1\r\nHost: origin.example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let response = read_http_message(&mut client).await;
+        assert!(response.starts_with(b"HTTP/1.1 101 "));
+        assert!(String::from_utf8_lossy(&response)
+            .to_ascii_lowercase()
+            .contains("\r\nupgrade: websocket\r\n"));
+
+        let mask = [1_u8, 2, 3, 4];
+        let mut masked_payload = *b"hello";
+        for (index, byte) in masked_payload.iter_mut().enumerate() {
+            *byte ^= mask[index % mask.len()];
+        }
+        client
+            .write_all(&[
+                0x81,
+                0x80 | u8::try_from(masked_payload.len()).unwrap(),
+                mask[0],
+                mask[1],
+                mask[2],
+                mask[3],
+            ])
+            .await
+            .unwrap();
+        client.write_all(&masked_payload).await.unwrap();
+        let mut response_frame = [0_u8; 7];
+        client.read_exact(&mut response_frame).await.unwrap();
+        assert_eq!(&response_frame[..2], &[0x81, 0x05]);
+        assert_eq!(&response_frame[2..], b"world");
+        drop(client);
+        origin_task.await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), product.shutdown())
+            .await
+            .expect("completed Access Flow WebSocket retained runtime resources");
+        assert!(socket_path.exists());
+        fs::remove_file(&socket_path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn access_flow_transparent_https_performs_mitm_in_the_existing_product_pipeline() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
         let directory = tempdir().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -1277,13 +1714,16 @@ request_timeout = "5s"
 shutdown_drain_timeout = "1s"
 
 [listeners.transparent_https]
-endpoint.kind = "unix_proxy_v2"
-endpoint.path = {:?}
-endpoint.mode = "0600"
-endpoint.proxy_header_timeout = "2s"
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
 endpoint.allowed_destination_ports = [443]
 http_versions = ["http1"]
 handshake_timeout = "1s"
+
+[listeners.transparent_https.endpoint.transport]
+kind = "unix"
+path = {:?}
+mode = "0600"
 
 [mitm]
 mode = "generated"
@@ -1354,16 +1794,13 @@ urls = ["https://origin.example.test/**"]
         });
 
         let mut unix = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
-        let mut proxy = [0_u8; 28];
-        proxy[..12].copy_from_slice(b"\r\n\r\n\0\r\nQUIT\n");
-        proxy[12] = 0x21;
-        proxy[13] = 0x11;
-        proxy[14..16].copy_from_slice(&12_u16.to_be_bytes());
-        proxy[16..20].copy_from_slice(&[198, 51, 100, 77]);
-        proxy[20..24].copy_from_slice(&[203, 0, 113, 8]);
-        proxy[24..26].copy_from_slice(&40_000_u16.to_be_bytes());
-        proxy[26..28].copy_from_slice(&443_u16.to_be_bytes());
-        unix.write_all(&proxy).await.unwrap();
+        write_access_flow_preface(
+            &mut unix,
+            AccessFlowDestination::new("203.0.113.8".parse().unwrap(), 443).unwrap(),
+            &IdentityPresentation::Disabled,
+        )
+        .await
+        .unwrap();
 
         let connector =
             TlsConnector::from(Arc::new(client_config_for_roots(ca_chain, &[b"http/1.1"])));

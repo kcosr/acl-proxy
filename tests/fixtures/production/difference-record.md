@@ -19,7 +19,7 @@ traceability without retaining their contents:
 | internal container | 2,907 | `0c8965f1529ed55618624d0fd5f4c2a39f066cf076a6400acf4dd91b8d0d09e0` | `internal-container-proxy.toml` |
 
 The TCP fixture preserves the migrated source topology. The separate UDS host
-fixture records the workstation end state: only transparent Unix-PROXY-v2 data
+fixture records the workstation end state: only transparent Access Flow over Unix data
 listeners, one fixed local-workstation principal with no `client_cidrs`, and
 mandatory TLS parent-proxy egress with typed workstation identity injection.
 

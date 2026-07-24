@@ -7,8 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::sync::watch;
 
 use http_access_runtime::{
-    ListenerRuntime, LocalAddressProvider, UpgradeRuntime, UpgradeRuntimeError,
-    UpgradeRuntimeLimits,
+    LocalAddressProvider, UpgradeRuntime, UpgradeRuntimeError, UpgradeRuntimeLimits,
 };
 
 use crate::authorization::callback::PendingTerminalCause;
@@ -34,8 +33,8 @@ use crate::tls_io_runtime::{TlsIoRuntime, TlsIoRuntimeError, TlsIoShutdownOutcom
 
 use super::assets::{ProductIngressAssets, ProductIngressAssetsError};
 use super::listeners::{
-    LocalAddressRefreshFailureObserver, PreparedProxyListeners, ProductLocalAddressRuntime,
-    ProxyListenerBindError, ProxyListenerFailure, UnixSocketLifetime,
+    LocalAddressRefreshFailureObserver, PreparedProxyListeners, ProductListenerRuntime,
+    ProductLocalAddressRuntime, ProxyListenerBindError, ProxyListenerFailure, UnixSocketLifetime,
 };
 use super::product::ProductActivator;
 
@@ -56,7 +55,7 @@ pub(crate) struct ProductStaticResources {
     listener_failure: watch::Sender<Option<Arc<ProxyListenerFailure>>>,
     #[cfg(test)]
     listener_failure_notifications: AtomicUsize,
-    listener_runtime: Mutex<Option<Arc<ListenerRuntime>>>,
+    listener_runtime: Mutex<Option<Arc<ProductListenerRuntime>>>,
     unix_socket_lifetimes: Mutex<Vec<Arc<UnixSocketLifetime>>>,
     listener_shutdown_started: AtomicBool,
     #[cfg(test)]
@@ -723,7 +722,7 @@ impl ProductStaticResources {
 
     pub(super) fn adopt_listener_runtime(
         &self,
-        runtime: ListenerRuntime,
+        runtime: ProductListenerRuntime,
         unix_socket_lifetimes: Vec<Arc<UnixSocketLifetime>>,
     ) -> Result<(), ProductStaticResourcesError> {
         let mut owned = self
@@ -846,6 +845,16 @@ impl ProductStaticResources {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn listener_runtime_for_test(&self) -> Arc<ProductListenerRuntime> {
+        self.listener_runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned()
+            .expect("listener runtime is not active")
     }
 
     fn record_control_shutdown_error(&self, error: Arc<ControlServerShutdownError>) {

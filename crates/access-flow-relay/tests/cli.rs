@@ -26,7 +26,7 @@ fn reserve_address() -> std::net::SocketAddr {
 }
 
 #[test]
-fn binary_loads_strict_config_binds_and_shuts_down() {
+fn binary_loads_strict_config_binds_and_drains_on_signal() {
     let directory = tempfile::tempdir().unwrap();
     let socket_path = directory.path().join("proxy.sock");
     let _socket = UnixListener::bind(&socket_path).unwrap();
@@ -36,17 +36,22 @@ fn binary_loads_strict_config_binds_and_shuts_down() {
         "routes": [{
             "name": "http",
             "listen": listen.to_string(),
-            "allowedOriginalPorts": [listen.port()],
-            "upstreamSocket": socket_path,
+            "allowedDestinationPorts": [listen.port()],
+            "transport": {
+                "kind": "unix",
+                "path": socket_path,
+            },
         }],
+        "presentation": {"kind": "disabled"},
         "setupTimeout": "2s",
+        "drainTimeout": "1s",
         "maxConnections": 1,
         "copyBufferBytesPerDirection": 1024,
     });
     std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
 
     let mut child = ChildGuard(
-        Command::new(env!("CARGO_BIN_EXE_acl-proxy-transparent-uds-relay"))
+        Command::new(env!("CARGO_BIN_EXE_acl-proxy-access-flow-relay"))
             .args(["--config", config_path.to_str().unwrap()])
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -75,7 +80,7 @@ fn binary_loads_strict_config_binds_and_shuts_down() {
 
     // SAFETY: the PID is the live child process owned by this test.
     assert_eq!(
-        unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGINT) },
+        unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) },
         0
     );
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -84,28 +89,29 @@ fn binary_loads_strict_config_binds_and_shuts_down() {
             assert!(status.success(), "relay exited unsuccessfully: {status}");
             break;
         }
-        assert!(Instant::now() < deadline, "relay did not stop after SIGINT");
+        assert!(
+            Instant::now() < deadline,
+            "relay did not stop after SIGTERM"
+        );
         thread::sleep(Duration::from_millis(20));
     }
 }
 
 #[test]
-fn binary_rejects_unknown_config_fields() {
+fn binary_reports_removed_fields_without_accepting_an_alias() {
     let directory = tempfile::tempdir().unwrap();
     let config_path = directory.path().join("invalid.json");
     std::fs::write(
         &config_path,
-        br#"{"schemaVersion":1,"routes":[],"setupTimeout":"2s","maxConnections":1,"copyBufferBytesPerDirection":1024}"#,
+        br#"{"routes":[{"name":"http","listen":"127.0.0.1:3128","allowedOriginalPorts":[80],"upstreamSocket":"/run/acl-proxy/http.sock"}],"presentation":{"kind":"disabled"},"setupTimeout":"2s","drainTimeout":"10s","maxConnections":1,"copyBufferBytesPerDirection":1024}"#,
     )
     .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_acl-proxy-transparent-uds-relay"))
+    let output = Command::new(env!("CARGO_BIN_EXE_acl-proxy-access-flow-relay"))
         .args(["--config", config_path.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("schemaVersion"),
-        "unexpected stderr: {stderr}"
-    );
+    assert!(stderr.contains("allowedOriginalPorts"), "{stderr}");
+    assert!(stderr.contains("allowedDestinationPorts"), "{stderr}");
 }

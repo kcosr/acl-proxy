@@ -22,7 +22,7 @@ ALLOWED_LICENSES = {
 }
 REGISTRY = "https://github.com/rust-lang/crates.io-index"
 PRODUCT_VERSION = "0.3.0-rc.1"
-RUNTIME_COMMIT = "bca85d11787afe988dc63cad817f20434523cf66"
+RUNTIME_COMMIT = "52ad634fc1efccb62bf967f441a0047d56c1f425"
 PRODUCT_INITIAL_COMMIT = "a829f43552c7118d1f206b9e4112b3c747eecd50"
 TRANSPORT_PACKAGES = {
     "h2": ("0.4.15", True),
@@ -174,11 +174,13 @@ def load_metadata(root: Path, supplied: Path | None) -> dict[str, Any]:
 
 
 def check_manifest(root: Path) -> None:
+    if (root / "crates/transparent-uds-relay").exists():
+        fail("obsolete transparent UDS relay crate is present")
     manifest = load_toml(root / "Cargo.toml")
     workspace = manifest.get("workspace")
     if not isinstance(workspace, dict):
         fail("Cargo.toml lacks [workspace]")
-    expected_members = [".", "crates/transparent-uds-relay"]
+    expected_members = [".", "crates/access-flow-relay"]
     if workspace.get("members") != expected_members:
         fail("workspace members must include exactly the product and relay")
     if workspace.get("default-members") != expected_members:
@@ -198,7 +200,7 @@ def check_manifest(root: Path) -> None:
     lock_packages = lock.get("package")
     if not isinstance(lock_packages, list):
         fail("Cargo.lock lacks package records")
-    for package_name in ("acl-proxy", "acl-proxy-transparent-uds-relay"):
+    for package_name in ("acl-proxy", "acl-proxy-access-flow-relay"):
         locked_product = [
             package for package in lock_packages if package.get("name") == package_name
         ]
@@ -208,11 +210,30 @@ def check_manifest(root: Path) -> None:
                 f"{PRODUCT_VERSION} package"
             )
 
-    relay = load_toml(root / "crates/transparent-uds-relay/Cargo.toml").get("package")
-    if not isinstance(relay, dict) or relay.get("version") != {"workspace": True}:
-        fail("transparent UDS relay must inherit the workspace version")
+    relay_manifest = load_toml(root / "crates/access-flow-relay/Cargo.toml")
+    relay = relay_manifest.get("package")
+    if (
+        not isinstance(relay, dict)
+        or relay.get("name") != "acl-proxy-access-flow-relay"
+        or relay.get("version") != {"workspace": True}
+    ):
+        fail("Access Flow relay must inherit the workspace version")
+    linux_dependencies = (
+        relay_manifest.get("target", {})
+        .get("cfg(target_os = \"linux\")", {})
+        .get("dependencies", {})
+    )
+    if not isinstance(linux_dependencies, dict):
+        fail("Access Flow relay lacks its Linux dependency table")
+    for dependency in ("access-flow-relay", "access-flow-unix"):
+        if dependency not in linux_dependencies:
+            fail(f"Access Flow relay lacks shared {dependency} ownership")
+    if "proxy-protocol-v2-codec" in linux_dependencies:
+        fail("obsolete PROXY-v2 codec remains in the Access Flow relay")
 
     release_script = read_text(root / "scripts/release.mjs")
+    if "acl-proxy-transparent-uds-relay" in release_script:
+        fail("release script retains the obsolete relay artifact")
     if 'const REPO = "kcosr/acl-proxy-access-runtime";' not in release_script:
         fail("release script must target the authoritative ACL Proxy repository")
     if 'const RELEASE_REMOTE = "access-runtime";' not in release_script:
@@ -472,7 +493,7 @@ def check_shipped_docs(root: Path) -> None:
         "Release archives contain `acl-proxy`, the capture-body extraction helper, "
         "this README, `LICENSE`, `THIRD_PARTY_NOTICES`, and "
         "`acl-proxy.sample.toml`. Linux archives also contain the Linux-only "
-        "transparent UDS relay."
+        "Access Flow relay."
     )
     if archive_inventory not in normalized:
         fail("README lacks the exact release archive inventory")
@@ -481,7 +502,7 @@ def check_shipped_docs(root: Path) -> None:
         archive_root,
         "  bin/acl-proxy",
         "  bin/acl-proxy-extract-capture-body",
-        "  bin/acl-proxy-transparent-uds-relay  # Linux archives only",
+        "  bin/acl-proxy-access-flow-relay  # Linux archives only",
         "  README.md",
         "  LICENSE",
         "  THIRD_PARTY_NOTICES",

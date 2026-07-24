@@ -15,17 +15,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use access_async_contracts::BoxAccessFuture;
+use access_flow::{
+    AccessFlowAcceptor, AccessFlowAdmission, AccessFlowAdmissionInput, AccessFlowPresentationMode,
+};
+use access_flow_unix::UnixAccessFlowListenerAdapter;
+use access_identity::IdentityContext;
 use http_access_runtime::{
-    AllowedDestinationPorts, Http1ConnectPolicy, ListenerConfig, ListenerLimits, ListenerMode,
-    LocalAddressProvider, OriginalDestinationProvider, PreboundListener, PreboundListenerBundle,
+    ForwardingCancellation, Http1ConnectPolicy, HttpAccessFlowService, ListenerConfig,
+    ListenerLimits, ListenerMode, ListenerRuntime, LocalAddressProvider,
+    OriginalDestinationProvider, PreboundListener, PreboundListenerBundle,
     PreboundListenerEndpoint, RuntimeError as SharedRuntimeError,
 };
 use http_access_types::{HttpProtocol, HttpProtocolSet};
 
 use crate::config::compiler::{
     unix_listener_lock_path, CompiledHttp1ConnectPolicy, CompiledHttpVersion,
-    StaticCleartextListener, StaticExplicitHttpsListener, StaticListenerEndpoint,
-    StaticListenersConfig, StaticTransparentHttpsListener,
+    StaticAccessFlowTransport, StaticCleartextListener, StaticExplicitHttpsListener,
+    StaticListenerEndpoint, StaticListenersConfig, StaticTransparentHttpsListener,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,10 +117,10 @@ pub(crate) struct PreparedProxyListener {
 enum PreparedListenerEndpoint {
     Tcp(TcpListener),
     #[cfg(unix)]
-    UnixProxyV2 {
+    AccessFlow {
         listener: UnixListener,
         lifetime: Arc<UnixSocketLifetime>,
-        proxy_header_timeout: Duration,
+        admission_timeout: Duration,
         allowed_destination_ports: Vec<u16>,
     },
 }
@@ -132,6 +139,12 @@ pub(super) struct PreparedProxyListeners {
     pub(super) transparent_http: Option<PreparedProxyListener>,
     pub(super) explicit_https: Option<PreparedProxyListener>,
     pub(super) transparent_https: Option<PreparedProxyListener>,
+}
+
+pub(super) struct PreparedListenerRuntimeInputs {
+    pub(super) tcp: Option<PreboundListenerBundle>,
+    pub(super) access_flow: Vec<PreparedAccessFlowListener>,
+    pub(super) unix_socket_lifetimes: Vec<Arc<UnixSocketLifetime>>,
 }
 
 impl PreparedProxyListeners {
@@ -192,10 +205,10 @@ impl PreparedProxyListeners {
         .collect()
     }
 
-    pub(super) fn into_shared_bundle_with_transparent_support(
+    pub(super) fn into_runtime_inputs_with_transparent_support(
         self,
         transparent_supported: bool,
-    ) -> Result<(PreboundListenerBundle, Vec<Arc<UnixSocketLifetime>>), SharedRuntimeError> {
+    ) -> Result<PreparedListenerRuntimeInputs, SharedRuntimeError> {
         if !transparent_supported
             && [
                 self.transparent_http.as_ref(),
@@ -212,21 +225,34 @@ impl PreparedProxyListeners {
         {
             return Err(SharedRuntimeError::InvalidInput);
         }
-        let prepared = self
-            .into_entries()
-            .into_iter()
-            .map(PreparedProxyListener::into_shared_with_lifetime)
-            .collect::<Result<Vec<_>, _>>()?;
-        let (listeners, lifetimes): (Vec<_>, Vec<_>) = prepared.into_iter().unzip();
-        let lifetimes = lifetimes.into_iter().flatten().collect();
-        Ok((PreboundListenerBundle::new(listeners)?, lifetimes))
+        let mut tcp = Vec::new();
+        let mut access_flow = Vec::new();
+        let mut lifetimes = Vec::new();
+        for listener in self.into_entries() {
+            match listener.into_runtime_input()? {
+                PreparedRuntimeInput::Tcp(listener) => tcp.push(listener),
+                PreparedRuntimeInput::AccessFlow(listener, lifetime) => {
+                    access_flow.push(listener);
+                    lifetimes.push(lifetime);
+                }
+            }
+        }
+        let tcp = if tcp.is_empty() {
+            None
+        } else {
+            Some(PreboundListenerBundle::new(tcp)?)
+        };
+        Ok(PreparedListenerRuntimeInputs {
+            tcp,
+            access_flow,
+            unix_socket_lifetimes: lifetimes,
+        })
     }
 }
 
 impl PreparedProxyListener {
-    fn into_shared_with_lifetime(
-        self,
-    ) -> Result<(PreboundListener, Option<Arc<UnixSocketLifetime>>), SharedRuntimeError> {
+    fn into_runtime_input(self) -> Result<PreparedRuntimeInput, SharedRuntimeError> {
+        let kind = self.config.kind();
         let config = match self.config {
             ProxyListenerConfig::ExplicitHttp(config) => ListenerConfig::explicit_http(
                 protocol_set(&config.http_versions)?,
@@ -265,35 +291,500 @@ impl PreparedProxyListener {
                 )?,
             )?,
         };
-        let (endpoint, lifetime) = match self.endpoint {
-            PreparedListenerEndpoint::Tcp(listener) => {
-                (PreboundListenerEndpoint::Tcp(listener), None)
-            }
+        match self.endpoint {
+            PreparedListenerEndpoint::Tcp(listener) => Ok(PreparedRuntimeInput::Tcp(
+                PreboundListener::new(config, PreboundListenerEndpoint::Tcp(listener))?,
+            )),
             #[cfg(unix)]
-            PreparedListenerEndpoint::UnixProxyV2 {
+            PreparedListenerEndpoint::AccessFlow {
                 listener,
                 lifetime,
-                proxy_header_timeout,
+                admission_timeout,
                 allowed_destination_ports,
-            } => (
-                PreboundListenerEndpoint::UnixProxyV2 {
-                    listener,
-                    proxy_header_timeout,
-                    allowed_destination_ports: AllowedDestinationPorts::new(
-                        allowed_destination_ports,
-                    )?,
-                },
-                Some(lifetime),
-            ),
-        };
-        Ok((PreboundListener::new(config, endpoint)?, lifetime))
+            } => {
+                listener
+                    .set_nonblocking(true)
+                    .map_err(|_| SharedRuntimeError::InvalidInput)?;
+                let listener = tokio::net::UnixListener::from_std(listener)
+                    .map_err(|_| SharedRuntimeError::InvalidInput)?;
+                let ports = allowed_destination_ports
+                    .into_iter()
+                    .map(|port| {
+                        std::num::NonZeroU16::new(port).ok_or(SharedRuntimeError::InvalidInput)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let acceptor = AccessFlowAcceptor::new(AccessFlowPresentationMode::Disabled, ports)
+                    .map_err(|_| SharedRuntimeError::InvalidInput)?;
+                let adapter =
+                    UnixAccessFlowListenerAdapter::from_prebound(listener, admission_timeout)
+                        .map_err(|_| SharedRuntimeError::InvalidInput)?;
+                Ok(PreparedRuntimeInput::AccessFlow(
+                    PreparedAccessFlowListener {
+                        kind,
+                        config,
+                        adapter,
+                        acceptor,
+                    },
+                    lifetime,
+                ))
+            }
+        }
     }
 
     #[cfg(test)]
     fn into_shared(self) -> Result<PreboundListener, SharedRuntimeError> {
-        self.into_shared_with_lifetime()
-            .map(|(listener, _)| listener)
+        match self.into_runtime_input()? {
+            PreparedRuntimeInput::Tcp(listener) => Ok(listener),
+            PreparedRuntimeInput::AccessFlow(..) => Err(SharedRuntimeError::InvalidInput),
+        }
     }
+}
+
+enum PreparedRuntimeInput {
+    Tcp(PreboundListener),
+    AccessFlow(PreparedAccessFlowListener, Arc<UnixSocketLifetime>),
+}
+
+pub(super) struct PreparedAccessFlowListener {
+    kind: ProxyListenerKind,
+    config: ListenerConfig,
+    adapter: UnixAccessFlowListenerAdapter,
+    acceptor: AccessFlowAcceptor,
+}
+
+struct DisabledAccessFlowAdmission;
+
+impl<C> AccessFlowAdmission<C> for DisabledAccessFlowAdmission {
+    type Facts = IdentityContext;
+    type Error = std::convert::Infallible;
+
+    fn admit<'a>(
+        &'a self,
+        _input: AccessFlowAdmissionInput<'a, C>,
+    ) -> BoxAccessFuture<'a, Result<Self::Facts, Self::Error>> {
+        Box::pin(std::future::ready(Ok(IdentityContext::Disabled)))
+    }
+}
+
+struct AccessFlowAdmissionLatch {
+    open: std::sync::atomic::AtomicUsize,
+    closed: tokio::sync::Notify,
+}
+
+impl AccessFlowAdmissionLatch {
+    fn new(listeners: usize) -> Self {
+        Self {
+            open: std::sync::atomic::AtomicUsize::new(listeners),
+            closed: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn close_one(&self) {
+        if self.open.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.closed.notify_waiters();
+        }
+    }
+
+    async fn wait_closed(&self) {
+        loop {
+            let notified = self.closed.notified();
+            if self.open.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct AccessFlowAdmissionGuard(Arc<AccessFlowAdmissionLatch>);
+
+impl Drop for AccessFlowAdmissionGuard {
+    fn drop(&mut self) {
+        self.0.close_one();
+    }
+}
+
+pub(super) struct AccessFlowListenerRuntime {
+    admission: ForwardingCancellation,
+    force: ForwardingCancellation,
+    admission_latch: Arc<AccessFlowAdmissionLatch>,
+    supervisor: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl AccessFlowListenerRuntime {
+    pub(super) fn start(
+        listeners: Vec<PreparedAccessFlowListener>,
+        service: HttpAccessFlowService,
+        failure_observer: Arc<dyn Fn(Arc<ProxyListenerFailure>) + Send + Sync>,
+    ) -> Option<Self> {
+        if listeners.is_empty() {
+            return None;
+        }
+        let admission = ForwardingCancellation::new();
+        let force = ForwardingCancellation::new();
+        let admission_latch = Arc::new(AccessFlowAdmissionLatch::new(listeners.len()));
+        let supervisor_admission = admission.clone();
+        let supervisor_force = force.clone();
+        let supervisor_latch = Arc::clone(&admission_latch);
+        let supervisor = tokio::spawn(async move {
+            let mut routes = tokio::task::JoinSet::new();
+            for listener in listeners {
+                routes.spawn(run_access_flow_listener(
+                    listener,
+                    service.clone(),
+                    supervisor_admission.clone(),
+                    supervisor_force.clone(),
+                    AccessFlowAdmissionGuard(Arc::clone(&supervisor_latch)),
+                ));
+            }
+
+            tokio::select! {
+                biased;
+                _ = supervisor_admission.cancelled() => {}
+                result = routes.join_next() => {
+                    let failure = match result {
+                        Some(Ok(Err(failure))) => failure,
+                        Some(Err(_)) => Arc::new(ProxyListenerFailure {
+                            listener: ProxyListenerKind::TransparentHttp,
+                            message: "Access Flow listener task failed".to_owned(),
+                        }),
+                        Some(Ok(Ok(kind))) => Arc::new(ProxyListenerFailure {
+                            listener: kind,
+                            message: "Access Flow listener exited unexpectedly".to_owned(),
+                        }),
+                        None => Arc::new(ProxyListenerFailure {
+                            listener: ProxyListenerKind::TransparentHttp,
+                            message: "all Access Flow listeners exited unexpectedly".to_owned(),
+                        }),
+                    };
+                    failure_observer(failure);
+                    supervisor_admission.cancel();
+                    supervisor_force.cancel();
+                }
+            }
+            while let Some(result) = routes.join_next().await {
+                if let Ok(Err(failure)) = result {
+                    tracing::error!(error = %failure, "Access Flow listener failed during shutdown");
+                }
+            }
+        });
+        Some(Self {
+            admission,
+            force,
+            admission_latch,
+            supervisor: std::sync::Mutex::new(Some(supervisor)),
+        })
+    }
+
+    pub(super) fn begin_shutdown(&self) {
+        self.admission.cancel();
+    }
+
+    pub(super) async fn stop_admission_and_wait_closed(&self) {
+        self.begin_shutdown();
+        self.admission_latch.wait_closed().await;
+    }
+
+    pub(super) async fn shutdown_and_wait(&self, deadline: Option<std::time::Instant>) {
+        self.begin_shutdown();
+        let supervisor = self
+            .supervisor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(mut supervisor) = supervisor else {
+            return;
+        };
+        if let Some(deadline) = deadline {
+            if tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut supervisor)
+                .await
+                .is_err()
+            {
+                self.force.cancel();
+                let _ = supervisor.await;
+            }
+        } else {
+            let _ = supervisor.await;
+        }
+    }
+}
+
+impl Drop for AccessFlowListenerRuntime {
+    fn drop(&mut self) {
+        self.admission.cancel();
+        self.force.cancel();
+        let supervisor = self
+            .supervisor
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(supervisor) = supervisor {
+            supervisor.abort();
+        }
+    }
+}
+
+pub(super) struct ProductListenerRuntime {
+    shared: Option<Arc<ListenerRuntime>>,
+    access_flow: Option<Arc<AccessFlowListenerRuntime>>,
+}
+
+impl ProductListenerRuntime {
+    pub(super) fn new(
+        shared: Option<ListenerRuntime>,
+        access_flow: Option<AccessFlowListenerRuntime>,
+    ) -> Result<Self, SharedRuntimeError> {
+        if shared.is_none() && access_flow.is_none() {
+            return Err(SharedRuntimeError::InvalidInput);
+        }
+        Ok(Self {
+            shared: shared.map(Arc::new),
+            access_flow: access_flow.map(Arc::new),
+        })
+    }
+
+    pub(super) fn begin_shutdown(&self) {
+        if let Some(shared) = &self.shared {
+            shared.begin_shutdown();
+        }
+        if let Some(access_flow) = &self.access_flow {
+            access_flow.begin_shutdown();
+        }
+    }
+
+    pub(super) async fn stop_admission_and_wait_closed(&self) {
+        if let Some(shared) = &self.shared {
+            shared.stop_admission_and_wait_closed().await;
+        }
+        if let Some(access_flow) = &self.access_flow {
+            access_flow.stop_admission_and_wait_closed().await;
+        }
+    }
+
+    pub(super) async fn shutdown_and_wait(&self, deadline: Option<std::time::Instant>) {
+        if let Some(shared) = &self.shared {
+            shared.shutdown_and_wait(deadline).await;
+        }
+        if let Some(access_flow) = &self.access_flow {
+            access_flow.shutdown_and_wait(deadline).await;
+        }
+    }
+}
+
+async fn run_access_flow_listener(
+    listener: PreparedAccessFlowListener,
+    service: HttpAccessFlowService,
+    admission_cancellation: ForwardingCancellation,
+    force_cancellation: ForwardingCancellation,
+    admission_guard: AccessFlowAdmissionGuard,
+) -> Result<ProxyListenerKind, Arc<ProxyListenerFailure>> {
+    let kind = listener.kind;
+    let capacity = Arc::new(tokio::sync::Semaphore::new(
+        listener.config.limits().max_connections(),
+    ));
+    let mut connections = tokio::task::JoinSet::new();
+    let admission_result: Result<(), Arc<ProxyListenerFailure>> = {
+        let _admission_guard = admission_guard;
+        let PreparedAccessFlowListener {
+            kind: _,
+            config,
+            adapter,
+            acceptor,
+        } = listener;
+        async {
+            loop {
+                let permit = tokio::select! {
+                    biased;
+                    _ = admission_cancellation.cancelled() => break,
+                    joined = connections.join_next(), if !connections.is_empty() => {
+                        inspect_access_flow_connection(kind, joined, false)?;
+                        continue;
+                    }
+                    permit = Arc::clone(&capacity).acquire_owned() => {
+                        permit.map_err(|_| listener_failure(
+                            kind,
+                            "Access Flow listener capacity closed unexpectedly",
+                        ))?
+                    }
+                };
+                let (accepted, permit) = match wait_for_access_flow_accept(
+                    &adapter,
+                    &admission_cancellation,
+                    &mut connections,
+                    permit,
+                    kind,
+                )
+                .await
+                {
+                    Ok(AccessFlowAcceptEvent::Accepted(accepted, permit)) => (accepted, permit),
+                    Ok(AccessFlowAcceptEvent::ConnectionCompleted) => continue,
+                    Ok(AccessFlowAcceptEvent::Cancelled) => break,
+                    Err(failure) => return Err(failure),
+                };
+                let acceptor = acceptor.clone();
+                let service = service.clone();
+                let config = config.clone();
+                let admission_cancellation = admission_cancellation.clone();
+                let connection_cancellation = force_cancellation.clone();
+                connections.spawn(async move {
+                    let _permit = permit;
+                    let (channel, deadline) = accepted.into_access_flow();
+                    let accepted = match acceptor
+                        .accept(
+                            channel,
+                            deadline,
+                            &admission_cancellation,
+                            &DisabledAccessFlowAdmission,
+                        )
+                        .await
+                    {
+                        Ok(accepted) => accepted,
+                        Err(_error) if admission_cancellation.is_cancelled() => return Ok(()),
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "acl_proxy::traffic",
+                                listener = %kind,
+                                listener_transport = "access_flow",
+                                category = "connection_rejected",
+                                error = %error,
+                                "proxy listener rejected an Access Flow before HTTP/TLS processing"
+                            );
+                            return Ok(());
+                        }
+                    };
+                    match service
+                        .serve_access_flow(accepted, config, &connection_cancellation)
+                        .await
+                    {
+                        Ok(_) => Ok(()),
+                        Err(http_access_runtime::HttpAccessConnectionError::ConnectionRejected) => {
+                            tracing::warn!(
+                                target: "acl_proxy::traffic",
+                                listener = %kind,
+                                listener_transport = "access_flow",
+                                category = "connection_rejected",
+                                "Access Flow HTTP/TLS connection was rejected"
+                            );
+                            Ok(())
+                        }
+                        Err(error) => Err(listener_failure(kind, error.to_string())),
+                    }
+                });
+            }
+            Ok(())
+        }
+        .await
+    };
+
+    if let Err(failure) = admission_result {
+        admission_cancellation.cancel();
+        force_cancellation.cancel();
+        connections.abort_all();
+        let _ = drain_access_flow_connections(kind, &force_cancellation, &mut connections).await;
+        return Err(failure);
+    }
+    if let Err(failure) =
+        drain_access_flow_connections(kind, &force_cancellation, &mut connections).await
+    {
+        force_cancellation.cancel();
+        connections.abort_all();
+        let _ = drain_access_flow_connections(kind, &force_cancellation, &mut connections).await;
+        return Err(failure);
+    }
+    Ok(kind)
+}
+
+enum AccessFlowAcceptEvent {
+    Accepted(
+        access_flow_unix::AcceptedUnixAccessFlowChannel,
+        tokio::sync::OwnedSemaphorePermit,
+    ),
+    ConnectionCompleted,
+    Cancelled,
+}
+
+async fn wait_for_access_flow_accept(
+    adapter: &UnixAccessFlowListenerAdapter,
+    admission_cancellation: &ForwardingCancellation,
+    connections: &mut tokio::task::JoinSet<Result<(), Arc<ProxyListenerFailure>>>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    kind: ProxyListenerKind,
+) -> Result<AccessFlowAcceptEvent, Arc<ProxyListenerFailure>> {
+    tokio::select! {
+        biased;
+        _ = admission_cancellation.cancelled() => {
+            drop(permit);
+            Ok(AccessFlowAcceptEvent::Cancelled)
+        }
+        joined = connections.join_next(), if !connections.is_empty() => {
+            drop(permit);
+            inspect_access_flow_connection(kind, joined, false)?;
+            Ok(AccessFlowAcceptEvent::ConnectionCompleted)
+        }
+        accepted = adapter.accept(admission_cancellation) => match accepted {
+            Ok(accepted) => Ok(AccessFlowAcceptEvent::Accepted(accepted, permit)),
+            Err(_error) if admission_cancellation.is_cancelled() => {
+                drop(permit);
+                Ok(AccessFlowAcceptEvent::Cancelled)
+            }
+            Err(error) => {
+                drop(permit);
+                Err(listener_failure(kind, error.to_string()))
+            }
+        }
+    }
+}
+
+async fn drain_access_flow_connections(
+    kind: ProxyListenerKind,
+    force_cancellation: &ForwardingCancellation,
+    connections: &mut tokio::task::JoinSet<Result<(), Arc<ProxyListenerFailure>>>,
+) -> Result<(), Arc<ProxyListenerFailure>> {
+    let mut forced = force_cancellation.is_cancelled();
+    if forced {
+        connections.abort_all();
+    }
+    while !connections.is_empty() {
+        if forced {
+            let joined = connections.join_next().await;
+            inspect_access_flow_connection(kind, joined, true)?;
+            continue;
+        }
+        tokio::select! {
+            biased;
+            _ = force_cancellation.cancelled() => {
+                forced = true;
+                connections.abort_all();
+            }
+            joined = connections.join_next() => {
+                inspect_access_flow_connection(kind, joined, false)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn inspect_access_flow_connection(
+    kind: ProxyListenerKind,
+    joined: Option<Result<Result<(), Arc<ProxyListenerFailure>>, tokio::task::JoinError>>,
+    cancelled_task_is_expected: bool,
+) -> Result<(), Arc<ProxyListenerFailure>> {
+    match joined {
+        Some(Ok(Ok(_))) | None => Ok(()),
+        Some(Ok(Err(failure))) => Err(failure),
+        Some(Err(error)) if cancelled_task_is_expected && error.is_cancelled() => Ok(()),
+        Some(Err(_)) => Err(listener_failure(kind, "Access Flow connection task failed")),
+    }
+}
+
+fn listener_failure(
+    listener: ProxyListenerKind,
+    message: impl Into<String>,
+) -> Arc<ProxyListenerFailure> {
+    Arc::new(ProxyListenerFailure {
+        listener,
+        message: message.into(),
+    })
 }
 
 fn protocol_set(versions: &[CompiledHttpVersion]) -> Result<HttpProtocolSet, SharedRuntimeError> {
@@ -562,15 +1053,14 @@ fn bind_configured(
                         address: Some(*address),
                         source,
                     })?,
-                StaticListenerEndpoint::UnixProxyV2 {
-                    path,
-                    mode,
-                    proxy_header_timeout,
+                StaticListenerEndpoint::AccessFlow {
+                    admission_timeout,
                     allowed_destination_ports,
-                } => bind_unix_proxy_v2(
+                    transport: StaticAccessFlowTransport::Unix { path, mode },
+                } => bind_access_flow_unix(
                     path,
                     *mode,
-                    *proxy_header_timeout,
+                    *admission_timeout,
                     allowed_destination_ports.clone(),
                 )
                 .map_err(|source| ProxyListenerBindError {
@@ -586,10 +1076,10 @@ fn bind_configured(
 }
 
 #[cfg(unix)]
-fn bind_unix_proxy_v2(
+fn bind_access_flow_unix(
     path: &Path,
     mode: u32,
-    proxy_header_timeout: Duration,
+    admission_timeout: Duration,
     allowed_destination_ports: Vec<u16>,
 ) -> io::Result<PreparedListenerEndpoint> {
     use fs2::FileExt;
@@ -640,10 +1130,10 @@ fn bind_unix_proxy_v2(
     }
 
     let lifetime = Arc::new(UnixSocketLifetime { _lock: lock });
-    Ok(PreparedListenerEndpoint::UnixProxyV2 {
+    Ok(PreparedListenerEndpoint::AccessFlow {
         listener,
         lifetime,
-        proxy_header_timeout,
+        admission_timeout,
         allowed_destination_ports,
     })
 }
@@ -859,10 +1349,10 @@ fn validate_owned_socket(metadata: &std::fs::Metadata, effective_uid: u32) -> io
 }
 
 #[cfg(not(unix))]
-fn bind_unix_proxy_v2(
+fn bind_access_flow_unix(
     _path: &std::path::Path,
     _mode: u32,
-    _proxy_header_timeout: Duration,
+    _admission_timeout: Duration,
     _allowed_destination_ports: Vec<u16>,
 ) -> io::Result<PreparedListenerEndpoint> {
     Err(io::Error::new(
@@ -1178,9 +1668,84 @@ mod tests {
         };
 
         assert!(matches!(
-            prepared.into_shared_bundle_with_transparent_support(false),
+            prepared.into_runtime_inputs_with_transparent_support(false),
             Err(SharedRuntimeError::InvalidInput)
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn access_flow_accept_wait_observes_fatal_connection_without_a_later_client() {
+        let directory = tempfile::tempdir().unwrap();
+        let listener = tokio::net::UnixListener::bind(directory.path().join("listener.sock"))
+            .expect("bind test Unix listener");
+        let adapter =
+            UnixAccessFlowListenerAdapter::from_prebound(listener, Duration::from_secs(2)).unwrap();
+        let cancellation = ForwardingCancellation::new();
+        let permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        let mut connections = tokio::task::JoinSet::new();
+        connections.spawn(async {
+            tokio::task::yield_now().await;
+            Err(listener_failure(
+                ProxyListenerKind::TransparentHttp,
+                "injected connection failure",
+            ))
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_access_flow_accept(
+                &adapter,
+                &cancellation,
+                &mut connections,
+                permit,
+                ProxyListenerKind::TransparentHttp,
+            ),
+        )
+        .await
+        .expect("fatal connection completion was hidden behind Unix accept");
+
+        let failure = match result {
+            Err(failure) => failure,
+            Ok(_) => panic!("fatal connection completion was not propagated"),
+        };
+        assert_eq!(failure.listener, ProxyListenerKind::TransparentHttp);
+        assert_eq!(failure.message, "injected connection failure");
+    }
+
+    #[tokio::test]
+    async fn forced_access_flow_drain_joins_aborted_connection_resources() {
+        struct DropWitness(Arc<AtomicBool>);
+
+        impl Drop for DropWitness {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let witness = DropWitness(Arc::clone(&dropped));
+        let mut connections = tokio::task::JoinSet::new();
+        connections.spawn(async move {
+            let _witness = witness;
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        let force = ForwardingCancellation::new();
+        force.cancel();
+
+        drain_access_flow_connections(ProxyListenerKind::TransparentHttp, &force, &mut connections)
+            .await
+            .unwrap();
+
+        assert!(connections.is_empty());
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "forced drain returned before the aborted connection resource dropped"
+        );
     }
 
     #[test]
@@ -1355,11 +1920,13 @@ mod tests {
         StaticListenersConfig {
             explicit_http: None,
             transparent_http: Some(StaticCleartextListener {
-                endpoint: StaticListenerEndpoint::UnixProxyV2 {
-                    path: path.to_path_buf(),
-                    mode,
-                    proxy_header_timeout: Duration::from_secs(1),
+                endpoint: StaticListenerEndpoint::AccessFlow {
+                    admission_timeout: Duration::from_secs(1),
                     allowed_destination_ports: vec![80],
+                    transport: StaticAccessFlowTransport::Unix {
+                        path: path.to_path_buf(),
+                        mode,
+                    },
                 },
                 http_versions: vec![CompiledHttpVersion::Http1],
                 request_header_timeout: Duration::from_secs(1),

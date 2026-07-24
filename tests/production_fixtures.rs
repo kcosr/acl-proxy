@@ -226,10 +226,18 @@ fn sanitized_production_role_structure_matches_difference_record() {
         let endpoint = table(listener, "endpoint");
         assert_eq!(
             endpoint.get("kind").and_then(TomlValue::as_str),
-            Some("unix_proxy_v2")
+            Some("access_flow")
+        );
+        let transport = endpoint
+            .get("transport")
+            .and_then(TomlValue::as_table)
+            .unwrap();
+        assert_eq!(
+            transport.get("kind").and_then(TomlValue::as_str),
+            Some("unix")
         );
         assert_eq!(
-            endpoint.get("mode").and_then(TomlValue::as_str),
+            transport.get("mode").and_then(TomlValue::as_str),
             Some("0600")
         );
     }

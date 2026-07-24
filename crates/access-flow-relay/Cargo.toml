@@ -1,18 +1,18 @@
 [package]
-name = "acl-proxy-transparent-uds-relay"
+name = "acl-proxy-access-flow-relay"
 version.workspace = true
 edition = "2021"
 license = "MIT"
 publish = false
-description = "Linux transparent TCP to Unix socket relay for ACL Proxy"
-
-[features]
-test-seam = []
+description = "ACL Proxy adapter for the shared Linux Access Flow relay"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+access-async-contracts = { path = "../../../access-runtime/crates/access-async-contracts", version = "=0.1.0" }
+access-flow-relay = { path = "../../../access-runtime/crates/access-flow-relay", version = "=0.1.0" }
+access-flow-unix = { path = "../../../access-runtime/crates/access-flow-unix", version = "=0.1.0" }
+access-identity = { path = "../../../access-runtime/crates/access-identity", version = "=0.1.0" }
 humantime = "2.1"
 libc = "0.2"
-proxy-protocol-v2-codec = { path = "../../../access-runtime/crates/proxy-protocol-v2-codec", version = "=0.1.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"

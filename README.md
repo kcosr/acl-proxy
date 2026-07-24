@@ -14,13 +14,13 @@ parser or migration mode.
 
 Release archives contain `acl-proxy`, the capture-body extraction helper, this
 README, `LICENSE`, `THIRD_PARTY_NOTICES`, and `acl-proxy.sample.toml`. Linux
-archives also contain the Linux-only transparent UDS relay. To build locally:
+archives also contain the Linux-only Access Flow relay. To build locally:
 
 ```text
 acl-proxy-<version>-<acl12>/
   bin/acl-proxy
   bin/acl-proxy-extract-capture-body
-  bin/acl-proxy-transparent-uds-relay  # Linux archives only
+  bin/acl-proxy-access-flow-relay  # Linux archives only
   README.md
   LICENSE
   THIRD_PARTY_NOTICES
@@ -148,17 +148,19 @@ http1 = "deny" # deny | mitm
 ```
 
 Transparent HTTP and HTTPS listeners may instead accept a Unix stream carrying
-one strict PROXY Protocol v2 IPv4/STREAM preface followed by the untouched TCP
-stream:
+one strict AW Access Flow preface followed by the untouched TCP stream:
 
 ```toml
 [listeners.transparent_http]
-endpoint.kind = "unix_proxy_v2"
-endpoint.path = "/Users/your-user/Library/Application Support/AW Gateway/runtime/transparent-http.sock"
-endpoint.mode = "0600"
-endpoint.proxy_header_timeout = "2s"
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
 endpoint.allowed_destination_ports = [80]
 http_versions = ["http1"]
+
+[listeners.transparent_http.endpoint.transport]
+kind = "unix"
+path = "/Users/your-user/Library/Application Support/AW Gateway/runtime/transparent-http.sock"
+mode = "0600"
 ```
 
 The workstation host path must be inside a user-writable runtime directory
@@ -193,29 +195,30 @@ stage fails following socket publication. The immediate parent must already
 exist as a real directory owned by the workstation user with no group or other
 permission bits (normally mode `0700`).
 
-Unix-PROXY-v2 ingress represents one local workstation principal. The asserted
-PROXY source is discarded, the effective client is loopback and local for quota
-purposes, and configurations using this transport may not contain
+Access Flow ingress represents one local workstation principal. The effective
+client is loopback and local for quota purposes, and configurations using this
+transport may not contain
 `client_cidrs` predicates. The validated original destination is retained and
 must belong to that endpoint's nonempty `allowed_destination_ports` set. The
 workstation profile uses port 80 for transparent HTTP and port 443 for
 transparent HTTPS. This transport is available on supported Unix hosts. The companion
-`acl-proxy-transparent-uds-relay` artifact is Linux-only because it retrieves
+`acl-proxy-access-flow-relay` artifact is Linux-only because it retrieves
 `SO_ORIGINAL_DST` from redirected TCP connections.
 
 Run the relay with its separate strict JSON configuration:
 
 ```bash
-acl-proxy-transparent-uds-relay --config /etc/acl-proxy/transparent-uds-relay.json
+acl-proxy-access-flow-relay --config /etc/acl-proxy/access-flow-relay.json
 ```
 
-See `examples/transparent-uds-relay.json` for the complete schema and
-`examples/acl-proxy-transparent-uds.toml` for the paired host listeners. Relay
+See `examples/access-flow-relay.json` for the complete schema and
+`examples/acl-proxy-access-flow.toml` for the paired host listeners. Relay
 listener addresses must be unprivileged IPv4 loopback addresses. Route names,
-listeners, original-port sets, and Unix paths are unique. `setupTimeout` covers
-both the Unix connection and complete PROXY preface write. `maxConnections` is
-global across routes, and the relay validates its projected file descriptors
-and `maxConnections * 2 * copyBufferBytesPerDirection` memory before binding.
+listeners are unique. `setupTimeout` covers both the Unix connection and
+complete AW Access Flow preface write. `maxConnections` is global across routes.
+The relay reserves 16 non-relay descriptors from `RLIMIT_NOFILE`, reserves
+2 MiB from its fixed 256 MiB process preflight ceiling, and delegates exact
+checked resource projection to the shared relay engine before binding.
 The relay never parses HTTP or TLS and has no TCP egress fallback.
 The shipped host example requires TLS parent-proxy egress; it does not silently
 fall back to direct origin access.
