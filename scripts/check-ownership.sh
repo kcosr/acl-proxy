@@ -17,6 +17,7 @@ ownership_gates=(
     scripts/check-shared-credential-ownership.sh
     scripts/check-smoke-config-schema.py
     scripts/check-production-websocket-smoke.sh
+    scripts/check-awap-fixtures.py
     scripts/check-transport-oracles.py
 )
 mutation_suites=(
@@ -30,6 +31,7 @@ mutation_suites=(
     scripts/tests/check-shared-credential-ownership-test.sh
     scripts/tests/check-smoke-config-schema-test.sh
     scripts/tests/check-production-websocket-smoke-test.sh
+    scripts/tests/check-awap-fixtures-test.py
     scripts/tests/check-transport-oracles-test.py
 )
 

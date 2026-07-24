@@ -172,6 +172,7 @@ pub(crate) struct AuthorizationDispatchContext<'a> {
     request: crate::authorization::protocol::ProviderRequest<'a>,
     invocation_mode: AuthorizationInvocationMode,
     generation: &'a GenerationLease,
+    cancellation: http_access_runtime::ForwardingCancellation,
 }
 
 impl<'a> AuthorizationDispatchContext<'a> {
@@ -182,6 +183,16 @@ impl<'a> AuthorizationDispatchContext<'a> {
         AuthorizationInvocationMode,
     ) {
         (self.request, self.invocation_mode)
+    }
+
+    pub(crate) fn into_unix_parts(
+        self,
+    ) -> (
+        crate::authorization::protocol::ProviderRequest<'a>,
+        AuthorizationInvocationMode,
+        http_access_runtime::ForwardingCancellation,
+    ) {
+        (self.request, self.invocation_mode, self.cancellation)
     }
 
     pub(crate) fn into_webhook_parts(
@@ -490,6 +501,7 @@ impl GenerationLease {
         provider: ProviderIndex,
         request: crate::authorization::protocol::ProviderRequest<'a>,
         invocation_mode: AuthorizationInvocationMode,
+        cancellation: http_access_runtime::ForwardingCancellation,
         guard: &'a crate::safety::HttpWireBodyGuard,
         request_deadline: tokio::time::Instant,
     ) -> BoxFuture<
@@ -505,6 +517,7 @@ impl GenerationLease {
                 request,
                 invocation_mode,
                 generation: self,
+                cancellation,
             },
             guard,
             request_deadline,

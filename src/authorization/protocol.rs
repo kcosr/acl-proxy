@@ -28,7 +28,7 @@ use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
 use crate::config::compiler::{ProviderOutputPlan, MAX_PROVIDER_CREDENTIAL_BYTES};
-use crate::safety::wire_body::{GuardedAllocationCharge, GuardedScratch};
+use crate::safety::wire_body::{GuardedAllocationCharge, GuardedExactBytes, GuardedScratch};
 use crate::safety::{GuardedBody, HttpWireBodyGuard};
 
 #[cfg(test)]
@@ -356,11 +356,44 @@ impl ProcessProviderCredentials {
     }
 }
 
+pub(crate) struct UnixProviderCredentials {
+    registry_id: u64,
+    values: FallibleBox<[Option<ProcessEffectRange>]>,
+    storage: GuardedExactBytes,
+    _range_charge: GuardedAllocationCharge,
+}
+
+impl UnixProviderCredentials {
+    pub(super) fn new(
+        registry_id: u64,
+        values: FallibleBox<[Option<ProcessEffectRange>]>,
+        storage: GuardedExactBytes,
+        range_charge: GuardedAllocationCharge,
+    ) -> Self {
+        Self {
+            registry_id,
+            values,
+            storage,
+            _range_charge: range_charge,
+        }
+    }
+
+    fn get(&self, index: ProviderOutputIndex) -> Option<&[u8]> {
+        let range = self
+            .values
+            .get(index.get())
+            .filter(|_| self.registry_id == index.registry_id())
+            .and_then(|range| *range)?;
+        self.storage.as_slice().get(range.start..range.end)
+    }
+}
+
 pub(crate) enum ProviderCredentialSet {
     #[cfg(test)]
     Contiguous(ContiguousProviderCredentials),
     Segmented(crate::authorization::callback::CallbackCredentialSet),
     ProcessSegmented(ProcessProviderCredentials),
+    Unix(UnixProviderCredentials),
 }
 
 impl ProviderCredentialSet {
@@ -370,6 +403,7 @@ impl ProviderCredentialSet {
             Self::Contiguous(credentials) => credentials.registry_id,
             Self::Segmented(credentials) => credentials.registry_id(),
             Self::ProcessSegmented(credentials) => credentials.registry_id,
+            Self::Unix(credentials) => credentials.registry_id,
         }
     }
 
@@ -401,7 +435,16 @@ impl ProviderCredentialSet {
             #[cfg(test)]
             Self::Contiguous(_) => None,
             Self::ProcessSegmented(_) => None,
+            Self::Unix(_) => None,
             Self::Segmented(credentials) => credentials.get(index),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unix_contiguous(&self, index: ProviderOutputIndex) -> Option<&[u8]> {
+        match self {
+            Self::Unix(credentials) => credentials.get(index),
+            _ => None,
         }
     }
 
@@ -413,6 +456,10 @@ impl ProviderCredentialSet {
 
     pub(super) fn from_process_segmented(credentials: ProcessProviderCredentials) -> Self {
         Self::ProcessSegmented(credentials)
+    }
+
+    pub(super) fn from_unix(credentials: UnixProviderCredentials) -> Self {
+        Self::Unix(credentials)
     }
 
     #[cfg(test)]
@@ -444,6 +491,9 @@ impl ProviderCredentialSet {
             Self::ProcessSegmented(credentials) => credentials
                 .get(index)
                 .map(ProviderCredentialSegments::Process),
+            Self::Unix(credentials) => credentials
+                .get(index)
+                .map(|value| ProviderCredentialSegments::Unix(Some(value))),
         }
     }
 }
@@ -453,6 +503,7 @@ enum ProviderCredentialSegments<'a> {
     Contiguous(Option<&'a [u8]>),
     Callback(crate::authorization::callback::CallbackCredentialSegments<'a>),
     Process(ProcessEffectSegments<'a>),
+    Unix(Option<&'a [u8]>),
 }
 
 impl<'a> Iterator for ProviderCredentialSegments<'a> {
@@ -464,6 +515,7 @@ impl<'a> Iterator for ProviderCredentialSegments<'a> {
             Self::Contiguous(value) => value.take(),
             Self::Callback(segments) => segments.next(),
             Self::Process(segments) => segments.next(),
+            Self::Unix(value) => value.take(),
         }
     }
 }
@@ -503,6 +555,20 @@ impl fmt::Debug for ProviderCredentialSet {
                         .count(),
                 )
                 .field("charged_bytes", &credentials.storage.charged_bytes())
+                .finish(),
+            Self::Unix(credentials) => formatter
+                .debug_struct("ProviderCredentialSet")
+                .field("representation", &"unix")
+                .field("count", &credentials.values.len())
+                .field(
+                    "present_count",
+                    &credentials
+                        .values
+                        .iter()
+                        .filter(|value| value.is_some())
+                        .count(),
+                )
+                .field("material_bytes", &credentials.storage.as_slice().len())
                 .finish(),
         }
     }
@@ -851,7 +917,7 @@ pub(crate) struct ProviderRequestHeaders<'a> {
 
 const MAX_INCLUDED_HEADER_VALUE_BYTES: usize = 64 * 1024;
 const MAX_INCLUDED_HEADERS_BYTES: usize = 1024 * 1024;
-const MAX_PROVIDER_REQUEST_ID_BYTES: usize = 4096;
+pub(super) const MAX_PROVIDER_REQUEST_ID_BYTES: usize = 4096;
 
 impl<'a> ProviderRequestHeaders<'a> {
     pub(crate) fn new(fields: &'a [IncludedHeader<'a>]) -> Result<Self, RequestShapeError> {

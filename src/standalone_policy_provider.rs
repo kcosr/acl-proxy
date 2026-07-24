@@ -1001,6 +1001,7 @@ impl StandalonePolicyProvider {
                             provider,
                             provider_request,
                             invocation_mode,
+                            terminal.cancellation.capability(),
                             &guard,
                             deadline,
                         )
@@ -1010,6 +1011,7 @@ impl StandalonePolicyProvider {
                     }
                     let decision = match decision {
                         Ok(decision) => decision,
+                        Err(error) if error.is_cancelled() => return Err(503),
                         Err(_) if metadata.failure_mode == CompiledProviderFailureMode::Deny => {
                             let policy_result = resolve_delegate(
                                 generation,

@@ -9,6 +9,7 @@ use access_identity::{
     project_static_resolver_resources, AuthorityId, GroupId, IdentityAudience, IdentityState,
     IdentitySubject, PrincipalId, PrincipalKind, StaticGroup, StaticPrincipal, TokenId,
 };
+use access_rpc_framing::{FrameBodyLimit, FrameKind, FrameProtocol};
 use base64::encoded_len as base64_encoded_len;
 use credential_core::{
     project_credential_resources, CredentialDescriptor, CredentialLimits, CredentialProfile,
@@ -105,6 +106,14 @@ const MAX_PROCESS_PROVIDERS: usize = 64;
 const MAX_PROCESS_BODY_BYTES: usize = GIB;
 const MAX_PROCESS_STDOUT_LINE_BYTES: usize = 16 * MIB;
 const MAX_PROCESS_PENDING_REQUESTS: usize = 4_096;
+const MAX_UNIX_PROVIDER_BODY_BYTES: usize = MIB;
+const MAX_UNIX_PROVIDER_PENDING_REQUESTS: usize = 4_096;
+const MAX_UNIX_PROVIDER_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const UNIX_PROVIDER_MAGIC: [u8; 4] = *b"AWAP";
+const UNIX_PROVIDER_WIRE_VERSION: u8 = 1;
+const MIN_UNIX_PROVIDER_REQUEST_BYTES: usize = br#"{"id":"u0000000000000001","type":"request","requestId":"req-00000000000000000000000000000000","ruleId":"a","invocation":"decision_only","url":"http://a/","method":"A","client":"127.0.0.1:0","headers":{}}"#.len();
+const MIN_UNIX_PROVIDER_RESPONSE_BYTES: usize =
+    br#"{"id":"u0000000000000001","type":"response","decision":"deny"}"#.len();
 const MAX_FORWARDING_BODY_BYTES: usize = GIB;
 const MAX_FORWARDING_TRAILER_COUNT: usize = 65_536;
 const MAX_RUNTIME_BODY_CHUNKS: usize = 65_536;
@@ -722,6 +731,7 @@ impl PendingOperationLimit {
 pub(crate) enum AuthorizationProviderPlan {
     Webhook(WebhookProviderPlan),
     Process(ProcessProviderPlan),
+    UnixSocket(UnixSocketProviderPlan),
 }
 
 #[derive(Clone)]
@@ -764,6 +774,24 @@ pub(crate) struct ProcessProviderPlan {
     pub(crate) max_pending_requests: usize,
     pub(crate) restart_backoff: Duration,
     pub(crate) retire_timeout: Duration,
+    pub(crate) outputs: BTreeMap<String, ProviderOutputPlan>,
+}
+
+#[derive(Clone)]
+pub(crate) struct UnixSocketProviderPlan {
+    pub(crate) socket_path: PathBuf,
+    pub(crate) timeout: Duration,
+    pub(crate) on_failure: CompiledProviderFailureMode,
+    pub(crate) include_headers: Vec<HeaderName>,
+    pub(crate) include_identity: bool,
+    pub(crate) frame_protocol: FrameProtocol,
+    pub(crate) request_frame_bytes: usize,
+    pub(crate) response_frame_bytes: usize,
+    pub(crate) request_allocation_bytes: usize,
+    pub(crate) response_allocation_bytes: usize,
+    pub(crate) max_pending_requests: usize,
+    pub(crate) max_inflight_allocation_bytes: usize,
+    pub(crate) peer_uid: Option<u32>,
     pub(crate) outputs: BTreeMap<String, ProviderOutputPlan>,
 }
 
@@ -1218,6 +1246,7 @@ fn normalize_authored_paths(
                     &format!("authorization.providers.{name}.command"),
                 )?;
             }
+            AuthorizationProviderConfig::UnixSocket(_) => {}
         }
     }
     for (name, source) in &mut config.credentials.sources {
@@ -2072,6 +2101,7 @@ fn validate_protected_identity_locators(
                     )?;
                 }
             }
+            AuthorizationProviderConfig::UnixSocket(_) => {}
         }
     }
 
@@ -3519,6 +3549,7 @@ fn provider_output_destinations(
     let outputs = match provider {
         AuthorizationProviderConfig::Webhook(value) => &value.outputs,
         AuthorizationProviderConfig::Process(value) => &value.outputs,
+        AuthorizationProviderConfig::UnixSocket(value) => &value.outputs,
     };
     if outputs.len() > MAX_PROVIDER_ITEMS {
         return Err(ConfigCompileError::at(path, "contains too many outputs"));
@@ -3647,6 +3678,7 @@ fn validate_provider_security(
         let (headers, is_process) = match provider {
             AuthorizationProviderConfig::Webhook(value) => (&value.include_headers, false),
             AuthorizationProviderConfig::Process(value) => (&value.include_headers, true),
+            AuthorizationProviderConfig::UnixSocket(value) => (&value.include_headers, false),
         };
         if headers.len() > MAX_PROVIDER_ITEMS {
             return Err(ConfigCompileError::at(
@@ -3888,6 +3920,7 @@ fn validate_credential_transport_security(
         let outputs = match provider {
             AuthorizationProviderConfig::Webhook(provider) => &provider.outputs,
             AuthorizationProviderConfig::Process(provider) => &provider.outputs,
+            AuthorizationProviderConfig::UnixSocket(provider) => &provider.outputs,
         };
         for (name, output) in outputs {
             let transport_security = match output {
@@ -4368,7 +4401,185 @@ fn validate_provider_limits(
                     ));
                 }
             }
+            AuthorizationProviderConfig::UnixSocket(value) => {
+                compile_unix_provider_projection(name, value)?;
+                let identity_member_bytes = if value.include_identity {
+                    maximum_provider_identity_member_bytes(config)?
+                } else {
+                    0
+                };
+                let minimum = MIN_UNIX_PROVIDER_REQUEST_BYTES
+                    .checked_add(identity_member_bytes)
+                    .ok_or_else(|| {
+                        ConfigCompileError::at(
+                            format!("authorization.providers.{name}.max_request_bytes"),
+                            "minimum AWAP request-envelope arithmetic overflow",
+                        )
+                    })?;
+                if value.max_request_bytes < minimum {
+                    return Err(ConfigCompileError::at(
+                        format!("authorization.providers.{name}.max_request_bytes"),
+                        format!(
+                            "must be at least {minimum} bytes to fit the provider's minimum AWAP request envelope and complete identity projection"
+                        ),
+                    ));
+                }
+            }
         }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct UnixProviderProjection {
+    frame_protocol: FrameProtocol,
+    request_frame_bytes: usize,
+    response_frame_bytes: usize,
+    request_allocation_bytes: usize,
+    response_allocation_bytes: usize,
+    per_request_allocation_bytes: usize,
+    max_inflight_allocation_bytes: usize,
+}
+
+fn compile_unix_provider_projection(
+    name: &str,
+    value: &super::authoring::UnixSocketProviderConfig,
+) -> Result<UnixProviderProjection, ConfigCompileError> {
+    let prefix = format!("authorization.providers.{name}");
+    validate_unix_provider_socket_path(&value.socket_path, &format!("{prefix}.socket_path"))?;
+    if value.timeout.get() > MAX_UNIX_PROVIDER_TIMEOUT {
+        return Err(ConfigCompileError::at(
+            format!("{prefix}.timeout"),
+            "must not exceed 10 minutes",
+        ));
+    }
+    if value.max_request_bytes < MIN_UNIX_PROVIDER_REQUEST_BYTES {
+        return Err(ConfigCompileError::at(
+            format!("{prefix}.max_request_bytes"),
+            format!(
+                "must be at least {MIN_UNIX_PROVIDER_REQUEST_BYTES} bytes to hold the minimum AWAP request"
+            ),
+        ));
+    }
+    if value.max_response_bytes < MIN_UNIX_PROVIDER_RESPONSE_BYTES {
+        return Err(ConfigCompileError::at(
+            format!("{prefix}.max_response_bytes"),
+            format!(
+                "must be at least {MIN_UNIX_PROVIDER_RESPONSE_BYTES} bytes to hold the minimum AWAP response"
+            ),
+        ));
+    }
+    check_range(
+        &format!("{prefix}.max_request_bytes"),
+        value.max_request_bytes,
+        MAX_UNIX_PROVIDER_BODY_BYTES,
+    )?;
+    check_range(
+        &format!("{prefix}.max_response_bytes"),
+        value.max_response_bytes,
+        MAX_UNIX_PROVIDER_BODY_BYTES,
+    )?;
+    check_range(
+        &format!("{prefix}.max_pending_requests"),
+        value.max_pending_requests,
+        MAX_UNIX_PROVIDER_PENDING_REQUESTS,
+    )?;
+
+    let request_limit = FrameBodyLimit::new(value.max_request_bytes).map_err(|_| {
+        ConfigCompileError::at(
+            format!("{prefix}.max_request_bytes"),
+            "must be a positive AWAP frame body limit",
+        )
+    })?;
+    let response_limit = FrameBodyLimit::new(value.max_response_bytes).map_err(|_| {
+        ConfigCompileError::at(
+            format!("{prefix}.max_response_bytes"),
+            "must be a positive AWAP frame body limit",
+        )
+    })?;
+    let frame_protocol = FrameProtocol::new(
+        UNIX_PROVIDER_MAGIC,
+        UNIX_PROVIDER_WIRE_VERSION,
+        request_limit,
+        response_limit,
+    );
+    let request_frame_bytes = frame_protocol
+        .projected_frame_bytes(FrameKind::Request)
+        .map_err(|_| {
+            ConfigCompileError::at(
+                format!("{prefix}.max_request_bytes"),
+                "AWAP request-frame projection overflow",
+            )
+        })?;
+    let response_frame_bytes = frame_protocol
+        .projected_frame_bytes(FrameKind::Response)
+        .map_err(|_| {
+            ConfigCompileError::at(
+                format!("{prefix}.max_response_bytes"),
+                "AWAP response-frame projection overflow",
+            )
+        })?;
+    let request_allocation_bytes = project_guarded_body_allocation(
+        value.max_request_bytes,
+        &format!("{prefix}.max_request_bytes"),
+        "AWAP request allocation projection overflow",
+    )?;
+    let response_allocation_bytes = project_guarded_body_allocation(
+        value.max_response_bytes,
+        &format!("{prefix}.max_response_bytes"),
+        "AWAP response allocation projection overflow",
+    )?;
+    let credential_allocation_bytes = if value.outputs.is_empty() {
+        0
+    } else {
+        compact_provider_credential_allocation(value.outputs.len(), value.max_response_bytes)?
+    };
+    let per_request_allocation_bytes = request_allocation_bytes
+        .checked_add(response_allocation_bytes)
+        .and_then(|bytes| bytes.checked_add(credential_allocation_bytes))
+        .ok_or_else(|| {
+            ConfigCompileError::at(&prefix, "AWAP per-request allocation projection overflow")
+        })?;
+    let max_inflight_allocation_bytes = per_request_allocation_bytes
+        .checked_mul(value.max_pending_requests)
+        .ok_or_else(|| {
+            ConfigCompileError::at(
+                format!("{prefix}.max_pending_requests"),
+                "AWAP in-flight allocation projection overflow",
+            )
+        })?;
+
+    Ok(UnixProviderProjection {
+        frame_protocol,
+        request_frame_bytes,
+        response_frame_bytes,
+        request_allocation_bytes,
+        response_allocation_bytes,
+        per_request_allocation_bytes,
+        max_inflight_allocation_bytes,
+    })
+}
+
+fn validate_unix_provider_socket_path(path: &Path, field: &str) -> Result<(), ConfigCompileError> {
+    if !path.is_absolute() {
+        return Err(ConfigCompileError::at(field, "must be an absolute path"));
+    }
+    let normalized = lexical_normalize_absolute(path)
+        .ok_or_else(|| ConfigCompileError::at(field, "absolute path could not be normalized"))?;
+    if normalized.as_os_str() != path.as_os_str() || path == Path::new("/") {
+        return Err(ConfigCompileError::at(
+            field,
+            "must be a normalized absolute path to a socket leaf",
+        ));
+    }
+    if unix_socket_path_contains_nul(path) {
+        return Err(ConfigCompileError::at(field, "must not contain a NUL byte"));
+    }
+    if unix_socket_path_bytes(path) > MAX_UNIX_SOCKET_PATH_BYTES {
+        return Err(ConfigCompileError::at(
+            field,
+            format!("must be at most {MAX_UNIX_SOCKET_PATH_BYTES} bytes"),
+        ));
     }
     Ok(())
 }
@@ -5275,6 +5486,14 @@ fn compile_http_rule_schedule_with_redaction(
             _ => None,
         }
     });
+    let unix_provider = rule.authorization_provider.as_ref().and_then(|name| {
+        match config.authorization.providers.get(name) {
+            Some(AuthorizationProviderConfig::UnixSocket(provider)) => {
+                Some((name.as_str(), provider))
+            }
+            _ => None,
+        }
+    });
     let process_body = process_provider.filter(|provider| provider.include_request_body);
     let profile = rule.redaction_profile.as_ref().map(|name| {
         config
@@ -5355,10 +5574,21 @@ fn compile_http_rule_schedule_with_redaction(
             compact_provider_credential_allocation(provider.outputs.len(), callback_bytes)
         })
         .transpose()?;
+    let unix_projection = unix_provider
+        .map(|(name, provider)| compile_unix_provider_projection(name, provider))
+        .transpose()?;
+    let unix_provider_allocation =
+        unix_projection.map(|projection| projection.per_request_allocation_bytes);
     for allocation in [webhook_request_allocation, webhook_callback_allocation]
         .into_iter()
         .flatten()
     {
+        initial_peak = initial_peak.max(allocation);
+        incoming_stages.push(IncomingBodyStage {
+            additional_bytes: allocation,
+        });
+    }
+    if let Some(allocation) = unix_provider_allocation {
         initial_peak = initial_peak.max(allocation);
         incoming_stages.push(IncomingBodyStage {
             additional_bytes: allocation,
@@ -5406,7 +5636,18 @@ fn compile_http_rule_schedule_with_redaction(
             compact_provider_credential_allocation(provider.outputs.len(), continuation_bytes)
         })
         .transpose()?;
-    let credential_allocation = process_credential_allocation.or(webhook_credential_allocation);
+    let unix_credential_allocation = unix_provider
+        .filter(|(_, provider)| !provider.outputs.is_empty())
+        .map(|(_, provider)| {
+            compact_provider_credential_allocation(
+                provider.outputs.len(),
+                provider.max_response_bytes,
+            )
+        })
+        .transpose()?;
+    let credential_allocation = process_credential_allocation
+        .or(webhook_credential_allocation)
+        .or(unix_credential_allocation);
     if let Some(response_continuation_allocation) = response_continuation_allocation {
         initial_peak = initial_peak.max(response_continuation_allocation);
     }
@@ -5455,6 +5696,14 @@ fn compile_http_rule_schedule_with_redaction(
                 allocation,
                 "policy.rules",
                 "webhook body-retention arithmetic overflow",
+            )?);
+        }
+        if let Some(allocation) = unix_provider_allocation {
+            initial_peak = initial_peak.max(checked_add(
+                original_allocation,
+                allocation,
+                "policy.rules",
+                "Unix provider body-retention arithmetic overflow",
             )?);
         }
         if let (Some(callback), Some(credentials)) =
@@ -6006,6 +6255,7 @@ fn compile_credential_finalization_peak(
             let outputs = match config.authorization.providers.get(name) {
                 Some(AuthorizationProviderConfig::Webhook(provider)) => &provider.outputs,
                 Some(AuthorizationProviderConfig::Process(provider)) => &provider.outputs,
+                Some(AuthorizationProviderConfig::UnixSocket(provider)) => &provider.outputs,
                 None => {
                     return Err(ConfigCompileError::at(
                         "policy.rules.authorization_provider",
@@ -7178,6 +7428,28 @@ fn compile_provider_plan(
                 max_pending_requests: value.max_pending_requests,
                 restart_backoff: value.restart_backoff.get(),
                 retire_timeout: value.retire_timeout.get(),
+                outputs: compile_provider_outputs(&value.outputs, &format!("{prefix}.outputs"))?,
+            })
+        }
+        AuthorizationProviderConfig::UnixSocket(value) => {
+            let projection = compile_unix_provider_projection(name, value)?;
+            AuthorizationProviderPlan::UnixSocket(UnixSocketProviderPlan {
+                socket_path: value.socket_path.clone(),
+                timeout: value.timeout.get(),
+                on_failure: compile_provider_failure(value.on_failure),
+                include_headers: compile_header_names(
+                    &value.include_headers,
+                    &format!("{prefix}.include_headers"),
+                )?,
+                include_identity: value.include_identity,
+                frame_protocol: projection.frame_protocol,
+                request_frame_bytes: projection.request_frame_bytes,
+                response_frame_bytes: projection.response_frame_bytes,
+                request_allocation_bytes: projection.request_allocation_bytes,
+                response_allocation_bytes: projection.response_allocation_bytes,
+                max_pending_requests: value.max_pending_requests,
+                max_inflight_allocation_bytes: projection.max_inflight_allocation_bytes,
+                peer_uid: value.peer_uid,
                 outputs: compile_provider_outputs(&value.outputs, &format!("{prefix}.outputs"))?,
             })
         }
@@ -9688,6 +9960,327 @@ command = "/bin/authorize"
         }
     }
 
+    fn unix_socket_provider_config() -> String {
+        MINIMAL.replace(
+            "[policy]",
+            r#"[authorization.providers.local]
+kind = "unix_socket"
+socket_path = "/run/acl-proxy/authorization.sock"
+timeout = "2s"
+on_failure = "deny"
+include_headers = ["x-safe-provider-input"]
+include_identity = true
+max_request_bytes = 262144
+max_response_bytes = 65536
+max_pending_requests = 128
+peer_uid = 501
+
+[authorization.providers.local.outputs.api_token]
+kind = "bearer"
+transport_security = "tls_required"
+required = true
+
+[policy]"#,
+        )
+    }
+
+    fn identity_unix_socket_provider_config(max_request_bytes: usize) -> String {
+        unix_socket_provider_config()
+            .replace(
+                "max_request_bytes = 262144",
+                &format!("max_request_bytes = {max_request_bytes}"),
+            )
+            .replace(
+                "[listeners.explicit_http.connect]",
+                r#"[listeners.explicit_http.identity]
+mode = "required"
+
+[identity]
+max_pending_authentications = 8
+max_pending_authentications_per_connection = 2
+
+[identity.resolver]
+kind = "static"
+authority = "test-authority"
+
+[[identity.resolver.principals]]
+id = "test-principal"
+kind = "service_account"
+
+[[identity.resolver.groups]]
+id = "developers"
+members = ["test-principal"]
+
+[[identity.resolver.tokens]]
+id = "test-token"
+principal = "test-principal"
+source = "environment"
+variable = "AW_IDENTITY_TOKEN"
+
+[listeners.explicit_http.connect]"#,
+            )
+    }
+
+    #[test]
+    fn unix_socket_provider_compiles_exact_path_framing_allocations_and_outputs() {
+        let compiled = compile(&unix_socket_provider_config()).unwrap();
+        let provider = match &compiled.reloadable_plan.authorization.providers["local"] {
+            AuthorizationProviderPlan::UnixSocket(provider) => provider,
+            AuthorizationProviderPlan::Webhook(_) | AuthorizationProviderPlan::Process(_) => {
+                panic!("expected Unix socket provider")
+            }
+        };
+        assert_eq!(
+            provider.socket_path,
+            PathBuf::from("/run/acl-proxy/authorization.sock")
+        );
+        assert_eq!(provider.timeout, Duration::from_secs(2));
+        assert!(provider.on_failure == CompiledProviderFailureMode::Deny);
+        assert_eq!(
+            provider.include_headers,
+            [HeaderName::from_static("x-safe-provider-input")]
+        );
+        assert!(provider.include_identity);
+        assert_eq!(provider.frame_protocol.magic(), UNIX_PROVIDER_MAGIC);
+        assert_eq!(
+            provider.frame_protocol.version(),
+            UNIX_PROVIDER_WIRE_VERSION
+        );
+        assert_eq!(provider.frame_protocol.request_limit().get(), 262_144);
+        assert_eq!(provider.frame_protocol.response_limit().get(), 65_536);
+        assert_eq!(provider.request_frame_bytes, 262_144 + 10);
+        assert_eq!(provider.response_frame_bytes, 65_536 + 10);
+        assert_eq!(provider.request_allocation_bytes, guarded(262_144));
+        assert_eq!(provider.response_allocation_bytes, guarded(65_536));
+        assert_eq!(provider.max_pending_requests, 128);
+        assert_eq!(provider.peer_uid, Some(501));
+        assert_eq!(provider.outputs.len(), 1);
+        assert!(matches!(
+            provider.outputs["api_token"],
+            ProviderOutputPlan::Bearer {
+                required: true,
+                transport_security: CompiledTransportSecurity::TlsRequired
+            }
+        ));
+        let credential_allocation = compact_provider_credential_allocation(1, 65_536).unwrap();
+        assert_eq!(
+            provider.max_inflight_allocation_bytes,
+            128 * (guarded(262_144) + guarded(65_536) + credential_allocation)
+        );
+    }
+
+    #[test]
+    fn unix_socket_provider_schedule_adds_request_response_and_credential_relocation() {
+        let input = format!(
+            r#"{}
+
+[[policy.rules]]
+id = "unix-provider"
+decision = "delegate"
+methods = ["GET"]
+authorization_provider = "local"
+"#,
+            unix_socket_provider_config()
+                .replace("include_identity = true", "include_identity = false")
+                .replace(
+                    "max_request_bytes = 262144",
+                    &format!("max_request_bytes = {MIN_UNIX_PROVIDER_REQUEST_BYTES}"),
+                )
+                .replace(
+                    "max_response_bytes = 65536",
+                    &format!("max_response_bytes = {MIN_UNIX_PROVIDER_RESPONSE_BYTES}"),
+                )
+        );
+        let authored: super::super::authoring::AuthoringConfig = toml::from_str(&input).unwrap();
+        let schedule = compile_http_rule_schedule(&authored, &authored.policy.rules[0]).unwrap();
+        let credential_allocation =
+            compact_provider_credential_allocation(1, MIN_UNIX_PROVIDER_RESPONSE_BYTES).unwrap();
+        let provider_peak = guarded(MIN_UNIX_PROVIDER_REQUEST_BYTES)
+            + guarded(MIN_UNIX_PROVIDER_RESPONSE_BYTES)
+            + credential_allocation;
+        let finalization_peak =
+            compile_credential_finalization_peak(&authored, Some(&authored.policy.rules[0]))
+                .unwrap();
+
+        assert_eq!(schedule.initial_peak, provider_peak + finalization_peak);
+        assert_eq!(
+            schedule.max_incoming_additional_bytes(),
+            provider_peak + finalization_peak
+        );
+    }
+
+    #[test]
+    fn unix_socket_provider_rejects_path_limit_header_and_nonprocess_crossovers() {
+        let baseline = unix_socket_provider_config();
+        for (name, input, path) in [
+            (
+                "relative path",
+                baseline.replace(
+                    "/run/acl-proxy/authorization.sock",
+                    "run/acl-proxy/authorization.sock",
+                ),
+                "authorization.providers.local.socket_path",
+            ),
+            (
+                "non-normalized path",
+                baseline.replace(
+                    "/run/acl-proxy/authorization.sock",
+                    "/run/acl-proxy/../authorization.sock",
+                ),
+                "authorization.providers.local.socket_path",
+            ),
+            (
+                "path with duplicate separator",
+                baseline.replace(
+                    "/run/acl-proxy/authorization.sock",
+                    "/run//acl-proxy/authorization.sock",
+                ),
+                "authorization.providers.local.socket_path",
+            ),
+            (
+                "path with current-directory component",
+                baseline.replace(
+                    "/run/acl-proxy/authorization.sock",
+                    "/run/./acl-proxy/authorization.sock",
+                ),
+                "authorization.providers.local.socket_path",
+            ),
+            (
+                "path with trailing separator",
+                baseline.replace(
+                    "/run/acl-proxy/authorization.sock",
+                    "/run/acl-proxy/authorization.sock/",
+                ),
+                "authorization.providers.local.socket_path",
+            ),
+            (
+                "root path",
+                baseline.replace("/run/acl-proxy/authorization.sock", "/"),
+                "authorization.providers.local.socket_path",
+            ),
+            (
+                "request limit below minimum envelope",
+                baseline.replace(
+                    "max_request_bytes = 262144",
+                    &format!(
+                        "max_request_bytes = {}",
+                        MIN_UNIX_PROVIDER_REQUEST_BYTES - 1
+                    ),
+                ),
+                "authorization.providers.local.max_request_bytes",
+            ),
+            (
+                "oversized request limit",
+                baseline.replace(
+                    "max_request_bytes = 262144",
+                    &format!("max_request_bytes = {}", MAX_UNIX_PROVIDER_BODY_BYTES + 1),
+                ),
+                "authorization.providers.local.max_request_bytes",
+            ),
+            (
+                "response limit below minimum envelope",
+                baseline.replace(
+                    "max_response_bytes = 65536",
+                    &format!(
+                        "max_response_bytes = {}",
+                        MIN_UNIX_PROVIDER_RESPONSE_BYTES - 1
+                    ),
+                ),
+                "authorization.providers.local.max_response_bytes",
+            ),
+            (
+                "zero pending limit",
+                baseline.replace("max_pending_requests = 128", "max_pending_requests = 0"),
+                "authorization.providers.local.max_pending_requests",
+            ),
+            (
+                "oversized pending limit",
+                baseline.replace(
+                    "max_pending_requests = 128",
+                    &format!(
+                        "max_pending_requests = {}",
+                        MAX_UNIX_PROVIDER_PENDING_REQUESTS + 1
+                    ),
+                ),
+                "authorization.providers.local.max_pending_requests",
+            ),
+            (
+                "oversized timeout",
+                baseline.replace("timeout = \"2s\"", "timeout = \"601s\""),
+                "authorization.providers.local.timeout",
+            ),
+            (
+                "protected header",
+                baseline.replace("x-safe-provider-input", "authorization"),
+                "authorization.providers.local.include_headers[0]",
+            ),
+        ] {
+            let error = compile(&input).expect_err(name);
+            assert_eq!(error.path, path, "{name}: {error}");
+        }
+
+        compile(
+            &baseline
+                .replace("include_identity = true", "include_identity = false")
+                .replace(
+                    "max_request_bytes = 262144",
+                    &format!("max_request_bytes = {MIN_UNIX_PROVIDER_REQUEST_BYTES}"),
+                )
+                .replace(
+                    "max_response_bytes = 65536",
+                    &format!("max_response_bytes = {MIN_UNIX_PROVIDER_RESPONSE_BYTES}"),
+                ),
+        )
+        .expect("exact minimum AWAP envelopes compile");
+
+        let oversized_path = format!("/{}", "p".repeat(MAX_UNIX_SOCKET_PATH_BYTES));
+        let error =
+            compile(&baseline.replace("/run/acl-proxy/authorization.sock", &oversized_path))
+                .expect_err("Unix socket paths are target bounded");
+        assert_eq!(error.path, "authorization.providers.local.socket_path");
+
+        let inbound = baseline.replace(
+            "[policy]",
+            r#"[credentials.inbound.provider_input]
+header = "x-safe-provider-input"
+process_providers = ["local"]
+
+[policy]"#,
+        );
+        let error = compile(&inbound)
+            .expect_err("Unix providers do not acquire process-only inbound credentials");
+        assert_eq!(
+            error.path,
+            "credentials.inbound.provider_input.process_providers"
+        );
+        assert!(error.message.contains("must name a process provider"));
+    }
+
+    #[test]
+    fn unix_socket_provider_identity_projection_uses_the_shared_exact_outer_object_bound() {
+        let authored: super::super::authoring::AuthoringConfig =
+            toml::from_str(&identity_unix_socket_provider_config(262_144)).unwrap();
+        let projection = compile_identity_plan(authored.identity.as_ref())
+            .unwrap()
+            .unwrap()
+            .resources
+            .max_provider_projection_bytes;
+        let identity_member = maximum_provider_identity_member_bytes(&authored).unwrap();
+        assert_eq!(u64::try_from(identity_member + 1).unwrap(), projection);
+
+        let minimum = MIN_UNIX_PROVIDER_REQUEST_BYTES
+            .checked_add(identity_member)
+            .unwrap();
+        compile(&identity_unix_socket_provider_config(minimum))
+            .expect("the exact complete identity projection boundary must compile");
+        let error = compile(&identity_unix_socket_provider_config(minimum - 1))
+            .expect_err("one byte below the complete identity projection must fail");
+        assert!(
+            error.to_string().contains(&format!("at least {minimum}")),
+            "{error}"
+        );
+    }
+
     #[test]
     fn webhook_minimum_request_envelope_limits_compile() {
         const CALLBACK_URL: &str = "http://127.0.0.1:8898/_acl-proxy/external-auth/callback";
@@ -9696,7 +10289,9 @@ command = "/bin/authorize"
             .expect("the exact compact request-envelope floor must compile");
         let provider = match &compiled.reloadable_plan.authorization.providers["approval"] {
             AuthorizationProviderPlan::Webhook(provider) => provider,
-            AuthorizationProviderPlan::Process(_) => panic!("expected webhook provider"),
+            AuthorizationProviderPlan::Process(_) | AuthorizationProviderPlan::UnixSocket(_) => {
+                panic!("expected webhook provider")
+            }
         };
         assert_eq!(provider.max_request_bytes, minimum);
 
@@ -11040,6 +11635,12 @@ filename = "{{requestId}}-{{suffix}}.json"
                     provider.command.display(),
                     provider.max_pending_requests
                 ),
+                AuthorizationProviderPlan::UnixSocket(provider) => format!(
+                    "{name}:unix_socket:{}:{}:{}",
+                    provider.frame_protocol.request_limit().get(),
+                    provider.frame_protocol.response_limit().get(),
+                    provider.max_pending_requests
+                ),
             })
             .collect::<Vec<_>>()
             .join(",");
@@ -12097,6 +12698,16 @@ include_headers = ["x-aw-identity-token"]
 kind = "webhook"
 url = "https://approval.example.test/authorize"
 include_headers = ["x-aw-identity-token"]
+"#,
+            r#"[authorization.providers.local]
+kind = "unix_socket"
+socket_path = "/run/acl-proxy/authorization.sock"
+timeout = "2s"
+on_failure = "deny"
+include_headers = ["x-aw-identity-token"]
+max_request_bytes = 262144
+max_response_bytes = 65536
+max_pending_requests = 128
 "#,
         ] {
             let input = MINIMAL.replace("[policy]", &format!("{provider}\n[policy]"));

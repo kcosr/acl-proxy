@@ -60,6 +60,7 @@ access-async-contracts = { path = "../access-runtime/crates/access-async-contrac
 access-flow = { path = "../access-runtime/crates/access-flow", version = "=0.1.0" }
 access-flow-unix = { path = "../access-runtime/crates/access-flow-unix", version = "=0.1.0" }
 access-identity = { path = "../access-runtime/crates/access-identity", version = "=0.1.0" }
+access-rpc-framing = { path = "../access-runtime/crates/access-rpc-framing", version = "=0.1.0" }
 http-access-types = { path = "../access-runtime/crates/http-access-types", version = "=0.1.0" }
 http-access-url = { path = "../access-runtime/crates/http-access-url", version = "=0.1.0" }
 http-access-runtime = { path = "../access-runtime/crates/http-access-runtime", version = "=0.1.0" }

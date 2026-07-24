@@ -209,6 +209,7 @@ impl PolicyDump {
                 let outputs = match provider {
                     AuthorizationProviderPlan::Webhook(provider) => &provider.outputs,
                     AuthorizationProviderPlan::Process(provider) => &provider.outputs,
+                    AuthorizationProviderPlan::UnixSocket(provider) => &provider.outputs,
                 };
                 (
                     provider_name.clone(),
@@ -692,6 +693,59 @@ credential = "file_source"
             .mutations
             .contains("credential:bearer:environment_source:tls_required"));
         assert!(!rows[0].mutations.contains("literal-secret-value"));
+    }
+
+    #[test]
+    fn unix_provider_dump_projects_outputs_without_disclosing_socket_path() {
+        let input = r#"schema_version = 3
+
+[listeners.explicit_http]
+endpoint.kind = "tcp"
+endpoint.address = "127.0.0.1:8881"
+http_versions = ["http1"]
+
+[listeners.explicit_http.connect]
+http1 = "deny"
+
+[authorization.providers.local]
+kind = "unix_socket"
+socket_path = "/run/private/authorization-provider.sock"
+timeout = "2s"
+on_failure = "deny"
+include_headers = []
+max_request_bytes = 262144
+max_response_bytes = 65536
+max_pending_requests = 128
+
+[authorization.providers.local.outputs.api_token]
+kind = "bearer"
+transport_security = "tls_required"
+required = true
+
+[policy]
+default = "deny"
+"#;
+        let compiled = compile_config_text(ConfigTextInput {
+            text: input,
+            source_path: Path::new("/etc/acl-proxy/acl-proxy.toml"),
+            config_root: Path::new("/etc/acl-proxy"),
+        })
+        .unwrap();
+        let json = serde_json::to_string(&PolicyDump::from_compiled(&compiled)).unwrap();
+        assert!(!json.contains("/run/private/authorization-provider.sock"));
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["provider_credential_outputs"]["local"]["api_token"]["kind"],
+            "bearer"
+        );
+        assert_eq!(
+            value["provider_credential_outputs"]["local"]["api_token"]["transport_security"],
+            "tls_required"
+        );
+        assert_eq!(
+            value["provider_credential_outputs"]["local"]["api_token"]["required"],
+            true
+        );
     }
 
     #[test]

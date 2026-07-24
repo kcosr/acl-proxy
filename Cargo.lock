@@ -63,6 +63,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "access-rpc-framing"
+version = "0.1.0"
+dependencies = [
+ "access-async-contracts",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "acl-proxy"
 version = "0.3.0-rc.1"
 dependencies = [
@@ -70,6 +79,7 @@ dependencies = [
  "access-flow",
  "access-flow-unix",
  "access-identity",
+ "access-rpc-framing",
  "allocator-api2",
  "arc-swap",
  "assert_cmd",

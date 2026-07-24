@@ -516,13 +516,55 @@ detaches into another process group is outside that authority.
 Webhook providers require a control listener and a canonical public callback
 URL. Control routes are never exposed by a data listener.
 
+Unix authorization providers connect to a separately managed local service for
+each selected request. They use one bounded `AWAP` version 1 request/response
+exchange over the shared access RPC frame, without a callback listener,
+connection pool, retry, request body, or dynamic credential destination:
+
+```toml
+[authorization.providers.repo_acl]
+kind = "unix_socket"
+socket_path = "/run/acl-proxy/repo-authorization.sock"
+timeout = "2s"
+on_failure = "deny"
+include_headers = ["x-workload-id"]
+include_identity = true
+max_request_bytes = 262144
+max_response_bytes = 65536
+max_pending_requests = 128
+peer_uid = 1000
+
+[authorization.providers.repo_acl.outputs.access_token]
+kind = "bearer"
+transport_security = "tls_required"
+required = true
+```
+
+All fields shown above except `include_identity`, `peer_uid`, and `outputs` are
+required. `include_identity` defaults to false, `peer_uid` is optional, and an
+omitted `outputs` table is empty. The socket path is absolute and normalized.
+Activation validates the platform and optional peer-UID capability but never
+probes or connects to the socket. Socket loss affects only requests selecting
+that provider; rebinding the same path lets later requests recover.
+
+AWAP requests contain the exact matched `ruleId`, invocation mode, canonical
+URL and method, fixed workstation client, mandatory header object, and checked
+identity only when selected. They never contain the raw identity bearer,
+request body, caller credentials, provider configuration, or output
+destinations. Responses echo the protocol request ID and return `allow`,
+`deny`, or `pass`; only an effects-allowed `allow` may carry values declared by
+the active configuration. Returned values are authorization effects passed to
+the existing late credential-injection boundary. AWAP is not a credential
+lookup protocol.
+
 #### Outer CONNECT Decisions
 
 When an HTTP/1 CONNECT is selected for MITM, a matching delegated policy rule
-still calls its process or webhook provider before the tunnel is established.
-This synthetic outer request is decision-only: the provider request has
-`method = "CONNECT"`, uses the canonical HTTPS root URL for the CONNECT
-authority, and never contains a body, even when the provider is configured
+still calls its process, webhook, or Unix provider before the tunnel is
+established. This synthetic outer request is decision-only: the provider
+request has `method = "CONNECT"`, uses the canonical HTTPS root URL for the
+CONNECT authority, and never contains a body, even when the provider is
+configured
 with `include_request_body = true`.
 
 The provider must return only `allow`, `deny`, or `pass`. An `allow` response

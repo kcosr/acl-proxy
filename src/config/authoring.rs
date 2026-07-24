@@ -905,10 +905,11 @@ fn default_max_pending_operations() -> usize {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum AuthorizationProviderConfig {
     Webhook(WebhookProviderConfig),
     Process(ProcessProviderConfig),
+    UnixSocket(UnixSocketProviderConfig),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1003,6 +1004,28 @@ pub(super) struct ProcessProviderConfig {
 
     #[serde(default = "default_retire_timeout")]
     pub retire_timeout: PositiveDuration,
+
+    #[serde(default)]
+    pub outputs: BTreeMap<String, ProviderOutputConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct UnixSocketProviderConfig {
+    pub socket_path: PathBuf,
+    pub timeout: PositiveDuration,
+    pub on_failure: ProviderFailureMode,
+    pub include_headers: Vec<String>,
+
+    #[serde(default)]
+    pub include_identity: bool,
+
+    pub max_request_bytes: usize,
+    pub max_response_bytes: usize,
+    pub max_pending_requests: usize,
+
+    #[serde(default)]
+    pub peer_uid: Option<u32>,
 
     #[serde(default)]
     pub outputs: BTreeMap<String, ProviderOutputConfig>,
@@ -1926,7 +1949,10 @@ max_inflight_body_bytes = 134217728
         assert_eq!(parsed.credentials.inbound.len(), 1);
         let webhook = match &parsed.authorization.providers["approval"] {
             AuthorizationProviderConfig::Webhook(webhook) => webhook,
-            AuthorizationProviderConfig::Process(_) => panic!("expected webhook provider"),
+            AuthorizationProviderConfig::Process(_)
+            | AuthorizationProviderConfig::UnixSocket(_) => {
+                panic!("expected webhook provider")
+            }
         };
         assert_eq!(webhook.timeout.get(), Duration::from_secs(30));
         assert_eq!(webhook.on_failure, ProviderFailureMode::Deny);
@@ -1935,7 +1961,10 @@ max_inflight_body_bytes = 134217728
 
         let process = match &parsed.authorization.providers["local"] {
             AuthorizationProviderConfig::Process(process) => process,
-            AuthorizationProviderConfig::Webhook(_) => panic!("expected process provider"),
+            AuthorizationProviderConfig::Webhook(_)
+            | AuthorizationProviderConfig::UnixSocket(_) => {
+                panic!("expected process provider")
+            }
         };
         assert!(process.include_request_body);
         assert!(process.allow_request_body_replacement);
@@ -1959,6 +1988,98 @@ max_inflight_body_bytes = 134217728
         assert_eq!(capture.redaction_profile, "secrets");
         assert_eq!(capture.max_inflight_body_bytes, 128 * 1024 * 1024);
         assert_eq!(capture.max_pending_records, 1024);
+    }
+
+    #[test]
+    fn unix_socket_provider_has_one_strict_required_shape_and_closed_defaults() {
+        let input = format!(
+            r#"{MINIMAL}
+
+[authorization.providers.local]
+kind = "unix_socket"
+socket_path = "/run/acl-proxy/authorization.sock"
+timeout = "2s"
+on_failure = "deny"
+include_headers = []
+max_request_bytes = 262144
+max_response_bytes = 65536
+max_pending_requests = 128
+"#
+        );
+        let parsed: AuthoringConfig = toml::from_str(&input).unwrap();
+        let provider = match &parsed.authorization.providers["local"] {
+            AuthorizationProviderConfig::UnixSocket(provider) => provider,
+            AuthorizationProviderConfig::Webhook(_) | AuthorizationProviderConfig::Process(_) => {
+                panic!("expected Unix socket provider")
+            }
+        };
+        assert_eq!(
+            provider.socket_path,
+            PathBuf::from("/run/acl-proxy/authorization.sock")
+        );
+        assert_eq!(provider.timeout.get(), Duration::from_secs(2));
+        assert_eq!(provider.on_failure, ProviderFailureMode::Deny);
+        assert!(provider.include_headers.is_empty());
+        assert!(!provider.include_identity);
+        assert_eq!(provider.max_request_bytes, 262_144);
+        assert_eq!(provider.max_response_bytes, 65_536);
+        assert_eq!(provider.max_pending_requests, 128);
+        assert_eq!(provider.peer_uid, None);
+        assert!(provider.outputs.is_empty());
+    }
+
+    #[test]
+    fn unix_socket_provider_rejects_missing_alias_mixed_remote_and_body_fields() {
+        const REQUIRED: &str = r#"
+[authorization.providers.local]
+kind = "unix_socket"
+socket_path = "/run/acl-proxy/authorization.sock"
+timeout = "2s"
+on_failure = "deny"
+include_headers = []
+max_request_bytes = 262144
+max_response_bytes = 65536
+max_pending_requests = 128
+"#;
+        for field in [
+            "socket_path",
+            "timeout",
+            "on_failure",
+            "include_headers",
+            "max_request_bytes",
+            "max_response_bytes",
+            "max_pending_requests",
+        ] {
+            let removed = REQUIRED
+                .lines()
+                .filter(|line| !line.starts_with(&format!("{field} =")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            toml::from_str::<AuthoringConfig>(&format!("{MINIMAL}\n{removed}"))
+                .expect_err("every operational Unix provider field is required");
+        }
+
+        let alias = REQUIRED.replace("kind = \"unix_socket\"", "kind = \"unix\"");
+        toml::from_str::<AuthoringConfig>(&format!("{MINIMAL}\n{alias}"))
+            .expect_err("the Unix provider kind has no alias");
+
+        for unsupported in [
+            "socket = \"/run/provider.sock\"",
+            "url = \"https://provider.example.test\"",
+            "host = \"provider.example.test\"",
+            "port = 443",
+            "command = \"/bin/provider\"",
+            "tls = {}",
+            "include_request_body = true",
+            "allow_request_body_replacement = true",
+            "max_request_body_bytes = 1024",
+            "max_stdout_line_bytes = 1024",
+            "restart_backoff = \"1s\"",
+        ] {
+            let mixed = format!("{MINIMAL}\n{REQUIRED}\n{unsupported}\n");
+            toml::from_str::<AuthoringConfig>(&mixed)
+                .expect_err("unsupported Unix provider fields must remain closed");
+        }
     }
 
     #[test]

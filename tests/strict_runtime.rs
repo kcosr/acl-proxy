@@ -4,10 +4,15 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use access_rpc_framing::{
+    receive_sensitive_request, FrameBodyLimit, FrameProtocol, SensitiveFrameBody,
+};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -267,6 +272,32 @@ fn proxy_request(proxy: SocketAddr, method: &str, url: &str, body: &[u8]) -> Htt
             ("X-Test-Input", "included"),
             ("X-Aw-Identity-Token", "abcdefghijklmnopqrstuvwxyzABCDEF"),
         ],
+        body,
+        true,
+    )
+}
+
+fn anonymous_proxy_request(proxy: SocketAddr, method: &str, url: &str) -> HttpResponse {
+    anonymous_proxy_request_with_body(proxy, method, url, &[])
+}
+
+fn anonymous_proxy_request_with_body(
+    proxy: SocketAddr,
+    method: &str,
+    url: &str,
+    body: &[u8],
+) -> HttpResponse {
+    let host = url
+        .strip_prefix("http://")
+        .and_then(|rest| rest.split('/').next())
+        .expect("test URL authority");
+    let mut stream = connect(proxy);
+    send_request(
+        &mut stream,
+        method,
+        url,
+        host,
+        &[("Content-Type", "text/plain")],
         body,
         true,
     )
@@ -735,6 +766,224 @@ fn start_proxy(config: &Path) -> ChildGuard {
     ChildGuard::new(child, libc::SIGTERM)
 }
 
+fn start_unix_authorization_provider(
+    socket_path: &Path,
+    expected_requests: usize,
+) -> JoinHandle<()> {
+    let listener = StdUnixListener::bind(socket_path).expect("bind Unix authorization provider");
+    listener.set_nonblocking(true).unwrap();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+            let protocol = FrameProtocol::new(
+                *b"AWAP",
+                1,
+                FrameBodyLimit::new(65_536).unwrap(),
+                FrameBodyLimit::new(65_536).unwrap(),
+            );
+            for _ in 0..expected_requests {
+                let (stream, _) = listener.accept().await.unwrap();
+                let cancellation = http_access_runtime::ForwardingCancellation::new();
+                let received = receive_sensitive_request(
+                    stream,
+                    protocol,
+                    Instant::now() + PROCESS_TIMEOUT,
+                    &cancellation,
+                )
+                .await
+                .unwrap();
+                let request: Value = received
+                    .body()
+                    .expose(|bytes| serde_json::from_slice(bytes))
+                    .unwrap();
+                assert_eq!(request["type"], "request");
+                assert_eq!(request["ruleId"], "unix-live");
+                assert_eq!(request["invocation"], "effects_allowed");
+                assert_eq!(request["client"], "127.0.0.1:0");
+                assert_eq!(request["headers"], json!({}));
+                assert!(request.get("identity").is_none());
+                assert!(request.get("body").is_none());
+
+                let path = request["url"]
+                    .as_str()
+                    .and_then(|url| url.split_once("://"))
+                    .and_then(|(_, rest)| rest.find('/').map(|offset| &rest[offset..]))
+                    .expect("AWAP request has a canonical URL path");
+                assert_eq!(
+                    request["method"],
+                    if path == "/unix-body" { "POST" } else { "GET" }
+                );
+                let decision = match path {
+                    "/unix-pass" => json!({
+                        "id": request["id"],
+                        "type": "response",
+                        "decision": "pass",
+                    }),
+                    "/unix-allow" => json!({
+                        "id": request["id"],
+                        "type": "response",
+                        "decision": "allow",
+                        "values": {"api_token": "unix-typed-secret"},
+                    }),
+                    "/unix-body" => json!({
+                        "id": request["id"],
+                        "type": "response",
+                        "decision": "allow",
+                        "values": {"api_token": "unix-typed-secret"},
+                    }),
+                    _ => panic!("unexpected Unix provider request URL: {}", request["url"]),
+                };
+                let response =
+                    SensitiveFrameBody::new(serde_json::to_vec(&decision).unwrap()).unwrap();
+                received.respond_sensitive(&response).await.unwrap();
+            }
+        });
+    })
+}
+
+fn unix_authorization_config(
+    data: SocketAddr,
+    control: SocketAddr,
+    origin: SocketAddr,
+    live_socket: &Path,
+    missing_deny_socket: &Path,
+    missing_error_socket: &Path,
+) -> String {
+    format!(
+        r#"schema_version = 3
+
+[service]
+request_timeout = "5s"
+shutdown_drain_timeout = "2s"
+max_retiring_generations = 2
+
+[control]
+bind = "{control}"
+base_path = "/_acl-proxy"
+request_header_timeout = "1s"
+request_body_timeout = "2s"
+max_connections = 8
+max_request_body_bytes = 65536
+
+[listeners.explicit_http]
+endpoint.kind = "tcp"
+endpoint.address = "{data}"
+http_versions = ["http1"]
+request_header_timeout = "2s"
+max_connections = 16
+max_concurrent_streams = 16
+
+[listeners.explicit_http.connect]
+http1 = "deny"
+
+[authorization.providers.unix_live]
+kind = "unix_socket"
+socket_path = "{}"
+timeout = "2s"
+on_failure = "deny"
+include_headers = []
+max_request_bytes = 65536
+max_response_bytes = 65536
+max_pending_requests = 4
+
+[authorization.providers.unix_live.outputs.api_token]
+kind = "custom_header"
+transport_security = "cleartext_allowed"
+header = "x-provider-token"
+required = true
+
+[authorization.providers.missing_deny]
+kind = "unix_socket"
+socket_path = "{}"
+timeout = "250ms"
+on_failure = "deny"
+include_headers = []
+max_request_bytes = 65536
+max_response_bytes = 65536
+max_pending_requests = 1
+
+[authorization.providers.missing_error]
+kind = "unix_socket"
+socket_path = "{}"
+timeout = "250ms"
+on_failure = "error"
+include_headers = []
+max_request_bytes = 65536
+max_response_bytes = 65536
+max_pending_requests = 1
+
+[credentials]
+allowed_custom_headers = ["x-provider-token"]
+
+[egress]
+route = "direct"
+
+[egress.origin_tls]
+trust = "system"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "unix-live"
+decision = "delegate"
+urls = ["http://{origin}/unix-pass", "http://{origin}/unix-allow", "http://{origin}/unix-body"]
+methods = ["GET", "POST"]
+authorization_provider = "unix_live"
+
+[[policy.rules.response_headers]]
+operation = "set"
+when = "always"
+name = "x-unix-delegate-effect"
+value = "applied"
+
+[[policy.rules]]
+id = "after-unix-pass"
+decision = "allow"
+urls = ["http://{origin}/unix-pass"]
+
+[[policy.rules.response_headers]]
+operation = "set"
+when = "always"
+name = "x-unix-pass-successor"
+value = "applied"
+
+[[policy.rules]]
+id = "missing-deny"
+decision = "delegate"
+urls = ["http://{origin}/missing-deny"]
+authorization_provider = "missing_deny"
+
+[[policy.rules]]
+id = "missing-error"
+decision = "delegate"
+urls = ["http://{origin}/missing-error"]
+authorization_provider = "missing_error"
+
+[[policy.rules]]
+id = "unrelated"
+decision = "allow"
+urls = ["http://{origin}/unrelated"]
+
+[observation.logging]
+level = "info"
+directory = "logs"
+console = false
+
+[safety.loop_detection]
+inject = true
+header = "x-unix-provider-request-id"
+"#,
+        live_socket.display(),
+        missing_deny_socket.display(),
+        missing_error_socket.display(),
+    )
+}
+
 fn records_for_url(capture_dir: &Path, url: &str) -> Vec<Value> {
     let Ok(entries) = fs::read_dir(capture_dir) else {
         return Vec::new();
@@ -792,6 +1041,117 @@ fn assert_all_log_files_omit_secrets(log_dir: &Path, secrets: &[&str]) {
         }
     }
     assert!(file_count > 0, "runtime produced no log files");
+}
+
+#[test]
+fn unix_authorization_provider_isolated_product_paths_are_live() {
+    let directory = TempDir::new().expect("create Unix provider fixture");
+    let python = python3_path();
+    let (_origin_process, origin) = start_origin(directory.path(), &python);
+    let data = unused_address();
+    let control = unused_address();
+    assert_ne!(data, control);
+
+    let live_socket = directory.path().join("live-authorization.sock");
+    let missing_deny_socket = directory.path().join("missing-deny.sock");
+    let missing_error_socket = directory.path().join("missing-error.sock");
+    let provider = start_unix_authorization_provider(&live_socket, 3);
+    let config_path = directory.path().join("unix-authorization.toml");
+    write_file(
+        &config_path,
+        &unix_authorization_config(
+            data,
+            control,
+            origin,
+            &live_socket,
+            &missing_deny_socket,
+            &missing_error_socket,
+        ),
+    );
+
+    let validation = Command::new(assert_cmd::cargo::cargo_bin!("acl-proxy"))
+        .args(["config", "validate", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("validate Unix provider fixture");
+    assert!(
+        validation.status.success(),
+        "Unix provider fixture must validate: {}",
+        String::from_utf8_lossy(&validation.stderr)
+    );
+
+    let mut proxy = start_proxy(&config_path);
+    wait_for_ready(&mut proxy, control);
+
+    let pass_url = format!("http://{origin}/unix-pass");
+    let pass = anonymous_proxy_request(data, "GET", &pass_url);
+    assert_eq!(
+        pass.status,
+        200,
+        "unexpected pass response: {pass:?}; logs: {}",
+        fs::read_to_string(directory.path().join("logs/acl-proxy.log")).unwrap_or_default()
+    );
+    assert_eq!(pass.header("x-seen-provider-token"), Some("missing"));
+    assert_eq!(pass.header("x-unix-delegate-effect"), None);
+    assert_eq!(pass.header("x-unix-pass-successor"), Some("applied"));
+
+    let allow_url = format!("http://{origin}/unix-allow");
+    let allow = anonymous_proxy_request(data, "GET", &allow_url);
+    assert_eq!(allow.status, 200);
+    assert_eq!(
+        allow.header("x-seen-provider-token"),
+        Some("unix-typed-secret")
+    );
+    assert_eq!(allow.header("x-unix-delegate-effect"), Some("applied"));
+    assert_eq!(allow.header("x-unix-pass-successor"), None);
+
+    let body_marker = b"unix-request-body-secret";
+    let body_url = format!("http://{origin}/unix-body");
+    let body = anonymous_proxy_request_with_body(data, "POST", &body_url, body_marker);
+    assert_eq!(body.status, 200);
+    assert_eq!(body.body, body_marker);
+    assert_eq!(
+        body.header("x-seen-provider-token"),
+        Some("unix-typed-secret")
+    );
+
+    let missing_deny_url = format!("http://{origin}/missing-deny");
+    assert_eq!(
+        anonymous_proxy_request(data, "GET", &missing_deny_url).status,
+        403
+    );
+    let unrelated_url = format!("http://{origin}/unrelated");
+    assert_eq!(
+        anonymous_proxy_request(data, "GET", &unrelated_url).status,
+        200
+    );
+
+    let missing_error_url = format!("http://{origin}/missing-error");
+    assert_eq!(
+        anonymous_proxy_request(data, "GET", &missing_error_url).status,
+        500
+    );
+    assert_eq!(
+        anonymous_proxy_request(data, "GET", &unrelated_url).status,
+        200
+    );
+
+    provider.join().expect("Unix provider server completed");
+    let status = proxy.terminate();
+    assert!(status.success(), "acl-proxy shutdown failed: {status}");
+    let live_socket = live_socket.to_string_lossy();
+    let missing_deny_socket = missing_deny_socket.to_string_lossy();
+    let missing_error_socket = missing_error_socket.to_string_lossy();
+    assert_all_log_files_omit_secrets(
+        &directory.path().join("logs"),
+        &[
+            "unix-typed-secret",
+            "unix-request-body-secret",
+            live_socket.as_ref(),
+            missing_deny_socket.as_ref(),
+            missing_error_socket.as_ref(),
+        ],
+    );
 }
 
 #[test]

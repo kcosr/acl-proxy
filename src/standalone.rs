@@ -682,6 +682,7 @@ fn compile_binding_manifest(
         .map(|provider| match provider {
             AuthorizationProviderPlan::Webhook(provider) => provider.outputs.len(),
             AuthorizationProviderPlan::Process(provider) => provider.outputs.len(),
+            AuthorizationProviderPlan::UnixSocket(provider) => provider.outputs.len(),
         })
         .sum::<usize>();
     if provider_output_count != neutral_provider_outputs.len() {
@@ -697,6 +698,7 @@ fn compile_binding_manifest(
             let outputs = match provider {
                 AuthorizationProviderPlan::Webhook(provider) => &provider.outputs,
                 AuthorizationProviderPlan::Process(provider) => &provider.outputs,
+                AuthorizationProviderPlan::UnixSocket(provider) => &provider.outputs,
             };
             outputs.iter().map(move |(output_name, output)| {
                 (
@@ -1350,6 +1352,7 @@ fn compile_observation_sensitive_header_policy(
                 .flat_map(|provider| match provider {
                     AuthorizationProviderPlan::Webhook(provider) => provider.outputs.values(),
                     AuthorizationProviderPlan::Process(provider) => provider.outputs.values(),
+                    AuthorizationProviderPlan::UnixSocket(provider) => provider.outputs.values(),
                 })
                 .map(provider_output_destination),
         )
@@ -1455,6 +1458,7 @@ fn compile_provider_credentials(
             let outputs = match provider {
                 AuthorizationProviderPlan::Webhook(provider) => &provider.outputs,
                 AuthorizationProviderPlan::Process(provider) => &provider.outputs,
+                AuthorizationProviderPlan::UnixSocket(provider) => &provider.outputs,
             };
             let outputs = outputs
                 .iter()
