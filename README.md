@@ -259,6 +259,11 @@ See `examples/access-flow-relay.json` for the complete schema and
 listener addresses must be unprivileged IPv4 loopback addresses. Route names,
 listeners are unique. `setupTimeout` covers both the Unix connection and
 complete AW Access Flow preface write. `maxConnections` is global across routes.
+Existing relay configurations require a one-time rewrite:
+`allowedOriginalPorts` becomes `allowedDestinationPorts`, and
+`upstreamSocket` becomes the nested
+`"transport": {"kind": "unix", "path": "..."}` object. The old fields and
+mixed old/new route shapes are rejected; there are no aliases.
 The strict `presentation` union accepts `disabled`, `anonymous`, or
 `bearer_environment`; the latter requires a `variable`, consumes and removes
 that environment value before the Tokio runtime starts, and presents the same
@@ -273,9 +278,10 @@ fall back to direct origin access.
 Repository tests cover the relay-to-ACL HTTP artifact boundary through an
 injected original-destination seam and cover TLS MITM on the Unix listener.
 Kernel `SO_ORIGINAL_DST`/iptables netns behavior and the complete
-TLS/HTTP2/WebSocket topology remain the T04 AW Gateway cross-repository release
-gates because they require the privileged Linux redirect environment and the
-Apple host socket relay.
+TLS/HTTP2/WebSocket topology remain part of Gate A and the exact-tuple Gate X
+suite. Gate X runs both relay consumers in a privileged Linux redirect
+environment. Live Apple Container socket-relay execution remains a
+host-conditional platform gate and is not inferred from Linux coverage.
 
 HTTP/2 CONNECT is intentionally deny-only. Enabling `http1 = "mitm"` or a
 transparent HTTPS listener requires `[mitm]`:
@@ -377,6 +383,10 @@ decision = "allow"
 urls = ["https://api.example.test/v1/**"]
 methods = ["GET", "HEAD"]
 client_cidrs = ["192.0.2.0/24"]
+identity_states = ["authenticated"]
+identity_subjects = [
+  { kind = "group", authority = "workstation", id = "developers" }
+]
 
 [policy.rules.headers]
 present_all = ["x-workload-id"]
@@ -385,6 +395,13 @@ none = { x-blocked = ["true"] }
 
 Every rule requires a stable, unique `id` and a `decision`. An empty `urls`
 list means every canonical HTTP/HTTPS URL, subject to the other predicates.
+`identity_states` is an optional nonempty, duplicate-free OR set drawn from
+`disabled`, `anonymous`, and `authenticated`; omission means no identity-state
+predicate. Authoring order does not affect the compiled rule. The singular
+`identity_state` field is rejected and has no alias. `identity_subjects` is an
+OR set of exact authority-qualified `principal` or `group` references and may
+appear only with `identity_states = ["authenticated"]`. Identity predicates
+combine with the other predicates using the rule-wide AND behavior.
 
 URL patterns are component aware:
 
