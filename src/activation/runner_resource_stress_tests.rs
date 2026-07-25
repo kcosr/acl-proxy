@@ -5,10 +5,12 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 #[cfg(target_os = "linux")]
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 #[cfg(target_os = "linux")]
 use std::time::Instant;
@@ -80,6 +82,49 @@ impl Drop for OriginSocketGuard {
     fn drop(&mut self) {
         let previous = self.0 .0.fetch_sub(1, Ordering::AcqRel);
         assert!(previous > 0, "origin socket accounting underflowed");
+    }
+}
+
+struct TrackedOriginIo<T> {
+    // Rust drops fields in declaration order, so the transport precedes its accounting guard.
+    io: T,
+    _active: OriginSocketGuard,
+}
+
+impl<T> TrackedOriginIo<T> {
+    fn new(io: T, active: OriginSocketGuard) -> Self {
+        Self {
+            io,
+            _active: active,
+        }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for TrackedOriginIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_read(context, buffer)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for TrackedOriginIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().io).poll_write(context, buffer)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_flush(context)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_shutdown(context)
     }
 }
 
@@ -159,7 +204,7 @@ impl StressOrigins {
                 let cancelled_body = cancelled_body.clone();
                 let success_body = success_body.clone();
                 connections.push(tokio::spawn(async move {
-                    let _active = activity.enter();
+                    let stream = TrackedOriginIo::new(stream, activity.enter());
                     serve_h2_origin_connection(stream, cancelled_body, success_body).await;
                 }));
             }
@@ -357,7 +402,10 @@ async fn h1_request_backpressure_origin(mut stream: tokio::net::TcpStream) {
         }
     })
     .await;
-    assert!(written > 0, "request-backpressure response made no progress");
+    assert!(
+        written > 0,
+        "request-backpressure response made no progress"
+    );
     assert!(
         written < H1_BODY_BYTES,
         "request-backpressure response was completely buffered"
@@ -400,7 +448,7 @@ async fn h1_response_backpressure_origin(mut stream: tokio::net::TcpStream) {
 }
 
 async fn serve_h2_origin_connection(
-    stream: tokio::net::TcpStream,
+    stream: TrackedOriginIo<tokio::net::TcpStream>,
     cancelled_body: Bytes,
     success_body: Bytes,
 ) {
@@ -411,8 +459,6 @@ async fn serve_h2_origin_connection(
         .expect("H2 origin connection failed")
         .expect("H2 origin closed before its request");
     let cancelled = request.uri().path().contains("/cancel/");
-    // Release the fixture's receive handle before passively awaiting peer shutdown.
-    drop(request);
     let driver = tokio::spawn(async move {
         if let Some(Ok(_)) = connection.accept().await {
             panic!("H2 origin connection received more than one request");
@@ -1220,6 +1266,29 @@ fn process_resource_thresholds_are_exact_and_non_vacuous() {
     let mut origin = samples;
     origin[3].active_origin_sockets = 1;
     assert!(rejects(origin));
+}
+
+#[tokio::test]
+async fn origin_socket_accounting_ends_with_io_ownership_before_handler_completion() {
+    let activity = OriginActivity::new();
+    let (io, _peer) = tokio::io::duplex(64);
+    let io = TrackedOriginIo::new(io, activity.enter());
+    let (io_dropped, io_dropped_receiver) = tokio::sync::oneshot::channel();
+    let (release_handler, handler_release) = tokio::sync::oneshot::channel();
+    let handler = tokio::spawn(async move {
+        let driver = tokio::spawn(async move {
+            drop(io);
+            io_dropped.send(()).unwrap();
+        });
+        let _ = handler_release.await;
+        driver.await.unwrap();
+    });
+
+    io_dropped_receiver.await.unwrap();
+    assert_eq!(activity.count(), 0);
+    assert!(!handler.is_finished());
+    release_handler.send(()).unwrap();
+    handler.await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
