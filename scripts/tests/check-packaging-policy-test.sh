@@ -472,6 +472,10 @@ expect_rejected exception-name 'name = "compu-brotli-sys"' 'name = "brotli"' den
 expect_rejected source-policy 'unknown-git = "deny"' 'unknown-git = "allow"' deny.toml
 expect_rejected notice-license 'Boost Software License - Version 1.0' 'Removed License - Version 1.0' THIRD_PARTY_NOTICES
 expect_rejected notice-checksum 'd864fe78a6384799d3740c45f7fd2fd6d7518f139e68ba87be033b31ce7e17fe' 'missing-checksum' THIRD_PARTY_NOTICES
+expect_rejected notice-shared-runtime-license \
+    'access-runtime` crates are MIT-licensed' \
+    'access-runtime` crates are proprietary' \
+    THIRD_PARTY_NOTICES
 expect_rejected lock-checksum 'd864fe78a6384799d3740c45f7fd2fd6d7518f139e68ba87be033b31ce7e17fe' 'e864fe78a6384799d3740c45f7fd2fd6d7518f139e68ba87be033b31ce7e17fe' Cargo.lock
 expect_rejected direct-version '- tokio 1.48.0, MIT' '- tokio 1.47.0, MIT' THIRD_PARTY_NOTICES
 expect_rejected direct-name '- tokio 1.48.0, MIT' '- tokio-renamed 1.48.0, MIT' THIRD_PARTY_NOTICES
