@@ -317,11 +317,13 @@ PY
     fi
 }
 
-expect_resolved_runtime_crate_rejected() {
+expect_resolved_runtime_package_rejected() {
     local name=$1
+    local relative_manifest=$2
+    local expected=$3
     local fixture="$TMP/workspace/$name"
     cp -a "$BASELINE" "$fixture"
-    python3 - "$fixture/metadata.json" "$RUNTIME_FIXTURE" <<'PY'
+    python3 - "$fixture/metadata.json" "$RUNTIME_FIXTURE" "$relative_manifest" <<'PY'
 from pathlib import Path
 import copy
 import json
@@ -329,6 +331,7 @@ import sys
 
 path = Path(sys.argv[1])
 runtime = Path(sys.argv[2])
+relative_manifest = Path(sys.argv[3])
 document = json.loads(path.read_text(encoding="utf-8"))
 templates = [
     package
@@ -341,9 +344,7 @@ package = copy.deepcopy(templates[0])
 package_id = "path+file:///injected/access-new-foundation#0.1.0"
 package["id"] = package_id
 package["name"] = "access-new-foundation"
-package["manifest_path"] = str(
-    runtime / "crates/access-new-foundation/Cargo.toml"
-)
+package["manifest_path"] = str(runtime / relative_manifest)
 document["packages"].append(package)
 document["resolve"]["nodes"].append(
     {
@@ -371,14 +372,12 @@ runtime_nodes[0]["deps"].append(
 path.write_text(json.dumps(document), encoding="utf-8")
 PY
     if run_gate "$fixture" >"$fixture.out" 2>&1; then
-        printf 'packaging resolved runtime crate mutation unexpectedly passed: %s\n' \
+        printf 'packaging resolved runtime package mutation unexpectedly passed: %s\n' \
             "$name" >&2
         exit 1
     fi
-    if ! grep -Fq \
-        'access-runtime provenance crate coverage differs from the exact resolved shared product dependency graph' \
-        "$fixture.out"; then
-        printf 'packaging resolved runtime crate mutation failed for the wrong reason: %s\n' \
+    if ! grep -Fq "$expected" "$fixture.out"; then
+        printf 'packaging resolved runtime package mutation failed for the wrong reason: %s\n' \
             "$name" >&2
         cat "$fixture.out" >&2
         exit 1
@@ -485,7 +484,14 @@ expect_metadata_rejected metadata-hyper-path hyper manifest_path /tmp/wrong-runt
 expect_metadata_duplicate_rejected metadata-duplicate-http http
 expect_metadata_duplicate_rejected metadata-duplicate-hyper hyper
 expect_relay_metadata_dependency_rejected metadata-relay-hyper hyper
-expect_resolved_runtime_crate_rejected metadata-resolved-runtime-crate
+expect_resolved_runtime_package_rejected \
+    metadata-resolved-runtime-crate \
+    crates/access-new-foundation/Cargo.toml \
+    'access-runtime provenance crate coverage differs from the exact resolved shared product dependency graph'
+expect_resolved_runtime_package_rejected \
+    metadata-unapproved-runtime-path \
+    third_party/newlib/Cargo.toml \
+    'locked metadata resolves an unapproved source-less runtime package path'
 expect_rejected lock-http-version $'name = "http"\nversion = "1.4.2"' $'name = "http"\nversion = "0.2.12"' Cargo.lock
 expect_rejected lock-hyper-source $'name = "hyper"\nversion = "1.10.1"' $'name = "hyper"\nversion = "1.10.1"\nsource = "registry+https://github.com/rust-lang/crates.io-index"' Cargo.lock
 expect_rejected lock-duplicate-hyper $'name = "hyper-util"\nversion = "0.1.20"' $'name = "hyper"\nversion = "0.14.32"\n\n[[package]]\nname = "hyper-util"\nversion = "0.1.20"' Cargo.lock
@@ -524,6 +530,18 @@ expect_rejected provenance-runtime-record \
 expect_rejected provenance-runtime-authority-description \
     'The authoritative complete origin record is' \
     'The authoritative moved-source record is' \
+    PROVENANCE.md
+expect_rejected provenance-runtime-authority-file \
+    'access-runtime/PROVENANCE.md' \
+    'access-runtime/WRONG-PROVENANCE.md' \
+    PROVENANCE.md
+expect_rejected provenance-runtime-coverage-authority \
+    '`Shared Crate Origin Coverage` inventory is the exact per-crate' \
+    '`Shared Crate Origin Coverage` inventory is an advisory per-crate' \
+    PROVENANCE.md
+expect_rejected provenance-compu-package-version \
+    'compu-brotli-sys` 1.2.0' \
+    'compu-brotli-sys` 1.1.0' \
     PROVENANCE.md
 expect_rejected provenance-brotli-license 'Google Brotli C implementation it compiles is MIT' 'Google Brotli C implementation has the wrong license' PROVENANCE.md
 expect_rejected provenance-zstd-license 'Zstandard source under BSD-3-Clause' 'Zstandard source has the wrong license' PROVENANCE.md

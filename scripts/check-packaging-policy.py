@@ -519,6 +519,16 @@ def check_runtime_source(
             if crate_name in runtime_crates:
                 fail("locked metadata resolves a duplicate canonical runtime crate")
             runtime_crates.add(crate_name)
+        elif (
+            relative == Path("third_party/hyper/Cargo.toml")
+            and package.get("name") == "hyper"
+        ):
+            pass
+        else:
+            fail(
+                "locked metadata resolves an unapproved source-less runtime "
+                "package path"
+            )
     if not local_manifests:
         fail("locked metadata resolves no canonical sibling runtime packages")
     if not runtime_crates:
