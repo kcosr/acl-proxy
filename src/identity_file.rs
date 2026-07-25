@@ -114,13 +114,17 @@ fn owned_fd(fd: libc::c_int) -> Result<std::os::fd::OwnedFd, IdentityFileError> 
 #[cfg(unix)]
 fn verify_directory(fd: std::os::fd::RawFd, euid: libc::uid_t) -> Result<(), IdentityFileError> {
     let metadata = descriptor_metadata(fd)?;
-    if metadata.st_mode & libc::S_IFMT != libc::S_IFDIR
-        || !trusted_owner(metadata.st_uid, euid)
-        || metadata.st_mode & 0o022 != 0
-    {
+    if !directory_metadata_is_trusted(&metadata, euid) {
         return Err(IdentityFileError::Untrusted);
     }
     Ok(())
+}
+
+#[cfg(unix)]
+const fn directory_metadata_is_trusted(metadata: &libc::stat, euid: libc::uid_t) -> bool {
+    metadata.st_mode & libc::S_IFMT == libc::S_IFDIR
+        && trusted_owner(metadata.st_uid, euid)
+        && metadata.st_mode & 0o022 == 0
 }
 
 #[cfg(unix)]
@@ -162,10 +166,63 @@ mod tests {
 
     const BEARER: &[u8] = b"identity-file-bearer-000000000000";
 
+    fn effective_uid_home() -> std::path::PathBuf {
+        use std::ffi::{CStr, OsStr};
+        use std::os::unix::ffi::OsStrExt;
+
+        let configured_size = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+        let buffer_size = if configured_size > 0 {
+            configured_size as usize
+        } else {
+            16 * 1024
+        };
+        let mut buffer = vec![0_u8; buffer_size];
+        let mut password = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result = std::ptr::null_mut();
+        let status = unsafe {
+            libc::getpwuid_r(
+                libc::geteuid(),
+                password.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        assert_eq!(status, 0, "effective-UID passwd lookup failed");
+        assert!(!result.is_null(), "effective UID has no passwd entry");
+        let password = unsafe { password.assume_init() };
+        let home = unsafe { CStr::from_ptr(password.pw_dir) }.to_bytes();
+        assert!(!home.is_empty(), "effective-UID passwd home is empty");
+        std::path::PathBuf::from(OsStr::from_bytes(home))
+    }
+
+    fn assert_trusted_test_root(path: &Path) {
+        use std::os::unix::fs::MetadataExt;
+
+        let euid = unsafe { libc::geteuid() };
+        for ancestor in path.ancestors() {
+            let metadata = std::fs::symlink_metadata(ancestor).unwrap_or_else(|error| {
+                panic!(
+                    "effective-UID home ancestor {} is unavailable: {error}",
+                    ancestor.display()
+                )
+            });
+            assert!(
+                metadata.file_type().is_dir()
+                    && trusted_owner(metadata.uid(), euid)
+                    && metadata.mode() & 0o022 == 0,
+                "effective-UID home ancestor {} is not trusted",
+                ancestor.display()
+            );
+        }
+    }
+
     fn trusted_tempdir() -> tempfile::TempDir {
+        let home = effective_uid_home();
+        assert_trusted_test_root(&home);
         let directory = tempfile::Builder::new()
             .prefix(".identity-file-test-")
-            .tempdir_in(std::env::var_os("HOME").unwrap())
+            .tempdir_in(home)
             .unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         directory
@@ -181,6 +238,28 @@ mod tests {
         assert!(trusted_owner(0, 1000));
         assert!(trusted_owner(1000, 1000));
         assert!(!trusted_owner(1001, 1000));
+    }
+
+    #[test]
+    fn directory_metadata_enforces_type_owner_and_write_permissions() {
+        use std::os::fd::AsRawFd;
+
+        let directory = trusted_tempdir();
+        let file = std::fs::File::open(directory.path()).unwrap();
+        let mut metadata = descriptor_metadata(file.as_raw_fd()).unwrap();
+        let file_type = metadata.st_mode & libc::S_IFMT;
+
+        metadata.st_mode = file_type | 0o700;
+        metadata.st_uid = 0;
+        assert!(directory_metadata_is_trusted(&metadata, libc::uid_t::MAX));
+        metadata.st_uid = 1000;
+        assert!(directory_metadata_is_trusted(&metadata, 1000));
+        assert!(!directory_metadata_is_trusted(&metadata, 1001));
+
+        metadata.st_mode = file_type | 0o770;
+        assert!(!directory_metadata_is_trusted(&metadata, 1000));
+        metadata.st_mode = file_type | 0o707;
+        assert!(!directory_metadata_is_trusted(&metadata, 1000));
     }
 
     #[test]
@@ -237,12 +316,19 @@ mod tests {
         write_leaf(&leaf, BEARER);
         let file = std::fs::File::open(&leaf).unwrap();
         let mut metadata = descriptor_metadata(file.as_raw_fd()).unwrap();
+        let file_type = metadata.st_mode & libc::S_IFMT;
 
+        metadata.st_mode = file_type | 0o600;
         metadata.st_uid = 0;
         assert!(leaf_metadata_is_trusted(&metadata, libc::uid_t::MAX));
         metadata.st_uid = 1000;
         assert!(leaf_metadata_is_trusted(&metadata, 1000));
         assert!(!leaf_metadata_is_trusted(&metadata, 1001));
+
+        metadata.st_mode = file_type | 0o640;
+        assert!(!leaf_metadata_is_trusted(&metadata, 1000));
+        metadata.st_mode = file_type | 0o604;
+        assert!(!leaf_metadata_is_trusted(&metadata, 1000));
     }
 
     #[test]
@@ -252,6 +338,12 @@ mod tests {
         write_leaf(&leaf, BEARER);
 
         std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(matches!(
+            read_trusted_identity_file(&leaf),
+            Err(IdentityFileError::Untrusted)
+        ));
+
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o604)).unwrap();
         assert!(matches!(
             read_trusted_identity_file(&leaf),
             Err(IdentityFileError::Untrusted)
