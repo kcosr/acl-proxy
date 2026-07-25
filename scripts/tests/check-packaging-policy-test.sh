@@ -319,7 +319,7 @@ fi
 reject_runtime_authentication_failure() {
     local name=$1 output=$2
     if grep -Eq \
-        'authenticated runtime source|Git metadata|cannot inspect authenticated runtime' \
+        'authenticated runtime source|Git metadata|cannot inspect authenticated runtime|cannot verify canonical sibling runtime source state|canonical sibling runtime is not one complete Git worktree|canonical sibling runtime HEAD differs from the accepted runtime commit|canonical sibling runtime worktree or index is not clean' \
         "$output"; then
         printf 'packaging mutation failed through Runtime authentication instead of its target: %s\n' \
             "$name" >&2
@@ -335,6 +335,15 @@ if reject_runtime_authentication_failure \
     runtime-authentication-control "$TMP/runtime-authentication-control.out" \
     >"$TMP/runtime-authentication-control.log" 2>&1; then
     printf '%s\n' 'Runtime authentication control unexpectedly passed' >&2
+    exit 1
+fi
+printf '%s\n' \
+    'packaging policy check failed: canonical sibling runtime worktree or index is not clean' \
+    >"$TMP/runtime-worktree-control.out"
+if reject_runtime_authentication_failure \
+    runtime-worktree-control "$TMP/runtime-worktree-control.out" \
+    >"$TMP/runtime-worktree-control.log" 2>&1; then
+    printf '%s\n' 'Runtime worktree control unexpectedly passed' >&2
     exit 1
 fi
 
