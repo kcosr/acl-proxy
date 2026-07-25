@@ -116,9 +116,18 @@ env -u CARGO_TARGET_DIR \
     PATH="$TEST_ROOT/fake-bin:$PATH" \
     "$fallback_product/scripts/check-shared-url-ownership.sh" \
     >"$TEST_ROOT/no-ambient-target.out"
-[[ ! -e $fallback_runtime/target && ! -L $fallback_runtime/target ]]
-fallback_target=$(sed -n 's/^target=//p' "$fallback_target_log")
-[[ -n $fallback_target && $fallback_target != "$fallback_runtime"/* ]]
+if [[ -e $fallback_runtime/target || -L $fallback_runtime/target ]]; then
+    printf 'ownership probe wrote a Runtime-local target directory\n' >&2
+    exit 1
+fi
+if ! fallback_target=$(sed -n 's/^target=//p' "$fallback_target_log"); then
+    printf 'ownership probe target log could not be read\n' >&2
+    exit 1
+fi
+if [[ -z $fallback_target || $fallback_target == "$fallback_runtime"/* ]]; then
+    printf 'ownership probe did not use an out-of-Runtime target directory\n' >&2
+    exit 1
+fi
 
 expect_failure() {
     local mode=$1
