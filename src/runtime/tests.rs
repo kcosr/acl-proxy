@@ -1539,6 +1539,14 @@ async fn live_upgrade_reload_retires_generation_and_releases_terminal_once() {
         assert!(fin);
         assert_eq!(opcode, 0x1);
         assert_eq!(payload, b"old-secret [WIRE-NEW]");
+        let (fin, opcode, payload) = read_websocket_frame(&mut new_stream, true).await;
+        assert!(fin);
+        assert_eq!(opcode, 0x9);
+        assert_eq!(payload, b"new-capture-complete");
+        new_stream
+            .write_all(&websocket_frame(true, 0xA, false, b"new-capture-complete"))
+            .await
+            .unwrap();
     });
 
     let mut old_client = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
@@ -1635,6 +1643,14 @@ async fn live_upgrade_reload_retires_generation_and_releases_terminal_once() {
         .write_all(&websocket_frame(true, 0x1, true, b"old-secret new-secret"))
         .await
         .unwrap();
+    new_client
+        .write_all(&websocket_frame(true, 0x9, true, b"new-capture-complete"))
+        .await
+        .unwrap();
+    let (fin, opcode, payload) = read_websocket_frame(&mut new_client, false).await;
+    assert!(fin);
+    assert_eq!(opcode, 0xA);
+    assert_eq!(payload, b"new-capture-complete");
 
     drop(old_client);
     drop(new_client);
