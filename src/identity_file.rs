@@ -126,13 +126,17 @@ fn verify_directory(fd: std::os::fd::RawFd, euid: libc::uid_t) -> Result<(), Ide
 #[cfg(unix)]
 fn verify_leaf(fd: std::os::fd::RawFd, euid: libc::uid_t) -> Result<(), IdentityFileError> {
     let metadata = descriptor_metadata(fd)?;
-    if metadata.st_mode & libc::S_IFMT != libc::S_IFREG
-        || !trusted_owner(metadata.st_uid, euid)
-        || metadata.st_mode & 0o077 != 0
-    {
+    if !leaf_metadata_is_trusted(&metadata, euid) {
         return Err(IdentityFileError::Untrusted);
     }
     Ok(())
+}
+
+#[cfg(unix)]
+const fn leaf_metadata_is_trusted(metadata: &libc::stat, euid: libc::uid_t) -> bool {
+    metadata.st_mode & libc::S_IFMT == libc::S_IFREG
+        && trusted_owner(metadata.st_uid, euid)
+        && metadata.st_mode & 0o077 == 0
 }
 
 #[cfg(unix)]
@@ -225,14 +229,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_wrong_owner_and_group_or_other_leaf_permissions() {
+    fn leaf_metadata_accepts_root_or_effective_uid_and_rejects_other_owner() {
+        use std::os::fd::AsRawFd;
+
         let directory = trusted_tempdir();
         let leaf = directory.path().join("token");
         write_leaf(&leaf, BEARER);
-        assert!(matches!(
-            read_trusted_identity_file_for_euid(&leaf, libc::uid_t::MAX),
-            Err(IdentityFileError::Untrusted)
-        ));
+        let file = std::fs::File::open(&leaf).unwrap();
+        let mut metadata = descriptor_metadata(file.as_raw_fd()).unwrap();
+
+        metadata.st_uid = 0;
+        assert!(leaf_metadata_is_trusted(&metadata, libc::uid_t::MAX));
+        metadata.st_uid = 1000;
+        assert!(leaf_metadata_is_trusted(&metadata, 1000));
+        assert!(!leaf_metadata_is_trusted(&metadata, 1001));
+    }
+
+    #[test]
+    fn rejects_group_or_other_leaf_permissions() {
+        let directory = trusted_tempdir();
+        let leaf = directory.path().join("token");
+        write_leaf(&leaf, BEARER);
 
         std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o640)).unwrap();
         assert!(matches!(
