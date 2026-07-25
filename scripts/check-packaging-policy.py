@@ -32,6 +32,23 @@ PRIVATE_TRANSPORT_PACKAGES = {
     "hyper",
     "hyper-util",
 }
+EXPECTED_RUNTIME_COVERAGE = {
+    "access-async-contracts": "independently authored Access Flow foundation",
+    "access-flow": "independently authored Access Flow foundation",
+    "access-flow-conformance": "independently authored Access Flow foundation",
+    "access-flow-relay": "independently authored Access Flow foundation",
+    "access-flow-unix": "independently authored Access Flow foundation",
+    "access-identity": "independently authored Access Flow foundation",
+    "access-rpc-framing": "independently authored Access Flow foundation",
+    "credential-core": "independently authored product-neutral contract",
+    "http-access-conformance": "moved and normalized conformance inputs",
+    "http-access-mitm": "moved and redesigned product behavior",
+    "http-access-policy-acl": "independently authored product-neutral contract",
+    "http-access-redaction": "moved and redesigned product behavior",
+    "http-access-runtime": "mixed moved behavior and independently authored contracts",
+    "http-access-types": "independently authored product-neutral contracts",
+    "http-access-url": "moved and redesigned product behavior",
+}
 TRANSPORT_PACKAGES = {
     "h2": ("0.4.15", True),
     "http": ("1.4.2", True),
@@ -466,7 +483,7 @@ def check_runtime_source(
     root: Path,
     metadata: dict[str, Any],
     product: dict[str, Any],
-) -> None:
+) -> set[str]:
     packages = metadata.get("packages")
     if not isinstance(packages, list):
         fail("locked metadata lacks package records")
@@ -475,6 +492,7 @@ def check_runtime_source(
     runtime_root = (root.parent / "access-runtime").resolve()
 
     local_manifests = []
+    runtime_crates = set()
     for package in packages:
         if package.get("source") is not None:
             continue
@@ -487,8 +505,24 @@ def check_runtime_source(
         if not manifest_path.is_relative_to(runtime_root):
             fail("locked metadata resolves a local package outside the canonical sibling runtime")
         local_manifests.append(manifest_path)
+        relative = manifest_path.relative_to(runtime_root)
+        if (
+            len(relative.parts) == 3
+            and relative.parts[0] == "crates"
+            and relative.parts[2] == "Cargo.toml"
+        ):
+            crate_name = relative.parts[1]
+            if package.get("name") != crate_name:
+                fail(
+                    "locked metadata runtime crate name differs from its canonical path"
+                )
+            if crate_name in runtime_crates:
+                fail("locked metadata resolves a duplicate canonical runtime crate")
+            runtime_crates.add(crate_name)
     if not local_manifests:
         fail("locked metadata resolves no canonical sibling runtime packages")
+    if not runtime_crates:
+        fail("locked metadata resolves no canonical sibling runtime crates")
 
     try:
         top_level = subprocess.run(
@@ -524,6 +558,7 @@ def check_runtime_source(
         fail("canonical sibling runtime HEAD differs from the accepted runtime commit")
     if status:
         fail("canonical sibling runtime worktree or index is not clean")
+    return runtime_crates
 
 
 def check_deny_policy(root: Path) -> None:
@@ -656,11 +691,24 @@ def check_notices(root: Path, metadata: dict[str, Any]) -> None:
         fail("compu-brotli-sys notice checksum differs from Cargo.lock")
 
 
-def check_provenance(root: Path) -> None:
+def markdown_section(text: str, level: int, title: str) -> str:
+    marker = f"{'#' * level} {title}"
+    matches = list(re.finditer(rf"(?m)^{re.escape(marker)}$", text))
+    if len(matches) != 1:
+        fail(f"expected one {marker!r} section")
+    start = matches[0].end()
+    following = re.search(rf"(?m)^#{{1,{level}}} ", text[start:])
+    end = start + following.start() if following else len(text)
+    return text[start:end]
+
+
+def check_provenance(root: Path, shared_crates: set[str]) -> None:
     provenance = read_text(root / "PROVENANCE.md")
     for marker in (
         RUNTIME_COMMIT,
         "access-runtime/PROVENANCE.md",
+        "The authoritative complete origin record is",
+        "`Shared Crate Origin Coverage` inventory is the exact per-crate",
         "compu-brotli-sys` 1.2.0",
         "Google Brotli C implementation it compiles is MIT",
         "Zstandard source under BSD-3-Clause",
@@ -684,33 +732,32 @@ def check_provenance(root: Path) -> None:
     if accepted_runtime_commits != [RUNTIME_COMMIT]:
         fail("PROVENANCE.md must contain one exact accepted runtime commit record")
 
-    product_manifests = [
-        load_toml(root / "Cargo.toml"),
-        load_toml(root / "crates/access-flow-relay/Cargo.toml"),
-    ]
-    shared_crates = set()
-    for manifest in product_manifests:
-        for _, table in dependency_tables(manifest):
-            for specification in table.values():
-                if not isinstance(specification, dict):
-                    continue
-                path = specification.get("path")
-                if not isinstance(path, str):
-                    continue
-                match = re.search(r"(?:^|/)access-runtime/crates/([^/]+)$", path)
-                if match is not None:
-                    shared_crates.add(match.group(1))
     runtime_provenance = read_text(root.parent / "access-runtime/PROVENANCE.md")
-    coverage = dict(
-        re.findall(
-            r"(?m)^- `crates/([^`]+)`: (.+)$",
-            runtime_provenance,
-        )
+    coverage_section = markdown_section(
+        runtime_provenance, 2, "Shared Crate Origin Coverage"
     )
+    coverage_entries = re.findall(
+        r"(?m)^- `crates/([^`]+)`: (.+)$",
+        coverage_section,
+    )
+    all_coverage_entries = re.findall(
+        r"(?m)^- `crates/([^`]+)`: (.+)$",
+        runtime_provenance,
+    )
+    if all_coverage_entries != coverage_entries:
+        fail("access-runtime provenance has a crate coverage record outside its section")
+    coverage = dict(coverage_entries)
+    if len(coverage_entries) != len(coverage):
+        fail("access-runtime provenance crate coverage contains a duplicate entry")
+    if coverage != EXPECTED_RUNTIME_COVERAGE:
+        fail(
+            "access-runtime provenance crate coverage differs from the exact "
+            "accepted classification inventory"
+        )
     if set(coverage) != shared_crates:
         fail(
             "access-runtime provenance crate coverage differs from the exact "
-            "shared product dependency set"
+            "resolved shared product dependency graph"
         )
 
 
@@ -803,9 +850,9 @@ def main() -> int:
         metadata = load_metadata(root, args.metadata)
         product = resolved_product_package(root, metadata)
         check_transport_resolution(root, metadata, product)
-        check_runtime_source(root, metadata, product)
+        shared_crates = check_runtime_source(root, metadata, product)
         check_notices(root, metadata)
-        check_provenance(root)
+        check_provenance(root, shared_crates)
         check_shipped_docs(root)
     except ValueError as error:
         print(f"packaging policy check failed: {error}", file=sys.stderr)

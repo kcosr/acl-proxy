@@ -154,7 +154,44 @@ path.write_text(text.replace(marker, "", 1), encoding="utf-8")
 PY
 git -C "$RUNTIME_FIXTURE" update-index --assume-unchanged PROVENANCE.md
 expect_runtime_rejected runtime-provenance-coverage \
-    'access-runtime provenance crate coverage differs from the exact shared product dependency set'
+    'access-runtime provenance crate coverage differs from the exact accepted classification inventory'
+
+python3 - "$RUNTIME_FIXTURE/PROVENANCE.md" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+old = "- `crates/http-access-mitm`: moved and redesigned product behavior"
+new = "- `crates/http-access-mitm`: independently authored"
+if text.count(old) != 1:
+    raise SystemExit("runtime provenance classification mutation marker is not unique")
+path.write_text(text.replace(old, new, 1), encoding="utf-8")
+PY
+git -C "$RUNTIME_FIXTURE" update-index --assume-unchanged PROVENANCE.md
+expect_runtime_rejected runtime-provenance-classification \
+    'access-runtime provenance crate coverage differs from the exact accepted classification inventory'
+
+python3 - "$RUNTIME_FIXTURE/PROVENANCE.md" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+marker = "- `crates/http-access-mitm`: moved and redesigned product behavior"
+if text.count(marker) != 1:
+    raise SystemExit("runtime provenance duplicate mutation marker is not unique")
+path.write_text(text.replace(marker, f"{marker}\n{marker}", 1), encoding="utf-8")
+PY
+git -C "$RUNTIME_FIXTURE" update-index --assume-unchanged PROVENANCE.md
+expect_runtime_rejected runtime-provenance-duplicate \
+    'access-runtime provenance crate coverage contains a duplicate entry'
+
+printf '\n- `crates/outside-coverage`: independently authored\n' \
+    >>"$RUNTIME_FIXTURE/PROVENANCE.md"
+git -C "$RUNTIME_FIXTURE" update-index --assume-unchanged PROVENANCE.md
+expect_runtime_rejected runtime-provenance-outside-section \
+    'access-runtime provenance has a crate coverage record outside its section'
 
 expect_rejected() {
     local name=$1
@@ -280,6 +317,74 @@ PY
     fi
 }
 
+expect_resolved_runtime_crate_rejected() {
+    local name=$1
+    local fixture="$TMP/workspace/$name"
+    cp -a "$BASELINE" "$fixture"
+    python3 - "$fixture/metadata.json" "$RUNTIME_FIXTURE" <<'PY'
+from pathlib import Path
+import copy
+import json
+import sys
+
+path = Path(sys.argv[1])
+runtime = Path(sys.argv[2])
+document = json.loads(path.read_text(encoding="utf-8"))
+templates = [
+    package
+    for package in document["packages"]
+    if package["name"] == "access-async-contracts"
+]
+if len(templates) != 1:
+    raise SystemExit("expected exactly one runtime crate metadata template")
+package = copy.deepcopy(templates[0])
+package_id = "path+file:///injected/access-new-foundation#0.1.0"
+package["id"] = package_id
+package["name"] = "access-new-foundation"
+package["manifest_path"] = str(
+    runtime / "crates/access-new-foundation/Cargo.toml"
+)
+document["packages"].append(package)
+document["resolve"]["nodes"].append(
+    {
+        "id": package_id,
+        "dependencies": [],
+        "deps": [],
+        "features": [],
+    }
+)
+runtime_nodes = [
+    node
+    for node in document["resolve"]["nodes"]
+    if "/http-access-runtime#" in node["id"]
+]
+if len(runtime_nodes) != 1:
+    raise SystemExit("expected exactly one http-access-runtime resolution node")
+runtime_nodes[0]["dependencies"].append(package_id)
+runtime_nodes[0]["deps"].append(
+    {
+        "name": "access_new_foundation",
+        "pkg": package_id,
+        "dep_kinds": [{"kind": None, "target": None}],
+    }
+)
+path.write_text(json.dumps(document), encoding="utf-8")
+PY
+    if run_gate "$fixture" >"$fixture.out" 2>&1; then
+        printf 'packaging resolved runtime crate mutation unexpectedly passed: %s\n' \
+            "$name" >&2
+        exit 1
+    fi
+    if ! grep -Fq \
+        'access-runtime provenance crate coverage differs from the exact resolved shared product dependency graph' \
+        "$fixture.out"; then
+        printf 'packaging resolved runtime crate mutation failed for the wrong reason: %s\n' \
+            "$name" >&2
+        cat "$fixture.out" >&2
+        exit 1
+    fi
+}
+
 expect_created_path_rejected() {
     local name=$1
     local path=$2
@@ -380,6 +485,7 @@ expect_metadata_rejected metadata-hyper-path hyper manifest_path /tmp/wrong-runt
 expect_metadata_duplicate_rejected metadata-duplicate-http http
 expect_metadata_duplicate_rejected metadata-duplicate-hyper hyper
 expect_relay_metadata_dependency_rejected metadata-relay-hyper hyper
+expect_resolved_runtime_crate_rejected metadata-resolved-runtime-crate
 expect_rejected lock-http-version $'name = "http"\nversion = "1.4.2"' $'name = "http"\nversion = "0.2.12"' Cargo.lock
 expect_rejected lock-hyper-source $'name = "hyper"\nversion = "1.10.1"' $'name = "hyper"\nversion = "1.10.1"\nsource = "registry+https://github.com/rust-lang/crates.io-index"' Cargo.lock
 expect_rejected lock-duplicate-hyper $'name = "hyper-util"\nversion = "0.1.20"' $'name = "hyper"\nversion = "0.14.32"\n\n[[package]]\nname = "hyper-util"\nversion = "0.1.20"' Cargo.lock
@@ -414,6 +520,10 @@ runtime_duplicate_record=$(printf -- '%s\n- Accepted runtime commit:\n  `%s`' \
 expect_rejected provenance-runtime-record \
     "$runtime_record" \
     "$runtime_duplicate_record" \
+    PROVENANCE.md
+expect_rejected provenance-runtime-authority-description \
+    'The authoritative complete origin record is' \
+    'The authoritative moved-source record is' \
     PROVENANCE.md
 expect_rejected provenance-brotli-license 'Google Brotli C implementation it compiles is MIT' 'Google Brotli C implementation has the wrong license' PROVENANCE.md
 expect_rejected provenance-zstd-license 'Zstandard source under BSD-3-Clause' 'Zstandard source has the wrong license' PROVENANCE.md

@@ -27,19 +27,25 @@ or WebSocket implementation.
 - Dependency version: `0.1.0`
 - License: MIT
 - Material changes: product-specific inputs were replaced by versionless,
-  transport-neutral contracts; shared forwarding, listener, interception,
-  upgrade, credential, URL, ACL, and redaction owners were deleted from the
-  product as each extracted owner was adopted. P13 modernized the runtime's
-  private HTTP transport family and retained the reviewed Hyper fork in the
-  runtime repository.
+  transport-neutral contracts. Shared forwarding, listener, interception,
+  upgrade, URL, and redaction owners were deleted from the product as each moved
+  owner was adopted. Credential, ACL, identity, and Access Flow foundations were
+  independently authored as product-neutral contracts, with product behavior
+  oracles recorded where applicable. P13 modernized the runtime's private HTTP
+  transport family and retained the reviewed Hyper fork in the runtime
+  repository.
 
-The authoritative path-by-path moved-source record, including each immutable
-`acl-proxy` source commit and material modification, is
-`access-runtime/PROVENANCE.md` at the accepted commit above. This repository
-consumes the shared crates through exact-version canonical sibling path
-dependencies and does not vendor their source. Its root Cargo workspace applies
-the required relative Hyper source redirect to the runtime-owned fork so all
-transitive consumers resolve the same implementation and type family.
+The authoritative complete origin record is `access-runtime/PROVENANCE.md` at
+the accepted commit above. It identifies moved-source entries with immutable
+`acl-proxy` source commits and material modifications, and independently
+authored entries with implementation commits and behavior-oracle lineage where
+applicable. Its `Shared Crate Origin Coverage` inventory is the exact per-crate
+classification for the shared crates in this product's resolved dependency
+graph. This repository consumes those crates through exact-version canonical
+sibling path dependencies and does not vendor their source. Its root Cargo
+workspace applies the required relative Hyper source redirect to the
+runtime-owned fork so all transitive consumers resolve the same implementation
+and type family.
 
 ## Third-Party Source
 
