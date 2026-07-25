@@ -316,6 +316,28 @@ expect_runtime_rejected runtime-provenance-outside-section \
     'access-runtime provenance has a crate coverage record outside its section'
 fi
 
+reject_runtime_authentication_failure() {
+    local name=$1 output=$2
+    if grep -Eq \
+        'authenticated runtime source|Git metadata|cannot inspect authenticated runtime' \
+        "$output"; then
+        printf 'packaging mutation failed through Runtime authentication instead of its target: %s\n' \
+            "$name" >&2
+        cat "$output" >&2
+        return 1
+    fi
+}
+
+printf '%s\n' \
+    'packaging policy check failed: authenticated runtime source archive tree differs' \
+    >"$TMP/runtime-authentication-control.out"
+if reject_runtime_authentication_failure \
+    runtime-authentication-control "$TMP/runtime-authentication-control.out" \
+    >"$TMP/runtime-authentication-control.log" 2>&1; then
+    printf '%s\n' 'Runtime authentication control unexpectedly passed' >&2
+    exit 1
+fi
+
 expect_rejected() {
     local name=$1
     local old=$2
@@ -339,6 +361,7 @@ PY
         printf 'packaging mutation unexpectedly passed: %s\n' "$name" >&2
         exit 1
     fi
+    reject_runtime_authentication_failure "$name" "$fixture.out"
 }
 
 expect_metadata_rejected() {
@@ -368,6 +391,7 @@ PY
         printf 'packaging metadata mutation unexpectedly passed: %s\n' "$name" >&2
         exit 1
     fi
+    reject_runtime_authentication_failure "$name" "$fixture.out"
 }
 
 expect_metadata_duplicate_rejected() {
@@ -394,6 +418,7 @@ PY
         printf 'packaging duplicate metadata mutation unexpectedly passed: %s\n' "$name" >&2
         exit 1
     fi
+    reject_runtime_authentication_failure "$name" "$fixture.out"
 }
 
 expect_relay_metadata_dependency_rejected() {
@@ -438,6 +463,7 @@ PY
             "$name" >&2
         exit 1
     fi
+    reject_runtime_authentication_failure "$name" "$fixture.out"
 }
 
 expect_resolved_runtime_package_rejected() {
@@ -518,6 +544,7 @@ expect_created_path_rejected() {
         printf 'packaging created-path mutation unexpectedly passed: %s\n' "$name" >&2
         exit 1
     fi
+    reject_runtime_authentication_failure "$name" "$fixture.out"
 }
 
 expect_obsolete_surface_rejected() {
@@ -531,6 +558,7 @@ expect_obsolete_surface_rejected() {
         printf 'packaging obsolete-surface mutation unexpectedly passed: %s\n' "$name" >&2
         exit 1
     fi
+    reject_runtime_authentication_failure "$name" "$fixture.out"
 }
 
 expect_rejected product-version 'version = "0.3.0-rc.1"' 'version = "0.3.0-rc.2"' Cargo.toml

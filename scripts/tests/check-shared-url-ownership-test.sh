@@ -4,6 +4,7 @@ set -euo pipefail
 SOURCE_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 RUNTIME_SOURCE="$SOURCE_ROOT/../access-runtime"
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/shared-url-ownership-test.XXXXXX")
+export CARGO_TARGET_DIR="$TEST_ROOT/cargo-target"
 cleanup() {
     rm -rf -- "$TEST_ROOT"
 }
