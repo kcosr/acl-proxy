@@ -545,6 +545,19 @@ def source_tree_for_directory(root: Path) -> str:
         return tree
 
 
+def reject_git_metadata(root: Path) -> None:
+    def walk_error(error: OSError) -> None:
+        fail(f"cannot inspect authenticated runtime source archive: {error}")
+
+    for _current, directories, files in os.walk(
+        root,
+        followlinks=False,
+        onerror=walk_error,
+    ):
+        if ".git" in directories or ".git" in files:
+            fail("authenticated runtime source archive contains Git metadata")
+
+
 def check_runtime_source(
     root: Path,
     metadata: dict[str, Any],
@@ -639,9 +652,7 @@ def check_runtime_source(
     else:
         if runtime_source_tree != RUNTIME_TREE:
             fail("authenticated runtime source tree argument differs from the accepted runtime tree")
-        git_metadata = runtime_root / ".git"
-        if git_metadata.exists() or git_metadata.is_symlink():
-            fail("authenticated runtime source archive contains Git metadata")
+        reject_git_metadata(runtime_root)
         if source_tree_for_directory(runtime_root) != runtime_source_tree:
             fail("authenticated runtime source archive tree differs from the accepted runtime tree")
     return runtime_crates
@@ -913,9 +924,14 @@ def check_shipped_docs(root: Path) -> None:
     if "ca-cert.pem" in sample or "ca-key.pem" in sample:
         fail("sample configuration names obsolete generated CA storage files")
     packaging_gate = read_text(root / "scripts/check-packaging-policy.sh")
+    packaging_command = (
+        'python3 scripts/check-packaging-policy.py "${runtime_source_arguments[@]}"'
+    )
     audit_command = "cargo audit --no-fetch --no-yanked --deny warnings"
     deny_command = "cargo deny --locked --offline check -D warnings licenses sources"
     gate_lines = packaging_gate.splitlines()
+    if gate_lines.count(packaging_command) != 1:
+        fail("packaging gate must run the exact argument-bounded policy command")
     if gate_lines.count(audit_command) != 1:
         fail("packaging gate must run the exact offline advisory scan")
     if gate_lines.count(deny_command) != 1:

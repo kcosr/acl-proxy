@@ -32,6 +32,7 @@ ownership_gates=(
 )
 mutation_suites=(
     scripts/tests/check-packaging-policy-test.sh
+    scripts/tests/check-ownership-test.sh
     scripts/tests/check-public-api-test.sh
     scripts/tests/check-shared-url-ownership-test.sh
     scripts/tests/check-shared-acl-ownership-test.sh
@@ -57,7 +58,12 @@ for gate in "${ownership_gates[@]}"; do
     fi
 done
 for suite in "${mutation_suites[@]}"; do
-    "$suite"
+    if [[ $suite == scripts/tests/check-packaging-policy-test.sh \
+        && -n $runtime_source_tree ]]; then
+        "$suite" --runtime-source-tree "$runtime_source_tree"
+    else
+        "$suite"
+    fi
 done
 
 printf 'all product ownership/deletion gates and mutation suites passed\n'
