@@ -7,6 +7,9 @@ use tokio::sync::mpsc;
 
 const CLOSED_BIT: usize = 1usize << (usize::BITS - 1);
 const ACTIVE_MASK: usize = CLOSED_BIT - 1;
+const CUSTODY_FORCE_BIT: usize = 1usize << (usize::BITS - 1);
+const CUSTODY_PROCESSING_BIT: usize = 1usize << (usize::BITS - 2);
+const CUSTODY_COUNT_MASK: usize = CUSTODY_PROCESSING_BIT - 1;
 
 pub(super) struct BoundedCaptureWorker<Job> {
     admission: Arc<AdmissionState>,
@@ -24,10 +27,13 @@ struct AdmissionGuard<'state> {
     state: &'state AdmissionState,
 }
 
+struct SubmissionGuard<'worker, Job> {
+    sender: Arc<mpsc::Sender<Job>>,
+    _admission: AdmissionGuard<'worker>,
+}
+
 struct WorkerCustody {
-    force_discard: AtomicBool,
-    outstanding: AtomicUsize,
-    processing: AtomicBool,
+    state: AtomicUsize,
     discarded: AtomicUsize,
 }
 
@@ -72,9 +78,7 @@ impl<Job: Send + 'static> BoundedCaptureWorker<Job> {
         });
         let (sender, receiver) = mpsc::channel(capacity);
         let custody = Arc::new(WorkerCustody {
-            force_discard: AtomicBool::new(false),
-            outstanding: AtomicUsize::new(0),
-            processing: AtomicBool::new(false),
+            state: AtomicUsize::new(0),
             discarded: AtomicUsize::new(0),
         });
         let completion = Arc::new(ShutdownCompletion {
@@ -107,14 +111,10 @@ impl<Job> BoundedCaptureWorker<Job> {
         if self.completion.complete.load(Ordering::Acquire) {
             return Err(CaptureSubmitError::Closed(job));
         }
-        // An admitted submitter must keep the receiver open until its send completes.
-        let Some(sender) = self.sender.load_full() else {
+        let Some(submission) = self.try_enter_submission() else {
             return Err(CaptureSubmitError::Closed(job));
         };
-        let Some(_admission) = self.admission.try_enter() else {
-            return Err(CaptureSubmitError::Closed(job));
-        };
-        let permit = match sender.try_reserve() {
+        let permit = match submission.sender.try_reserve() {
             Ok(permit) => permit,
             Err(mpsc::error::TrySendError::Full(())) => {
                 return Err(CaptureSubmitError::Full(job));
@@ -123,9 +123,19 @@ impl<Job> BoundedCaptureWorker<Job> {
                 return Err(CaptureSubmitError::Closed(job));
             }
         };
-        self.custody.outstanding.fetch_add(1, Ordering::AcqRel);
+        self.custody.accept();
         permit.send(job);
         Ok(())
+    }
+
+    fn try_enter_submission(&self) -> Option<SubmissionGuard<'_, Job>> {
+        // An admitted submitter must keep the receiver open until its send completes.
+        let sender = self.sender.load_full()?;
+        let admission = self.admission.try_enter()?;
+        Some(SubmissionGuard {
+            sender,
+            _admission: admission,
+        })
     }
 
     pub(super) fn begin_shutdown(&self) {
@@ -154,15 +164,12 @@ impl<Job> BoundedCaptureWorker<Job> {
     }
 
     fn force_discard(&self) -> DetachedCaptureWork {
-        self.custody.force_discard.store(true, Ordering::Release);
-        let processing_records = usize::from(self.custody.processing.load(Ordering::Acquire));
+        let state = self.custody.force_discard();
+        let processing_records = usize::from(state & CUSTODY_PROCESSING_BIT != 0);
+        let outstanding = state & CUSTODY_COUNT_MASK;
         DetachedCaptureWork {
             processing_records,
-            queued_records: self
-                .custody
-                .outstanding
-                .load(Ordering::Acquire)
-                .saturating_sub(processing_records),
+            queued_records: outstanding.saturating_sub(processing_records),
             admitted_submissions: self.admission.active(),
         }
     }
@@ -186,18 +193,80 @@ fn run_worker<Job>(
     mut process: impl FnMut(Job),
 ) {
     while let Some(job) = receiver.blocking_recv() {
-        if custody.force_discard.load(Ordering::Acquire) {
+        if custody.begin_job() {
             drop(job);
-            custody.discarded.fetch_add(1, Ordering::AcqRel);
+            custody.complete_discarded();
         } else {
-            custody.processing.store(true, Ordering::Release);
             if catch_unwind(AssertUnwindSafe(|| process(job))).is_err() {
                 tracing::error!("capture worker isolated a record-processing panic");
             }
-            custody.processing.store(false, Ordering::Release);
+            custody.complete_processed();
         }
-        let before = custody.outstanding.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(before != 0, "capture custody accounting underflow");
+    }
+}
+
+impl WorkerCustody {
+    fn accept(&self) {
+        let before = self.state.fetch_add(1, Ordering::AcqRel);
+        debug_assert!(
+            before & CUSTODY_COUNT_MASK != CUSTODY_COUNT_MASK,
+            "capture custody accounting overflow"
+        );
+    }
+
+    fn begin_job(&self) -> bool {
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            debug_assert!(
+                state & CUSTODY_COUNT_MASK != 0,
+                "capture custody accounting underflow"
+            );
+            debug_assert_eq!(
+                state & CUSTODY_PROCESSING_BIT,
+                0,
+                "capture worker began concurrent processing"
+            );
+            if state & CUSTODY_FORCE_BIT != 0 {
+                return true;
+            }
+            match self.state.compare_exchange_weak(
+                state,
+                state | CUSTODY_PROCESSING_BIT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return false,
+                Err(observed) => state = observed,
+            }
+        }
+    }
+
+    fn complete_processed(&self) {
+        let before = self
+            .state
+            .fetch_sub(CUSTODY_PROCESSING_BIT + 1, Ordering::AcqRel);
+        debug_assert_ne!(
+            before & CUSTODY_PROCESSING_BIT,
+            0,
+            "capture processing accounting underflow"
+        );
+        debug_assert!(
+            before & CUSTODY_COUNT_MASK != 0,
+            "capture custody accounting underflow"
+        );
+    }
+
+    fn complete_discarded(&self) {
+        self.discarded.fetch_add(1, Ordering::AcqRel);
+        let before = self.state.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(
+            before & CUSTODY_COUNT_MASK != 0,
+            "capture custody accounting underflow"
+        );
+    }
+
+    fn force_discard(&self) -> usize {
+        self.state.fetch_or(CUSTODY_FORCE_BIT, Ordering::AcqRel)
     }
 }
 
@@ -279,7 +348,7 @@ impl<Job> Drop for BoundedCaptureWorker<Job> {
             self.join_completed_worker();
             return;
         }
-        if !self.custody.force_discard.load(Ordering::Acquire) {
+        if self.custody.state.load(Ordering::Acquire) & CUSTODY_FORCE_BIT == 0 {
             tracing::error!("capture worker dropped before bounded shutdown");
             let _ = self.force_discard();
         }
@@ -419,19 +488,18 @@ mod tests {
             let admission_entered = Arc::clone(&admission_entered);
             let release_admission = Arc::clone(&release_admission);
             std::thread::spawn(move || {
-                let sender = worker
-                    .sender
-                    .load_full()
-                    .expect("sender remains published before shutdown");
-                let guard = worker.admission.try_enter().unwrap();
+                let submission = worker.try_enter_submission().unwrap();
                 admission_entered.store(true, Ordering::Release);
                 while !release_admission.load(Ordering::Acquire) {
                     std::thread::yield_now();
                 }
-                let permit = sender.try_reserve().expect("capacity remains available");
-                worker.custody.outstanding.fetch_add(1, Ordering::AcqRel);
+                let permit = submission
+                    .sender
+                    .try_reserve()
+                    .expect("capacity remains available");
+                worker.custody.accept();
                 permit.send(());
-                drop(guard);
+                drop(submission);
             })
         };
         wait_until(|| admission_entered.load(Ordering::Acquire));
@@ -509,14 +577,9 @@ mod tests {
             })
             .unwrap(),
         );
-        let admission = worker
-            .admission
-            .try_enter()
+        let submission = worker
+            .try_enter_submission()
             .expect("submitter crosses admission before shutdown");
-        let sender = worker
-            .sender
-            .load_full()
-            .expect("submitter retains sender before shutdown");
         let waiter = {
             let worker = Arc::clone(&worker);
             tokio::spawn(async move { worker.shutdown().await })
@@ -534,13 +597,13 @@ mod tests {
             }
         );
 
-        let permit = sender
+        let permit = submission
+            .sender
             .try_reserve()
             .expect("preclosed submitter retains queue access");
-        worker.custody.outstanding.fetch_add(1, Ordering::AcqRel);
+        worker.custody.accept();
         permit.send(());
-        drop(sender);
-        drop(admission);
+        drop(submission);
 
         tokio::time::timeout(Duration::from_secs(1), worker.shutdown())
             .await
