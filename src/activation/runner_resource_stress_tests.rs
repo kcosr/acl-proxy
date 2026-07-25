@@ -1,5 +1,5 @@
 use std::future::poll_fn;
-use std::io;
+use std::io::{self, IoSlice};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
@@ -125,6 +125,18 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for TrackedOriginIo<T> {
 
     fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().io).poll_shutdown(context)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffers: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().io).poll_write_vectored(context, buffers)
     }
 }
 
@@ -452,6 +464,20 @@ async fn serve_h2_origin_connection(
     cancelled_body: Bytes,
     success_body: Bytes,
 ) {
+    serve_h2_origin_connection_with_hook(stream, cancelled_body, success_body, None).await;
+}
+
+struct H2DriverCompletionHook {
+    completed: tokio::sync::oneshot::Sender<()>,
+    release_handler: tokio::sync::oneshot::Receiver<()>,
+}
+
+async fn serve_h2_origin_connection_with_hook(
+    stream: TrackedOriginIo<tokio::net::TcpStream>,
+    cancelled_body: Bytes,
+    success_body: Bytes,
+    completion_hook: Option<H2DriverCompletionHook>,
+) {
     let mut connection = h2::server::handshake(stream).await.unwrap();
     let (request, respond) = tokio::time::timeout(BATCH_TIMEOUT, connection.accept())
         .await
@@ -465,6 +491,17 @@ async fn serve_h2_origin_connection(
         }
     });
     send_h2_response(respond, cancelled, cancelled_body, success_body).await;
+    if let Some(completion_hook) = completion_hook {
+        tokio::time::timeout(BATCH_TIMEOUT, async {
+            while !driver.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("H2 origin driver did not finish before its completion hook");
+        completion_hook.completed.send(()).unwrap();
+        completion_hook.release_handler.await.unwrap();
+    }
     tokio::time::timeout(BATCH_TIMEOUT, driver)
         .await
         .expect("H2 origin connection was not closed after its response")
@@ -1271,20 +1308,48 @@ fn process_resource_thresholds_are_exact_and_non_vacuous() {
 #[tokio::test]
 async fn origin_socket_accounting_ends_with_io_ownership_before_handler_completion() {
     let activity = OriginActivity::new();
-    let (io, _peer) = tokio::io::duplex(64);
-    let io = TrackedOriginIo::new(io, activity.enter());
-    let (io_dropped, io_dropped_receiver) = tokio::sync::oneshot::channel();
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let client_stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let (origin_stream, _) = listener.accept().await.unwrap();
+    let origin_stream = TrackedOriginIo::new(origin_stream, activity.enter());
+    let (driver_completed, driver_completed_receiver) = tokio::sync::oneshot::channel();
     let (release_handler, handler_release) = tokio::sync::oneshot::channel();
     let handler = tokio::spawn(async move {
-        let driver = tokio::spawn(async move {
-            drop(io);
-            io_dropped.send(()).unwrap();
-        });
-        let _ = handler_release.await;
-        driver.await.unwrap();
+        serve_h2_origin_connection_with_hook(
+            origin_stream,
+            Bytes::from_static(b"cancelled"),
+            Bytes::from_static(b"success"),
+            Some(H2DriverCompletionHook {
+                completed: driver_completed,
+                release_handler: handler_release,
+            }),
+        )
+        .await;
     });
 
-    io_dropped_receiver.await.unwrap();
+    let (mut sender, connection) = h2::client::handshake(client_stream).await.unwrap();
+    let connection = tokio::spawn(connection);
+    sender = sender.ready().await.unwrap();
+    let request = Request::builder()
+        .method("GET")
+        .version(Version::HTTP_2)
+        .uri(format!("http://{address}/h2/success"))
+        .body(())
+        .unwrap();
+    let (response, _) = sender.send_request(request, true).unwrap();
+    let mut body = response.await.unwrap().into_body();
+    while let Some(chunk) = body.data().await {
+        chunk.unwrap();
+    }
+    drop(body);
+    drop(sender);
+    connection.abort();
+    connection.await.unwrap_err();
+
+    driver_completed_receiver.await.unwrap();
     assert_eq!(activity.count(), 0);
     assert!(!handler.is_finished());
     release_handler.send(()).unwrap();
