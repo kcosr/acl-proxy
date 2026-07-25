@@ -1888,6 +1888,14 @@ default = "allow"
             .await
             .unwrap();
         let parent_address = parent.local_addr().unwrap();
+        let parent_identity = TestTlsIdentity::new("parent.test");
+        let parent_identity_directory = tempdir().unwrap();
+        let parent_ca_path = parent_identity_directory.path().join("parent-ca.pem");
+        crate::filesystem::write_public_file(
+            &parent_ca_path,
+            parent_identity.certificate_chain_pem(),
+        )
+        .unwrap();
         const INBOUND_VARIABLE: &str = "AW_INBOUND_PRODUCT_IDENTITY_TOKEN";
         const INBOUND_BEARER: &str = "inbound-product-identity-bearer-000000000000";
         const PARENT_VARIABLE: &str = "AW_PARENT_PRODUCT_IDENTITY_TOKEN";
@@ -1937,11 +1945,15 @@ route = "parent_proxy"
 
 [egress.parent_proxy]
 kind = "acl_proxy"
-url = "http://parent.test:8080"
+url = "https://parent.test:8443"
 
 [egress.parent_proxy.presentation]
 kind = "bearer_environment"
 variable = "{PARENT_VARIABLE}"
+
+[egress.parent_proxy.tls]
+trust = "custom"
+ca_certificate = {parent_ca_path:?}
 
 [policy]
 default = "allow"
@@ -1974,7 +1986,7 @@ default = "allow"
         assert!(std::env::var_os(PARENT_VARIABLE).is_none());
 
         let parent_url =
-            http_access_url::canonicalize_http_url("http://parent.test:8080/").unwrap();
+            http_access_url::canonicalize_http_url("https://parent.test:8443/").unwrap();
         let network = Arc::new(
             http_access_runtime::ForwardingDevHarness::new(
                 http_access_runtime::ForwardingNetworkFacts::new(
@@ -2002,9 +2014,12 @@ default = "allow"
         product.start_listeners().await.unwrap();
 
         let parent_task = tokio::spawn(async move {
+            let acceptor =
+                TlsAcceptor::from(Arc::new(parent_identity.server_config(&[b"http/1.1"])));
             let mut requests = Vec::new();
             for index in 0..2 {
-                let (mut stream, _) = parent.accept().await.unwrap();
+                let (stream, _) = parent.accept().await.unwrap();
+                let mut stream = acceptor.accept(stream).await.unwrap();
                 requests.push(read_http_message(&mut stream).await);
                 let response = if index == 0 {
                     b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\naccepted"

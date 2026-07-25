@@ -549,9 +549,9 @@ host_policy_replace = require_config_replace(
 )
 require_config_replace(
     python_trees["child_config"],
-    'url = "http://host-proxy.example.test:8881"\n',
-    'url = "https://host-proxy.example.test:8443"\n',
-    "child HTTPS parent proxy",
+    '[egress.parent_proxy.tls]\ntrust = "system"\n',
+    'ca_certificate = "tls/parent-ca.pem"\n',
+    "child HTTPS parent trust",
 )
 
 host_config_tree = python_trees["host_config"]

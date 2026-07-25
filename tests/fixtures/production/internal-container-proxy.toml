@@ -44,11 +44,14 @@ http_versions = ["http1"]
 
 [egress.parent_proxy]
 kind = "acl_proxy"
-url = "http://host-proxy.example.test:8881"
+url = "https://host-proxy.example.test:8443"
 
 [egress.parent_proxy.presentation]
 kind = "bearer_environment"
 variable = "AW_IDENTITY_TOKEN"
+
+[egress.parent_proxy.tls]
+trust = "system"
 
 [[egress.request_headers]]
 operation = "set"

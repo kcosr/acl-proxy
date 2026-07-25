@@ -60,12 +60,19 @@ path = {path:?}
     )
 }
 
-fn access_flow_config(socket_path: &Path, identity_mode: &str, token_path: &Path) -> String {
-    let resolver = if identity_mode == "disabled" {
-        String::new()
-    } else {
-        identity_resolver(token_path)
-    };
+fn access_flow_config(
+    socket_path: &Path,
+    identity_mode: Option<&str>,
+    token_path: &Path,
+) -> String {
+    let resolver = identity_mode.map_or_else(String::new, |_| identity_resolver(token_path));
+    let identity = identity_mode.map_or_else(String::new, |mode| {
+        format!(
+            r#"[listeners.transparent_http.identity]
+mode = "{mode}"
+"#
+        )
+    });
     format!(
         r#"schema_version = 3
 
@@ -79,8 +86,7 @@ endpoint.admission_timeout = "1s"
 endpoint.allowed_destination_ports = [80]
 http_versions = ["http1"]
 
-[listeners.transparent_http.identity]
-mode = "{identity_mode}"
+{identity}
 
 [listeners.transparent_http.endpoint.transport]
 kind = "unix"
@@ -114,15 +120,15 @@ async fn access_flow_product_enforces_the_identity_mode_matrix() {
     let _test = crate::activation::LISTENER_TEST_LOCK.lock().await;
 
     for (mode, presentation_kind, accepted) in [
-        ("disabled", "disabled", true),
-        ("disabled", "anonymous", false),
-        ("disabled", "bearer", false),
-        ("optional", "disabled", false),
-        ("optional", "anonymous", true),
-        ("optional", "bearer", true),
-        ("required", "disabled", false),
-        ("required", "anonymous", false),
-        ("required", "bearer", true),
+        (None, "disabled", true),
+        (None, "anonymous", false),
+        (None, "bearer", false),
+        (Some("optional"), "disabled", false),
+        (Some("optional"), "anonymous", true),
+        (Some("optional"), "bearer", true),
+        (Some("required"), "disabled", false),
+        (Some("required"), "anonymous", false),
+        (Some("required"), "bearer", true),
     ] {
         let directory = trusted_product_tempdir();
         let socket_path = directory.path().join("access-flow.sock");
@@ -167,7 +173,8 @@ async fn access_flow_product_enforces_the_identity_mode_matrix() {
             let response = read_http_message(&mut client).await;
             assert!(
                 response.starts_with(b"HTTP/1.1 403 "),
-                "mode={mode}, presentation={presentation_kind}, response={:?}",
+                "mode={}, presentation={presentation_kind}, response={:?}",
+                mode.unwrap_or("omitted"),
                 String::from_utf8_lossy(&response)
             );
         } else {
@@ -184,7 +191,8 @@ async fn access_flow_product_enforces_the_identity_mode_matrix() {
                 .expect("rejected Access Flow remained open");
             assert!(
                 matches!(read, Ok(0) | Err(_)),
-                "mode={mode}, presentation={presentation_kind} reached HTTP"
+                "mode={}, presentation={presentation_kind} reached HTTP",
+                mode.unwrap_or("omitted")
             );
         }
 
@@ -526,11 +534,11 @@ identity_states = ["authenticated"]
 
 enum CarrierIngress {
     Explicit {
-        identity_mode: &'static str,
+        identity_mode: Option<&'static str>,
         headers: String,
     },
     AccessFlow {
-        identity_mode: &'static str,
+        identity_mode: Option<&'static str>,
         presentation: &'static str,
     },
 }
@@ -543,37 +551,37 @@ async fn protected_identity_carriers_stop_before_policy_capture_and_upstream() {
         (
             "explicit duplicate",
             CarrierIngress::Explicit {
-                identity_mode: "required",
+                identity_mode: Some("required"),
                 headers: format!(
                     "x-aw-identity-token: {FILE_BEARER}\r\nx-aw-identity-token: {FILE_BEARER}\r\n"
                 ),
             },
         ),
         (
-            "explicit disabled",
+            "explicit identity omitted",
             CarrierIngress::Explicit {
-                identity_mode: "disabled",
+                identity_mode: None,
                 headers: format!("x-aw-identity-token: {FILE_BEARER}\r\n"),
             },
         ),
         (
-            "Access Flow disabled",
+            "Access Flow identity omitted",
             CarrierIngress::AccessFlow {
-                identity_mode: "disabled",
+                identity_mode: None,
                 presentation: "disabled",
             },
         ),
         (
             "Access Flow anonymous",
             CarrierIngress::AccessFlow {
-                identity_mode: "optional",
+                identity_mode: Some("optional"),
                 presentation: "anonymous",
             },
         ),
         (
             "Access Flow authenticated",
             CarrierIngress::AccessFlow {
-                identity_mode: "required",
+                identity_mode: Some("required"),
                 presentation: "bearer",
             },
         ),
@@ -612,13 +620,15 @@ endpoint.kind = "tcp"
 endpoint.address = "{}"
 http_versions = ["http1"]
 
-[listeners.explicit_http.identity]
-mode = "{identity_mode}"
+{identity}
 
 [listeners.explicit_http.connect]
 http1 = "deny"
 "#,
-                    addresses[0]
+                    addresses[0],
+                    identity = identity_mode.map_or_else(String::new, |mode| format!(
+                        "[listeners.explicit_http.identity]\nmode = \"{mode}\""
+                    ))
                 ),
                 *identity_mode,
                 reservations.unwrap().into_listeners(),
@@ -631,24 +641,24 @@ endpoint.admission_timeout = "1s"
 endpoint.allowed_destination_ports = [80]
 http_versions = ["http1"]
 
-[listeners.transparent_http.identity]
-mode = "{identity_mode}"
+{identity}
 
 [listeners.transparent_http.endpoint.transport]
 kind = "unix"
 path = {socket_path:?}
 mode = "0600"
-"#
+"#,
+                    identity = identity_mode.map_or_else(String::new, |mode| format!(
+                        "[listeners.transparent_http.identity]\nmode = \"{mode}\""
+                    ))
                 ),
                 *identity_mode,
                 Vec::new(),
             ),
         };
-        let resolver = if identity_mode == "disabled" {
-            String::new()
-        } else {
+        let resolver = identity_mode.map_or_else(String::new, |_| {
             identity_resolver(&fs::canonicalize(&token_path).unwrap())
-        };
+        });
         let config_path = directory.path().join("acl-proxy.toml");
         fs::write(
             &config_path,

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -419,8 +419,10 @@ impl AccessFlowListenerRuntime {
         let supervisor_latch = Arc::clone(&admission_latch);
         let supervisor = tokio::spawn(async move {
             let mut routes = tokio::task::JoinSet::new();
+            let mut route_kinds = HashMap::new();
             for listener in listeners {
-                routes.spawn(run_access_flow_listener(
+                let kind = listener.kind;
+                let task = routes.spawn(run_access_flow_listener(
                     listener,
                     service.clone(),
                     Arc::clone(&identity_admission),
@@ -428,27 +430,17 @@ impl AccessFlowListenerRuntime {
                     supervisor_force.clone(),
                     AccessFlowAdmissionGuard(Arc::clone(&supervisor_latch)),
                 ));
+                route_kinds.insert(task.id(), kind);
             }
 
             tokio::select! {
                 biased;
                 _ = supervisor_admission.cancelled() => {}
-                result = routes.join_next() => {
-                    let failure = match result {
-                        Some(Ok(Err(failure))) => failure,
-                        Some(Err(_)) => Arc::new(ProxyListenerFailure {
-                            listener: ProxyListenerKind::TransparentHttp,
-                            message: "Access Flow listener task failed".to_owned(),
-                        }),
-                        Some(Ok(Ok(kind))) => Arc::new(ProxyListenerFailure {
-                            listener: kind,
-                            message: "Access Flow listener exited unexpectedly".to_owned(),
-                        }),
-                        None => Arc::new(ProxyListenerFailure {
-                            listener: ProxyListenerKind::TransparentHttp,
-                            message: "all Access Flow listeners exited unexpectedly".to_owned(),
-                        }),
-                    };
+                result = routes.join_next_with_id() => {
+                    let failure = access_flow_route_failure(
+                        result.expect("the Access Flow route set is nonempty"),
+                        &mut route_kinds,
+                    );
                     failure_observer(failure);
                     supervisor_admission.cancel();
                     supervisor_force.cancel();
@@ -559,6 +551,36 @@ impl ProductListenerRuntime {
         }
         if let Some(access_flow) = &self.access_flow {
             access_flow.shutdown_and_wait(deadline).await;
+        }
+    }
+}
+
+type AccessFlowRouteJoinResult = Result<
+    (
+        tokio::task::Id,
+        Result<ProxyListenerKind, Arc<ProxyListenerFailure>>,
+    ),
+    tokio::task::JoinError,
+>;
+
+fn access_flow_route_failure(
+    result: AccessFlowRouteJoinResult,
+    route_kinds: &mut HashMap<tokio::task::Id, ProxyListenerKind>,
+) -> Arc<ProxyListenerFailure> {
+    match result {
+        Ok((id, Err(failure))) => {
+            route_kinds.remove(&id);
+            failure
+        }
+        Err(error) => {
+            let kind = route_kinds
+                .remove(&error.id())
+                .expect("every Access Flow listener task retains its listener kind");
+            listener_failure(kind, "Access Flow listener task failed")
+        }
+        Ok((id, Ok(kind))) => {
+            route_kinds.remove(&id);
+            listener_failure(kind, "Access Flow listener exited unexpectedly")
         }
     }
 }
@@ -1686,6 +1708,28 @@ mod tests {
             prepared.into_runtime_inputs_with_transparent_support(false),
             Err(SharedRuntimeError::InvalidInput)
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn panicked_access_flow_route_reports_its_exact_https_listener_kind() {
+        let mut routes = tokio::task::JoinSet::new();
+        let task = routes.spawn(async {
+            panic!("injected Access Flow route panic");
+            #[allow(unreachable_code)]
+            Ok::<ProxyListenerKind, Arc<ProxyListenerFailure>>(ProxyListenerKind::ExplicitHttps)
+        });
+        let mut route_kinds = HashMap::from([(task.id(), ProxyListenerKind::ExplicitHttps)]);
+        let joined = routes
+            .join_next_with_id()
+            .await
+            .expect("injected route task must complete");
+
+        let failure = access_flow_route_failure(joined, &mut route_kinds);
+
+        assert_eq!(failure.listener, ProxyListenerKind::ExplicitHttps);
+        assert_eq!(failure.message, "Access Flow listener task failed");
+        assert!(route_kinds.is_empty());
     }
 
     #[cfg(unix)]

@@ -413,7 +413,6 @@ pub(super) struct ListenerIdentityConfig {
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ListenerIdentityModeConfig {
-    Disabled,
     Optional,
     Required,
 }

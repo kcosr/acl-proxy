@@ -151,7 +151,8 @@ max_concurrent_streams = 128
 http1 = "deny" # deny | mitm
 ```
 
-Listeners support `disabled`, `optional`, or `required` workload identity:
+Listeners support `optional` or `required` workload identity. Omit the
+listener's `identity` table to disable identity:
 
 ```toml
 [listeners.explicit_http.identity]
@@ -357,18 +358,23 @@ route = "parent_proxy"
 
 [egress.parent_proxy]
 kind = "acl_proxy" # acl_proxy | generic
-url = "http://parent-proxy.example.test:8881"
+url = "https://parent-proxy.example.test:8443"
 
 [egress.parent_proxy.presentation]
 kind = "bearer_environment" # bearer_environment | bearer_file
 variable = "AW_IDENTITY_TOKEN"
+
+[egress.parent_proxy.tls]
+trust = "system"
 ```
 
 Parent endpoints may not resolve to loopback, a local interface, a data
 listener, or the control listener. DNS results are pinned and revalidated
-before and after connect. Presentation is valid only for `kind = "acl_proxy"`;
-the bearer is added to ACL Proxy parent requests and never to direct-origin or
-generic-parent traffic. A file presentation uses `path` instead of `variable`.
+before and after connect. Presentation requires an HTTPS endpoint and is valid
+only for `kind = "acl_proxy"`; the bearer is added to ACL Proxy parent requests
+and never to direct-origin or generic-parent traffic. A file presentation uses
+`path` instead of `variable`. Cleartext HTTP parents cannot carry a typed
+identity presentation.
 
 ### Policy
 

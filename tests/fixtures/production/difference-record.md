@@ -53,7 +53,7 @@ below.
 | readiness on proxy data plane | loopback control listener on 8898; proxy listeners have no control routes |
 | host-generated CA directory | explicit generated MITM mode |
 | container CA certificate/key paths | explicit file MITM mode; tests generate non-checked-in material |
-| parent host and port | `route = "parent_proxy"`, `kind = "acl_proxy"`, and one canonical HTTP URL |
+| parent host and port | `route = "parent_proxy"`, `kind = "acl_proxy"`, and one canonical HTTPS URL with explicit trust |
 | loop protection enabled with inner add-header false | unconditional detection with `inject = false` only for the `acl_proxy` child |
 | remove identity then set it from an environment placeholder | one typed static identity token source, required listener identity, and typed ACL Proxy parent presentation |
 | host identity header removal | protected carrier extraction authenticates before policy and the bearer cannot enter ordinary header configuration |

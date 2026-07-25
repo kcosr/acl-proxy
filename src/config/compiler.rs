@@ -1523,15 +1523,13 @@ fn validate_identity(config: &super::authoring::AuthoringConfig) -> Result<(), C
                 .map(|value| (&value.endpoint, value.identity.as_ref())),
         ),
     ] {
-        let Some((ListenerEndpointConfig::Tcp { .. }, Some(identity))) = listener else {
+        let Some((ListenerEndpointConfig::Tcp { .. }, Some(_identity))) = listener else {
             continue;
         };
-        if !matches!(identity.mode, ListenerIdentityModeConfig::Disabled) {
-            return Err(ConfigCompileError::at(
-                format!("{name}.identity.mode"),
-                "optional or required identity is supported only on a transparent access_flow endpoint",
-            ));
-        }
+        return Err(ConfigCompileError::at(
+            format!("{name}.identity.mode"),
+            "optional or required identity is supported only on a transparent access_flow endpoint",
+        ));
     }
     let enabled_listener = [
         config
@@ -1557,7 +1555,8 @@ fn validate_identity(config: &super::authoring::AuthoringConfig) -> Result<(), C
     ]
     .into_iter()
     .flatten()
-    .any(|identity| !matches!(identity.mode, ListenerIdentityModeConfig::Disabled));
+    .next()
+    .is_some();
     let optional_listener = [
         config
             .listeners
@@ -1836,13 +1835,11 @@ fn validate_identity(config: &super::authoring::AuthoringConfig) -> Result<(), C
             .as_ref()
             .map(|value| (&value.endpoint, value.identity.as_ref())),
     )] {
-        let Some((ListenerEndpointConfig::Tcp { address }, Some(listener_identity))) = listener
+        let Some((ListenerEndpointConfig::Tcp { address }, Some(_listener_identity))) = listener
         else {
             continue;
         };
-        if !matches!(listener_identity.mode, ListenerIdentityModeConfig::Disabled)
-            && !address.ip().is_loopback()
-        {
+        if !address.ip().is_loopback() {
             return Err(ConfigCompileError::at(
                 format!("{name}.identity.mode"),
                 "identity over cleartext TCP requires a loopback listener",
@@ -2918,6 +2915,12 @@ fn validate_tls_and_parent_matrix(
                     }
                 }
                 HttpScheme::Http => {}
+            }
+            if matches!(url.scheme(), HttpScheme::Http) && parent.presentation.is_some() {
+                return Err(ConfigCompileError::at(
+                    "egress.parent_proxy.presentation",
+                    "requires an HTTPS parent URL",
+                ));
             }
             if let Some(address) = literal_url_socket_addr(url) {
                 if config.control.as_ref().is_some_and(|control| {
@@ -7929,7 +7932,7 @@ fn compile_listener_identity_mode(
     value: Option<&super::authoring::ListenerIdentityConfig>,
 ) -> CompiledListenerIdentityMode {
     match value.map(|value| value.mode) {
-        None | Some(ListenerIdentityModeConfig::Disabled) => CompiledListenerIdentityMode::Disabled,
+        None => CompiledListenerIdentityMode::Disabled,
         Some(ListenerIdentityModeConfig::Optional) => CompiledListenerIdentityMode::Optional,
         Some(ListenerIdentityModeConfig::Required) => CompiledListenerIdentityMode::Required,
     }
@@ -8522,6 +8525,32 @@ identity_subjects = [
     }
 
     #[test]
+    fn policy_identity_subjects_reject_roles_wildcards_and_negative_ids() {
+        let role = identity_policy_config(
+            "required",
+            r#"["authenticated"]"#,
+            Some(r#"[{ kind = "role", authority = "test-authority", id = "operators" }]"#),
+        );
+        assert!(
+            toml::from_str::<super::super::authoring::AuthoringConfig>(&role).is_err(),
+            "identity role subjects must not be authored"
+        );
+
+        for id in ["*", "!test-principal"] {
+            let subjects =
+                format!(r#"[{{ kind = "principal", authority = "test-authority", id = "{id}" }}]"#);
+            let input = identity_policy_config("required", r#"["authenticated"]"#, Some(&subjects));
+            let error = compile(&input).expect_err("wildcard or negative subject ID must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("policy.rules[0].identity_subjects[0].id"),
+                "unexpected error for identity subject ID {id:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn policy_identity_anonymous_state_requires_an_optional_listener() {
         let required = identity_policy_config("required", r#"["anonymous"]"#, None);
         let error = compile(&required).expect_err("required listeners cannot produce anonymous");
@@ -8595,11 +8624,14 @@ route = "parent_proxy"
 
 [egress.parent_proxy]
 kind = "acl_proxy"
-url = "http://192.0.2.10:8080"
+url = "https://parent.example.test:8443"
 
 [egress.parent_proxy.presentation]
 kind = "bearer_environment"
 variable = "AW_ACCESS_FLOW_TOKEN"
+
+[egress.parent_proxy.tls]
+trust = "system"
 
 [policy]"#,
         );
@@ -8656,11 +8688,14 @@ route = "parent_proxy"
 
 [egress.parent_proxy]
 kind = "acl_proxy"
-url = "http://192.0.2.10:8080"
+url = "https://parent.example.test:8443"
 
 [egress.parent_proxy.presentation]
 kind = "bearer_file"
 path = "relative/token"
+
+[egress.parent_proxy.tls]
+trust = "system"
 
 [policy]"#,
         );
@@ -8694,6 +8729,11 @@ path = "relative/token"
     #[test]
     fn identity_capacity_and_listener_usage_are_strict() {
         let baseline = environment_identity_config("AW_IDENTITY_TOKEN");
+        let explicit_disabled = baseline.replace("mode = \"required\"", "mode = \"disabled\"");
+        assert!(
+            toml::from_str::<super::super::authoring::AuthoringConfig>(&explicit_disabled).is_err(),
+            "explicit disabled listener identity mode must be rejected"
+        );
         for (needle, replacement, expected_path) in [
             (
                 "max_pending_authentications = 8",
@@ -8721,7 +8761,35 @@ path = "relative/token"
             assert!(error.to_string().contains(expected_path), "{error}");
         }
 
-        let unused = baseline.replace("mode = \"required\"", "mode = \"disabled\"");
+        compile(
+            &baseline
+                .replace(
+                    "max_pending_authentications = 8",
+                    "max_pending_authentications = 4096",
+                )
+                .replace(
+                    "max_pending_authentications_per_connection = 2",
+                    "max_pending_authentications_per_connection = 256",
+                ),
+        )
+        .expect("exact identity authentication capacity bounds must compile");
+        let per_connection_zero = baseline.replace(
+            "max_pending_authentications_per_connection = 2",
+            "max_pending_authentications_per_connection = 0",
+        );
+        let error = compile(&per_connection_zero)
+            .expect_err("zero per-connection identity authentication capacity must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("identity.max_pending_authentications_per_connection"),
+            "{error}"
+        );
+
+        let unused = baseline.replace(
+            "\n[listeners.explicit_http.identity]\nmode = \"required\"\n",
+            "",
+        );
         let error = compile(&unused).expect_err("an unused resolver must fail");
         assert!(
             error
@@ -8849,8 +8917,11 @@ route = "parent_proxy"
 
 [egress.parent_proxy]
 kind = "generic"
-url = "http://192.0.2.10:8080"
+url = "https://parent.example.test:8443"
 {presentation}
+[egress.parent_proxy.tls]
+trust = "system"
+
 [policy]"#
                 ),
             );
@@ -8859,6 +8930,44 @@ url = "http://192.0.2.10:8080"
                 error
                     .to_string()
                     .contains("presentation: is valid only for an ACL Proxy parent"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn cleartext_acl_parent_rejects_every_identity_presentation_source() {
+        for presentation in [
+            r#"
+[egress.parent_proxy.presentation]
+kind = "bearer_environment"
+variable = "AW_IDENTITY_TOKEN"
+"#,
+            r#"
+[egress.parent_proxy.presentation]
+kind = "bearer_file"
+path = "/etc/acl-proxy/identity-token"
+"#,
+        ] {
+            let input = MINIMAL.replace(
+                "[policy]",
+                &format!(
+                    r#"[egress]
+route = "parent_proxy"
+
+[egress.parent_proxy]
+kind = "acl_proxy"
+url = "http://192.0.2.10:8080"
+{presentation}
+[policy]"#
+                ),
+            );
+            let error =
+                compile(&input).expect_err("cleartext parent presentation must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("egress.parent_proxy.presentation: requires an HTTPS parent URL"),
                 "{error}"
             );
         }
@@ -9175,8 +9284,10 @@ url = "http://192.0.2.10:8080"
 
     #[test]
     fn transparent_tcp_rejects_identity_before_static_listener_compilation() {
-        let baseline = environment_identity_config("AW_TRANSPARENT_TCP_IDENTITY_TOKEN")
-            .replace("mode = \"required\"", "mode = \"disabled\"");
+        let baseline = environment_identity_config("AW_TRANSPARENT_TCP_IDENTITY_TOKEN").replace(
+            "\n[listeners.explicit_http.identity]\nmode = \"required\"\n",
+            "",
+        );
         for listener in ["transparent_http", "transparent_https"] {
             for mode in ["optional", "required"] {
                 let candidate = baseline.replace(
@@ -9215,7 +9326,10 @@ mode = "{mode}"
     #[test]
     fn transparent_access_flow_compiles_enabled_identity_into_static_listener() {
         let input = environment_identity_config("AW_TRANSPARENT_ACCESS_FLOW_IDENTITY_TOKEN")
-            .replace("mode = \"required\"", "mode = \"disabled\"");
+            .replace(
+                "\n[listeners.explicit_http.identity]\nmode = \"required\"\n",
+                "",
+            );
         let input = input.replace(
             "[policy]",
             r#"[listeners.transparent_http]
@@ -9261,11 +9375,14 @@ route = "parent_proxy"
 
 [egress.parent_proxy]
 kind = "acl_proxy"
-url = "http://192.0.2.10:8080"
+url = "https://parent.example.test:8443"
 
 [egress.parent_proxy.presentation]
 kind = "bearer_environment"
 variable = "{variable}"
+
+[egress.parent_proxy.tls]
+trust = "system"
 
 "#
         );
@@ -9342,11 +9459,14 @@ route = "parent_proxy"
 
 [egress.parent_proxy]
 kind = "acl_proxy"
-url = "http://192.0.2.10:8080"
+url = "https://parent.example.test:8443"
 
 [egress.parent_proxy.presentation]
 kind = "bearer_file"
 path = "{path}"
+
+[egress.parent_proxy.tls]
+trust = "system"
 
 "#
         );

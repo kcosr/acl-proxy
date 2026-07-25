@@ -1174,8 +1174,7 @@ if text.count(needle) != 1:
     raise SystemExit("unexpected child origin TLS fixture shape")
 text = text.replace(needle, replacement)
 text = text.replace(
-    'url = "http://host-proxy.example.test:8881"\n',
-    'url = "https://host-proxy.example.test:8443"\n\n'
+    '[egress.parent_proxy.tls]\ntrust = "system"\n',
     '[egress.parent_proxy.tls]\ntrust = "custom"\n'
     'ca_certificate = "tls/parent-ca.pem"\nserver_name = "host-proxy.example.test"\n',
 )

@@ -379,9 +379,9 @@ replace_nth(
     5,
 )
 replace_once(
-    "https-listener-identity-disabled",
+    "https-listener-identity-omitted",
     '[listeners.explicit_https.identity]\nmode = "required"',
-    '[listeners.explicit_https.identity]\nmode = "disabled"',
+    '',
 )
 replace_once(
     "common-proxy-origin-header",
@@ -498,7 +498,7 @@ for mutation in missing duplicate skipped unexpected ordering proof uncalled \
     identity-header-projection host-environment-direct host-environment-connect \
     host-environment-admission host-environment-reload host-environment-shutdown \
     child-identity-present child-identity-unset-removed \
-    host-environment-unset-after-set https-listener-identity-disabled \
+    host-environment-unset-after-set https-listener-identity-omitted \
     common-proxy-origin-header internal-proxy-origin-header \
     common-proxy-long-origin-header internal-proxy-long-origin-header \
     common-proxy-attached-short-origin-header \

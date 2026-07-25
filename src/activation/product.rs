@@ -721,11 +721,14 @@ route = "parent_proxy"
 
 [egress.parent_proxy]
 kind = "acl_proxy"
-url = "http://192.0.2.10:8080"
+url = "https://parent.example.test:8443"
 
 [egress.parent_proxy.presentation]
 kind = "bearer_file"
 path = "/missing/acl-proxy-product-reload-identity-token"
+
+[egress.parent_proxy.tls]
+trust = "system"
 "#,
             environment_identity_product_config(VARIABLE, 8)
         ));
