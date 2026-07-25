@@ -799,6 +799,11 @@ polled while admitted work drains within `service.shutdown_drain_timeout`.
 `SIGHUP` is ignored after shutdown begins. A second `SIGINT` or `SIGTERM`
 abandons the graceful wait and forces prompt process termination.
 
+Capture and policy-decision admission closes when graceful shutdown begins,
+before admitted data-plane work drains. Capture jobs accepted before that
+boundary drain within the remaining shutdown deadline; observations completed
+during the later flow-drain window are intentionally omitted.
+
 Configured sockets are reserved during static preparation, but proxy listeners
 cannot start admitting data-plane work until the initial generation has
 published. Readiness is HTTP 200 only after static resources, proxy
