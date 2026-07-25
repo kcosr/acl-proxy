@@ -5,18 +5,23 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 GATE="$ROOT/scripts/check-packaging-policy.py"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/acl-proxy-packaging-policy.XXXXXX")
 RUNTIME_REPOSITORY=$(git -C "$ROOT/../access-runtime" rev-parse --show-toplevel)
-RUNTIME_COMMIT=$(python3 - "$GATE" <<'PY'
+readarray -t GATE_AUTHORITY < <(python3 - "$GATE" <<'PY'
 from pathlib import Path
 import runpy
 import sys
 
-value = runpy.run_path(Path(sys.argv[1]))["RUNTIME_COMMIT"]
-if not isinstance(value, str) or len(value) != 40:
-    raise SystemExit("packaging gate has no exact runtime commit")
-print(value)
+authority = runpy.run_path(Path(sys.argv[1]))
+for name in ("RUNTIME_COMMIT", "PRODUCT_INITIAL_COMMIT"):
+    value = authority[name]
+    if not isinstance(value, str) or len(value) != 40:
+        raise SystemExit(f"packaging gate has no exact {name}")
+    print(value)
 PY
 )
+RUNTIME_COMMIT=${GATE_AUTHORITY[0]}
+PRODUCT_INITIAL_COMMIT=${GATE_AUTHORITY[1]}
 readonly RUNTIME_COMMIT
+readonly PRODUCT_INITIAL_COMMIT
 RUNTIME_FIXTURE="$TMP/workspace/access-runtime"
 
 cleanup() {
@@ -136,6 +141,21 @@ printf '%s\n' '// untracked runtime source mutation' \
 expect_runtime_rejected runtime-untracked-source \
     'canonical sibling runtime worktree or index is not clean'
 
+python3 - "$RUNTIME_FIXTURE/PROVENANCE.md" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+marker = "- `crates/http-access-mitm`: moved and redesigned product behavior"
+if text.count(marker) != 1:
+    raise SystemExit("runtime provenance coverage mutation marker is not unique")
+path.write_text(text.replace(marker, "", 1), encoding="utf-8")
+PY
+git -C "$RUNTIME_FIXTURE" update-index --assume-unchanged PROVENANCE.md
+expect_runtime_rejected runtime-provenance-coverage \
+    'access-runtime provenance crate coverage differs from the exact shared product dependency set'
+
 expect_rejected() {
     local name=$1
     local old=$2
@@ -216,6 +236,50 @@ PY
     fi
 }
 
+expect_relay_metadata_dependency_rejected() {
+    local name=$1
+    local package_name=$2
+    local fixture="$TMP/workspace/$name"
+    cp -a "$BASELINE" "$fixture"
+    python3 - "$fixture/metadata.json" "$package_name" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+path = Path(sys.argv[1])
+package_name = sys.argv[2]
+document = json.loads(path.read_text(encoding="utf-8"))
+packages = [package for package in document["packages"] if package["name"] == package_name]
+if len(packages) != 1:
+    raise SystemExit(f"expected exactly one metadata package {package_name!r}")
+relay = [
+    package
+    for package in document["packages"]
+    if package["name"] == "acl-proxy-access-flow-relay"
+]
+if len(relay) != 1:
+    raise SystemExit("expected exactly one relay metadata package")
+nodes = [node for node in document["resolve"]["nodes"] if node["id"] == relay[0]["id"]]
+if len(nodes) != 1:
+    raise SystemExit("expected exactly one relay resolution node")
+package_id = packages[0]["id"]
+nodes[0]["dependencies"].append(package_id)
+nodes[0]["deps"].append(
+    {
+        "name": f"forbidden_{package_name.replace('-', '_')}",
+        "pkg": package_id,
+        "dep_kinds": [{"kind": None, "target": 'cfg(target_os = "linux")'}],
+    }
+)
+path.write_text(json.dumps(document), encoding="utf-8")
+PY
+    if run_gate "$fixture" >"$fixture.out" 2>&1; then
+        printf 'packaging relay metadata dependency mutation unexpectedly passed: %s\n' \
+            "$name" >&2
+        exit 1
+    fi
+}
+
 expect_created_path_rejected() {
     local name=$1
     local path=$2
@@ -249,12 +313,14 @@ expect_rejected relay-workspace-member $'[workspace]\nmembers = [".", "crates/ac
 expect_rejected relay-default-member 'default-members = [".", "crates/access-flow-relay"]' 'default-members = ["."]' Cargo.toml
 expect_rejected relay-shared-engine 'access-flow-relay = {' 'removed-access-flow-relay = {' crates/access-flow-relay/Cargo.toml
 expect_rejected relay-unix-adapter 'access-flow-unix = {' 'removed-access-flow-unix = {' crates/access-flow-relay/Cargo.toml
+expect_rejected relay-publish-guard 'publish = false' 'publish = true' crates/access-flow-relay/Cargo.toml
 expect_rejected release-repository 'kcosr/acl-proxy-access-runtime' 'kcosr/acl-proxy' scripts/release.mjs
 expect_rejected release-remote 'const RELEASE_REMOTE = "access-runtime";' 'const RELEASE_REMOTE = "origin";' scripts/release.mjs
 expect_rejected publish-guard 'publish = false' 'publish = true' Cargo.toml
 expect_rejected lock-product-version $'name = "acl-proxy"\nversion = "0.3.0-rc.1"' $'name = "acl-proxy"\nversion = "0.3.0-rc.2"' Cargo.lock
 expect_metadata_rejected metadata-product-version acl-proxy version 0.3.0-rc.2
 expect_metadata_rejected metadata-publish-guard acl-proxy publish unexpected
+expect_metadata_rejected metadata-relay-publish-guard acl-proxy-access-flow-relay publish unexpected
 expect_rejected compu-version '=1.2.0' '^1.2.0' Cargo.toml
 expect_rejected http-version 'http = "=1.4.2"' 'http = "1.4"' Cargo.toml
 expect_rejected h2-version 'h2 = "=0.4.15"' 'h2 = "0.4"' Cargo.toml
@@ -265,6 +331,32 @@ expect_rejected renamed-http-body-util $'http = "=1.4.2"' $'http = "=1.4.2"\nbod
 expect_rejected direct-hyper $'http = "=1.4.2"' $'http = "=1.4.2"\nhyper = "=1.10.1"' Cargo.toml
 expect_rejected renamed-hyper $'http = "=1.4.2"' $'http = "=1.4.2"\ntransport = { package = "hyper", version = "=1.10.1" }' Cargo.toml
 expect_rejected direct-hyper-util $'http = "=1.4.2"' $'http = "=1.4.2"\nhyper-util = "=0.1.20"' Cargo.toml
+relay_linux_dependencies='[target.'"'"'cfg(target_os = "linux")'"'"'.dependencies]'
+relay_linux_dev_dependencies='[target.'"'"'cfg(target_os = "linux")'"'"'.dev-dependencies]'
+expect_rejected relay-direct-http \
+    "$relay_linux_dependencies" \
+    "$relay_linux_dependencies"$'\nhttp = "=1.4.2"' \
+    crates/access-flow-relay/Cargo.toml
+expect_rejected relay-renamed-h2 \
+    "$relay_linux_dev_dependencies" \
+    "$relay_linux_dev_dependencies"$'\nrelay-h2 = { package = "h2", version = "=0.4.15" }' \
+    crates/access-flow-relay/Cargo.toml
+expect_rejected relay-direct-hyper \
+    "$relay_linux_dependencies" \
+    "$relay_linux_dependencies"$'\nhyper = "=1.10.1"' \
+    crates/access-flow-relay/Cargo.toml
+expect_rejected relay-renamed-hyper-util \
+    "$relay_linux_dependencies" \
+    "$relay_linux_dependencies"$'\nrelay-hyper-util = { package = "hyper-util", version = "=0.1.20" }' \
+    crates/access-flow-relay/Cargo.toml
+expect_rejected relay-target-build-http-body \
+    "$relay_linux_dev_dependencies" \
+    $'[target.'"'"'cfg(target_os = "linux")'"'"'.build-dependencies]\nhttp-body = "=1.0.1"\n\n'"$relay_linux_dev_dependencies" \
+    crates/access-flow-relay/Cargo.toml
+expect_rejected relay-renamed-http-body-util \
+    "$relay_linux_dependencies" \
+    $'[build-dependencies]\nrelay-body = { package = "http-body-util", version = "=0.1.3" }\n\n'"$relay_linux_dependencies" \
+    crates/access-flow-relay/Cargo.toml
 expect_rejected missing-patch '[patch.crates-io]' '[patch.removed]' Cargo.toml
 expect_rejected wrong-patch-path '../access-runtime/third_party/hyper' '../wrong-runtime/third_party/hyper' Cargo.toml
 expect_rejected extra-patch $'hyper = { path = "../access-runtime/third_party/hyper" }' $'hyper = { path = "../access-runtime/third_party/hyper" }\nhttp = { path = "../access-runtime/third_party/hyper" }' Cargo.toml
@@ -287,6 +379,7 @@ expect_metadata_rejected metadata-hyper-source hyper source "registry+https://gi
 expect_metadata_rejected metadata-hyper-path hyper manifest_path /tmp/wrong-runtime/third_party/hyper/Cargo.toml
 expect_metadata_duplicate_rejected metadata-duplicate-http http
 expect_metadata_duplicate_rejected metadata-duplicate-hyper hyper
+expect_relay_metadata_dependency_rejected metadata-relay-hyper hyper
 expect_rejected lock-http-version $'name = "http"\nversion = "1.4.2"' $'name = "http"\nversion = "0.2.12"' Cargo.lock
 expect_rejected lock-hyper-source $'name = "hyper"\nversion = "1.10.1"' $'name = "hyper"\nversion = "1.10.1"\nsource = "registry+https://github.com/rust-lang/crates.io-index"' Cargo.lock
 expect_rejected lock-duplicate-hyper $'name = "hyper-util"\nversion = "0.1.20"' $'name = "hyper"\nversion = "0.14.32"\n\n[[package]]\nname = "hyper-util"\nversion = "0.1.20"' Cargo.lock
@@ -294,6 +387,26 @@ expect_rejected brotli-copyright 'Copyright (c) 2009, 2010, 2013-2016 by the Bro
 expect_rejected dropbox-copyright 'Copyright (c) 2016 Dropbox, Inc.' 'Copyright removed from Dropbox brotli.' THIRD_PARTY_NOTICES
 expect_rejected zstd-copyright 'Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.' 'Copyright removed from Zstandard.' THIRD_PARTY_NOTICES
 expect_rejected hyper-license-copyright 'Copyright (c) 2014-2026 Sean McArthur' 'Copyright removed from Hyper.' THIRD_PARTY_NOTICES
+expect_rejected provenance-product-initial \
+    "$PRODUCT_INITIAL_COMMIT" \
+    1111111111111111111111111111111111111111 \
+    PROVENANCE.md
+initial_record=$(printf -- '- Initial source commit: `%s`' "$PRODUCT_INITIAL_COMMIT")
+expect_rejected provenance-product-initial-unstructured \
+    "$initial_record" \
+    "Product source lineage includes \`$PRODUCT_INITIAL_COMMIT\`." \
+    PROVENANCE.md
+initial_duplicate_record=$(printf -- '%s\n%s' "$initial_record" "$initial_record")
+expect_rejected provenance-product-initial-duplicate \
+    "$initial_record" \
+    "$initial_duplicate_record" \
+    PROVENANCE.md
+initial_conflicting_record=$(printf -- '%s\n- Initial source commit: `%s`' \
+    "$initial_record" 1111111111111111111111111111111111111111)
+expect_rejected provenance-product-initial-conflict \
+    "$initial_record" \
+    "$initial_conflicting_record" \
+    PROVENANCE.md
 expect_rejected provenance-runtime "$RUNTIME_COMMIT" 'wrong-runtime-commit' PROVENANCE.md
 runtime_record=$(printf -- '- Accepted runtime commit:\n  `%s`' "$RUNTIME_COMMIT")
 runtime_duplicate_record=$(printf -- '%s\n- Accepted runtime commit:\n  `%s`' \
@@ -320,6 +433,10 @@ expect_rejected archive-root 'acl-proxy-<version>-<acl12>/' 'acl-proxy-release/'
 expect_rejected archive-hardcoded-sha 'acl-proxy-<version>-<acl12>/' 'acl-proxy-0.3.0-rc.1-0123456789ab/' README.md
 expect_rejected archive-linux-name 'acl-proxy-<version>-<acl12>-linux-x86_64.tar.gz' 'acl-proxy-<version>-<acl12>-linux-amd64.tar.gz' README.md
 expect_rejected archive-macos-name 'acl-proxy-<version>-<acl12>-macos-arm64.tar.gz' 'acl-proxy-<version>-<acl12>-darwin-arm64.tar.gz' README.md
+expect_rejected archive-macos-qualification \
+    $'no macOS archive is built or\nincluded in this candidate' \
+    $'a macOS archive may be built or\nincluded in this candidate' \
+    README.md
 expect_rejected candidate-doc-version 'The `0.3.0-rc.1` candidate requires' 'The `0.3.0-rc.2` candidate requires' README.md
 expect_created_path_rejected obsolete-demo demos/auth-plugin-stdio/README.md
 expect_created_path_rejected obsolete-relay-crate crates/transparent-uds-relay/Cargo.toml

@@ -16,9 +16,11 @@ Release archives contain `acl-proxy`, the capture-body extraction helper, this
 README, `LICENSE`, `THIRD_PARTY_NOTICES`, and `acl-proxy.sample.toml`. Linux
 archives also contain the Linux-only Access Flow relay. To build locally:
 
-Published archive filenames are
-`acl-proxy-<version>-<acl12>-linux-x86_64.tar.gz` and
-`acl-proxy-<version>-<acl12>-macos-arm64.tar.gz`.
+The current local candidate contains only
+`acl-proxy-<version>-<acl12>-linux-x86_64.tar.gz`. The planned filename for a
+future native-host-validated macOS ARM64 archive is
+`acl-proxy-<version>-<acl12>-macos-arm64.tar.gz`; no macOS archive is built or
+included in this candidate.
 
 ```text
 acl-proxy-<version>-<acl12>/
@@ -33,8 +35,9 @@ acl-proxy-<version>-<acl12>/
 
 `<version>` is the exact Cargo package version and `<acl12>` is the first 12
 lowercase hexadecimal characters of the packaged `acl-proxy` commit. That
-directory is the archive root. The Linux archive has the three shown `bin/`
-entries; the macOS archive omits the Linux-only relay and has the other two.
+directory is the archive root. The current Linux archive has the three shown
+`bin/` entries; the planned macOS archive would omit the Linux-only relay and
+have the other two.
 
 The `0.3.0-rc.1` candidate requires `schema_version = 3`; configurations for
 the `0.2.x` contract must be rewritten rather than migrated through aliases or

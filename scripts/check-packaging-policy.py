@@ -22,8 +22,16 @@ ALLOWED_LICENSES = {
 }
 REGISTRY = "https://github.com/rust-lang/crates.io-index"
 PRODUCT_VERSION = "0.3.0-rc.1"
-RUNTIME_COMMIT = "a2a00081e383e9ed89d8d2f757909873507c829d"
+RUNTIME_COMMIT = "d571d88011923b0d639d1c3ea88ce43cfcfe1a3f"
 PRODUCT_INITIAL_COMMIT = "a829f43552c7118d1f206b9e4112b3c747eecd50"
+PRIVATE_TRANSPORT_PACKAGES = {
+    "h2",
+    "http",
+    "http-body",
+    "http-body-util",
+    "hyper",
+    "hyper-util",
+}
 TRANSPORT_PACKAGES = {
     "h2": ("0.4.15", True),
     "http": ("1.4.2", True),
@@ -196,6 +204,42 @@ def resolved_product_package(root: Path, metadata: dict[str, Any]) -> dict[str, 
     return product[0]
 
 
+def dependency_tables(manifest: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    tables: list[tuple[str, dict[str, Any]]] = []
+    for table_name in ("dependencies", "dev-dependencies", "build-dependencies"):
+        table = manifest.get(table_name)
+        if isinstance(table, dict):
+            tables.append((table_name, table))
+    targets = manifest.get("target")
+    if isinstance(targets, dict):
+        for target_name, target in targets.items():
+            if not isinstance(target, dict):
+                continue
+            for table_name in ("dependencies", "dev-dependencies", "build-dependencies"):
+                table = target.get(table_name)
+                if isinstance(table, dict):
+                    tables.append((f"target.{target_name}.{table_name}", table))
+    return tables
+
+
+def dependency_package_name(
+    name: str,
+    specification: Any,
+    workspace_dependencies: dict[str, Any],
+) -> str:
+    if not isinstance(specification, dict):
+        return name
+    package = specification.get("package")
+    if isinstance(package, str):
+        return package
+    if specification.get("workspace") is True:
+        inherited = workspace_dependencies.get(name)
+        if inherited is None:
+            fail(f"workspace dependency {name!r} has no workspace definition")
+        return dependency_package_name(name, inherited, {})
+    return name
+
+
 def check_manifest(root: Path) -> None:
     if (root / "crates/transparent-uds-relay").exists():
         fail("obsolete transparent UDS relay crate is present")
@@ -239,8 +283,9 @@ def check_manifest(root: Path) -> None:
         not isinstance(relay, dict)
         or relay.get("name") != "acl-proxy-access-flow-relay"
         or relay.get("version") != {"workspace": True}
+        or relay.get("publish") is not False
     ):
-        fail("Access Flow relay must inherit the workspace version")
+        fail("Access Flow relay must inherit the workspace version and remain non-publishable")
     linux_dependencies = (
         relay_manifest.get("target", {})
         .get("cfg(target_os = \"linux\")", {})
@@ -278,24 +323,14 @@ def check_manifest(root: Path) -> None:
     if "replace" in manifest:
         fail("Cargo.toml must not contain [replace] source overrides")
 
-    dependency_tables: list[tuple[str, dict[str, Any]]] = []
-    for table_name in ("dependencies", "dev-dependencies", "build-dependencies"):
-        table = manifest.get(table_name)
-        if isinstance(table, dict):
-            dependency_tables.append((table_name, table))
-    targets = manifest.get("target")
-    if isinstance(targets, dict):
-        for target_name, target in targets.items():
-            if not isinstance(target, dict):
-                continue
-            for table_name in ("dependencies", "dev-dependencies", "build-dependencies"):
-                table = target.get(table_name)
-                if isinstance(table, dict):
-                    dependency_tables.append((f"target.{target_name}.{table_name}", table))
-    for table_name, table in dependency_tables:
+    workspace_dependencies = workspace.get("dependencies", {})
+    if not isinstance(workspace_dependencies, dict):
+        fail("workspace dependency table must be a table")
+    for table_name, table in dependency_tables(manifest):
         for name, specification in table.items():
-            package = specification.get("package") if isinstance(specification, dict) else None
-            resolved_name = package or name
+            resolved_name = dependency_package_name(
+                name, specification, workspace_dependencies
+            )
             if resolved_name in {"http-body", "http-body-util", "hyper", "hyper-util"}:
                 fail(
                     "acl-proxy must not directly depend on private transport package "
@@ -303,10 +338,22 @@ def check_manifest(root: Path) -> None:
                 )
             if resolved_name == "http" and (table_name != "dependencies" or name != "http"):
                 fail("http must remain the canonical root production dependency")
-            if (name == "h2" or package == "h2") and (
+            package = specification.get("package") if isinstance(specification, dict) else None
+            if resolved_name == "h2" and (
                 table_name != "dev-dependencies" or name != "h2" or package is not None
             ):
                 fail("h2 must remain the canonical root development-only dependency")
+
+    for table_name, table in dependency_tables(relay_manifest):
+        for name, specification in table.items():
+            resolved_name = dependency_package_name(
+                name, specification, workspace_dependencies
+            )
+            if resolved_name in PRIVATE_TRANSPORT_PACKAGES:
+                fail(
+                    "Access Flow relay must not directly depend on private transport package "
+                    f"{resolved_name} ({table_name}.{name})"
+                )
 
 
 def check_transport_resolution(
@@ -335,6 +382,61 @@ def check_transport_resolution(
         fail(f"locked metadata must resolve acl-proxy {PRODUCT_VERSION}")
     if product.get("publish") != []:
         fail("locked metadata must retain the acl-proxy publication guard")
+    relay_manifest_path = (root / "crates/access-flow-relay/Cargo.toml").resolve()
+    relay_packages = [
+        package
+        for package in packages
+        if package.get("name") == "acl-proxy-access-flow-relay"
+        and package.get("version") == PRODUCT_VERSION
+        and isinstance(package.get("manifest_path"), str)
+        and Path(package["manifest_path"]).resolve() == relay_manifest_path
+    ]
+    if len(relay_packages) != 1:
+        fail("locked metadata must resolve one exact Access Flow relay package")
+    relay = relay_packages[0]
+    if relay.get("publish") != []:
+        fail("locked metadata must retain the Access Flow relay publication guard")
+    relay_id = relay.get("id")
+    workspace_members = metadata.get("workspace_members")
+    default_members = metadata.get("workspace_default_members")
+    if (
+        not isinstance(relay_id, str)
+        or not isinstance(workspace_members, list)
+        or not isinstance(default_members, list)
+        or relay_id not in workspace_members
+        or relay_id not in default_members
+    ):
+        fail("locked metadata does not retain the relay as a default workspace member")
+    resolve = metadata.get("resolve")
+    nodes = resolve.get("nodes") if isinstance(resolve, dict) else None
+    if not isinstance(nodes, list):
+        fail("locked metadata lacks resolution nodes")
+    relay_nodes = [node for node in nodes if node.get("id") == relay_id]
+    if len(relay_nodes) != 1:
+        fail("locked metadata lacks one exact Access Flow relay resolution node")
+    package_by_id = {
+        package.get("id"): package
+        for package in packages
+        if isinstance(package.get("id"), str)
+    }
+    relay_dependencies = relay_nodes[0].get("dependencies")
+    relay_edges = relay_nodes[0].get("deps")
+    if not isinstance(relay_dependencies, list) or not isinstance(relay_edges, list):
+        fail("locked metadata relay resolution node is malformed")
+    edge_packages = []
+    for edge in relay_edges:
+        package_id = edge.get("pkg") if isinstance(edge, dict) else None
+        package = package_by_id.get(package_id)
+        if package is None:
+            fail("locked metadata relay dependency edge has no package")
+        edge_packages.append(package_id)
+        if package.get("name") in PRIVATE_TRANSPORT_PACKAGES:
+            fail(
+                "locked metadata gives the Access Flow relay a private transport dependency "
+                f"{package.get('name')}"
+            )
+    if sorted(relay_dependencies) != sorted(edge_packages):
+        fail("locked metadata relay dependency lists disagree")
     hyper = next(package for package in packages if package.get("name") == "hyper")
     manifest_path = hyper.get("manifest_path")
     if not isinstance(manifest_path, str):
@@ -557,7 +659,6 @@ def check_notices(root: Path, metadata: dict[str, Any]) -> None:
 def check_provenance(root: Path) -> None:
     provenance = read_text(root / "PROVENANCE.md")
     for marker in (
-        PRODUCT_INITIAL_COMMIT,
         RUNTIME_COMMIT,
         "access-runtime/PROVENANCE.md",
         "compu-brotli-sys` 1.2.0",
@@ -566,6 +667,14 @@ def check_provenance(root: Path) -> None:
     ):
         if marker not in provenance:
             fail(f"PROVENANCE.md lacks required marker: {marker}")
+    if provenance.count(PRODUCT_INITIAL_COMMIT) != 1:
+        fail("PROVENANCE.md must name the exact product initial commit once")
+    initial_product_commits = re.findall(
+        r"(?m)^- Initial source commit: `([0-9a-f]{40})`$",
+        provenance,
+    )
+    if initial_product_commits != [PRODUCT_INITIAL_COMMIT]:
+        fail("PROVENANCE.md must contain one exact product initial commit record")
     if provenance.count(RUNTIME_COMMIT) != 1:
         fail("PROVENANCE.md must name the exact accepted runtime commit once")
     accepted_runtime_commits = re.findall(
@@ -574,6 +683,35 @@ def check_provenance(root: Path) -> None:
     )
     if accepted_runtime_commits != [RUNTIME_COMMIT]:
         fail("PROVENANCE.md must contain one exact accepted runtime commit record")
+
+    product_manifests = [
+        load_toml(root / "Cargo.toml"),
+        load_toml(root / "crates/access-flow-relay/Cargo.toml"),
+    ]
+    shared_crates = set()
+    for manifest in product_manifests:
+        for _, table in dependency_tables(manifest):
+            for specification in table.values():
+                if not isinstance(specification, dict):
+                    continue
+                path = specification.get("path")
+                if not isinstance(path, str):
+                    continue
+                match = re.search(r"(?:^|/)access-runtime/crates/([^/]+)$", path)
+                if match is not None:
+                    shared_crates.add(match.group(1))
+    runtime_provenance = read_text(root.parent / "access-runtime/PROVENANCE.md")
+    coverage = dict(
+        re.findall(
+            r"(?m)^- `crates/([^`]+)`: (.+)$",
+            runtime_provenance,
+        )
+    )
+    if set(coverage) != shared_crates:
+        fail(
+            "access-runtime provenance crate coverage differs from the exact "
+            "shared product dependency set"
+        )
 
 
 def check_shipped_docs(root: Path) -> None:
@@ -606,15 +744,17 @@ def check_shipped_docs(root: Path) -> None:
     if any(entry not in readme for entry in required_layout):
         fail("README lacks the exact versioned release layout")
     archive_names = (
-        "Published archive filenames are "
-        "`acl-proxy-<version>-<acl12>-linux-x86_64.tar.gz` and "
-        "`acl-proxy-<version>-<acl12>-macos-arm64.tar.gz`."
+        "The current local candidate contains only "
+        "`acl-proxy-<version>-<acl12>-linux-x86_64.tar.gz`. The planned filename "
+        "for a future native-host-validated macOS ARM64 archive is "
+        "`acl-proxy-<version>-<acl12>-macos-arm64.tar.gz`; no macOS archive is "
+        "built or included in this candidate."
     )
     if archive_names not in normalized:
         fail("README lacks the exact platform archive filenames")
     platform_inventory = (
-        "The Linux archive has the three shown `bin/` entries; the macOS archive "
-        "omits the Linux-only relay and has the other two."
+        "The current Linux archive has the three shown `bin/` entries; the planned "
+        "macOS archive would omit the Linux-only relay and have the other two."
     )
     if platform_inventory not in normalized:
         fail("README lacks the platform-specific relay archive contract")
