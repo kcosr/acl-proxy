@@ -129,13 +129,29 @@ impl<Job> BoundedCaptureWorker<Job> {
     }
 
     fn try_enter_submission(&self) -> Option<SubmissionGuard<'_, Job>> {
+        self.try_enter_submission_inner(|| {})
+    }
+
+    fn try_enter_submission_inner(
+        &self,
+        admission_entered: impl FnOnce(),
+    ) -> Option<SubmissionGuard<'_, Job>> {
         // An admitted submitter must keep the receiver open until its send completes.
         let sender = self.sender.load_full()?;
         let admission = self.admission.try_enter()?;
+        admission_entered();
         Some(SubmissionGuard {
             sender,
             _admission: admission,
         })
+    }
+
+    #[cfg(test)]
+    fn try_enter_submission_with_admission_hook(
+        &self,
+        admission_entered: impl FnOnce(),
+    ) -> Option<SubmissionGuard<'_, Job>> {
+        self.try_enter_submission_inner(admission_entered)
     }
 
     pub(super) fn begin_shutdown(&self) {
@@ -446,6 +462,36 @@ mod tests {
 
         worker.shutdown().await;
         assert_eq!(processed.load(Ordering::Relaxed), TOTAL_JOBS);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admitted_submitter_retains_sender_across_shutdown() {
+        let processed = Arc::new(AtomicUsize::new(0));
+        let worker = BoundedCaptureWorker::<()>::start(1, {
+            let processed = Arc::clone(&processed);
+            move |_| {
+                processed.fetch_add(1, Ordering::Release);
+            }
+        })
+        .unwrap();
+        let submission = worker
+            .try_enter_submission_with_admission_hook(|| worker.begin_shutdown())
+            .expect("admitted submitter must retain the sender across shutdown");
+        assert!(
+            worker.sender.load_full().is_none(),
+            "shutdown must unpublish the root sender"
+        );
+        let permit = submission
+            .sender
+            .try_reserve()
+            .expect("admitted submitter must retain queue access");
+        worker.custody.accept();
+        permit.send(());
+        drop(submission);
+        tokio::time::timeout(Duration::from_secs(1), worker.shutdown())
+            .await
+            .expect("worker did not drain the admitted submission");
+        assert_eq!(processed.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test]
