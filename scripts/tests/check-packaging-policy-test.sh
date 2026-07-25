@@ -11,7 +11,7 @@ import runpy
 import sys
 
 authority = runpy.run_path(Path(sys.argv[1]))
-for name in ("RUNTIME_COMMIT", "PRODUCT_INITIAL_COMMIT"):
+for name in ("RUNTIME_COMMIT", "RUNTIME_TREE", "PRODUCT_INITIAL_COMMIT"):
     value = authority[name]
     if not isinstance(value, str) or len(value) != 40:
         raise SystemExit(f"packaging gate has no exact {name}")
@@ -19,8 +19,10 @@ for name in ("RUNTIME_COMMIT", "PRODUCT_INITIAL_COMMIT"):
 PY
 )
 RUNTIME_COMMIT=${GATE_AUTHORITY[0]}
-PRODUCT_INITIAL_COMMIT=${GATE_AUTHORITY[1]}
+RUNTIME_TREE=${GATE_AUTHORITY[1]}
+PRODUCT_INITIAL_COMMIT=${GATE_AUTHORITY[2]}
 readonly RUNTIME_COMMIT
+readonly RUNTIME_TREE
 readonly PRODUCT_INITIAL_COMMIT
 RUNTIME_FIXTURE="$TMP/workspace/access-runtime"
 
@@ -54,6 +56,7 @@ printf '%s\n' '// metadata-only fixture' >"$BASELINE/crates/access-flow-relay/sr
 
 run_gate() {
     local fixture=$1
+    local runtime_source_tree=${2:-}
     local resolved_metadata
     resolved_metadata=$(mktemp "$TMP/resolved-metadata.XXXXXX.json")
     python3 - "$fixture/metadata.json" "$resolved_metadata" "$BASELINE" "$fixture" <<'PY'
@@ -75,9 +78,73 @@ def rebase(value):
 
 destination.write_text(json.dumps(rebase(document)), encoding="utf-8")
 PY
-    python3 "$GATE" --root "$fixture" --metadata "$resolved_metadata"
+    arguments=(--root "$fixture" --metadata "$resolved_metadata")
+    if [[ -n $runtime_source_tree ]]; then
+        arguments+=(--runtime-source-tree "$runtime_source_tree")
+    fi
+    python3 "$GATE" "${arguments[@]}"
 }
 
+run_gate "$BASELINE"
+
+reset_runtime_archive_fixture() {
+    git -C "$RUNTIME_REPOSITORY" worktree remove --force "$RUNTIME_FIXTURE" \
+        >/dev/null 2>&1 || true
+    rm -rf "$RUNTIME_FIXTURE"
+    mkdir -p "$RUNTIME_FIXTURE"
+    git -C "$RUNTIME_REPOSITORY" archive "$RUNTIME_COMMIT" \
+        | tar -x -C "$RUNTIME_FIXTURE"
+}
+
+expect_archive_rejected() {
+    local name=$1
+    local expected=$2
+    local source_tree=${3:-$RUNTIME_TREE}
+    if run_gate "$BASELINE" "$source_tree" >"$TMP/$name.out" 2>&1; then
+        printf 'packaging archive mutation unexpectedly passed: %s\n' "$name" >&2
+        exit 1
+    fi
+    if ! grep -Fq "$expected" "$TMP/$name.out"; then
+        printf 'packaging archive mutation failed for the wrong reason: %s\n' "$name" >&2
+        cat "$TMP/$name.out" >&2
+        exit 1
+    fi
+    reset_runtime_archive_fixture
+    run_gate "$BASELINE" "$RUNTIME_TREE" >/dev/null
+}
+
+reset_runtime_archive_fixture
+run_gate "$BASELINE" "$RUNTIME_TREE"
+if run_gate "$BASELINE" >"$TMP/archive-mode-omitted.out" 2>&1; then
+    printf '%s\n' 'metadata-free runtime unexpectedly passed without an authenticated tree' >&2
+    exit 1
+fi
+grep -Fq 'cannot verify canonical sibling runtime source state' \
+    "$TMP/archive-mode-omitted.out"
+expect_archive_rejected archive-wrong-tree \
+    'authenticated runtime source tree argument differs from the accepted runtime tree' \
+    0000000000000000000000000000000000000000
+
+printf '\n// authenticated archive content mutation\n' \
+    >>"$RUNTIME_FIXTURE/crates/http-access-types/src/lib.rs"
+expect_archive_rejected archive-content-mutation \
+    'authenticated runtime source archive tree differs from the accepted runtime tree'
+
+chmod +x "$RUNTIME_FIXTURE/crates/http-access-types/src/lib.rs"
+expect_archive_rejected archive-mode-mutation \
+    'authenticated runtime source archive tree differs from the accepted runtime tree'
+
+ln -s PROVENANCE.md "$RUNTIME_FIXTURE/untracked-source-link"
+expect_archive_rejected archive-symlink-mutation \
+    'authenticated runtime source archive tree differs from the accepted runtime tree'
+
+mkdir "$RUNTIME_FIXTURE/.git"
+expect_archive_rejected archive-git-metadata \
+    'authenticated runtime source archive contains Git metadata'
+
+rm -rf "$RUNTIME_FIXTURE"
+git -C "$RUNTIME_REPOSITORY" worktree add --detach "$RUNTIME_FIXTURE" "$RUNTIME_COMMIT" \
+    >/dev/null
 run_gate "$BASELINE"
 
 MISMATCHED_ROOT="$TMP/workspace/metadata-root-mismatch"

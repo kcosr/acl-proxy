@@ -4,6 +4,16 @@ set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 
+runtime_source_tree=
+if (( $# != 0 )); then
+    if (( $# != 2 )) || [[ $1 != --runtime-source-tree ]] \
+        || [[ ! $2 =~ ^[0-9a-f]{40}$ ]]; then
+        printf 'usage: %s [--runtime-source-tree <40-hex-git-tree>]\n' "$0" >&2
+        exit 2
+    fi
+    runtime_source_tree=$2
+fi
+
 ownership_gates=(
     scripts/check-packaging-policy.sh
     scripts/check-public-api.sh
@@ -36,7 +46,15 @@ mutation_suites=(
 )
 
 for gate in "${ownership_gates[@]}"; do
-    "$gate"
+    if [[ $gate == scripts/check-packaging-policy.sh ]]; then
+        if [[ -n $runtime_source_tree ]]; then
+            "$gate" --runtime-source-tree "$runtime_source_tree"
+        else
+            "$gate"
+        fi
+    else
+        "$gate"
+    fi
 done
 for suite in "${mutation_suites[@]}"; do
     "$suite"

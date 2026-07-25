@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import tomllib
 from typing import Any
 
@@ -23,6 +25,7 @@ ALLOWED_LICENSES = {
 REGISTRY = "https://github.com/rust-lang/crates.io-index"
 PRODUCT_VERSION = "0.3.0-rc.1"
 RUNTIME_COMMIT = "d571d88011923b0d639d1c3ea88ce43cfcfe1a3f"
+RUNTIME_TREE = "2e5bf5997c3d6ac84660d13cbbcbfe8e7385b88b"
 PRODUCT_INITIAL_COMMIT = "a829f43552c7118d1f206b9e4112b3c747eecd50"
 PRIVATE_TRANSPORT_PACKAGES = {
     "h2",
@@ -479,10 +482,74 @@ def check_transport_resolution(
             fail("Cargo.lock Hyper 1.10.1 must be source-less")
 
 
+def source_tree_for_directory(root: Path) -> str:
+    with tempfile.TemporaryDirectory(prefix="acl-proxy-runtime-tree-") as temporary:
+        scratch = Path(temporary)
+        git_directory = scratch / "repository.git"
+        template_directory = scratch / "templates"
+        template_directory.mkdir()
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("GIT_")
+        }
+        environment.update(
+            {
+                "GIT_ATTR_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_TERMINAL_PROMPT": "0",
+                "HOME": str(scratch),
+                "LC_ALL": "C",
+                "XDG_CONFIG_HOME": str(scratch / "xdg"),
+            }
+        )
+
+        def git(*arguments: str) -> str:
+            try:
+                return subprocess.run(
+                    ["git", *arguments],
+                    check=True,
+                    capture_output=True,
+                    cwd=root,
+                    env=environment,
+                    text=True,
+                ).stdout.strip()
+            except (OSError, subprocess.CalledProcessError) as error:
+                fail(f"cannot reconstruct authenticated runtime source tree: {error}")
+
+        git(
+            "-c",
+            "init.defaultBranch=source-tree",
+            "init",
+            "--quiet",
+            "--bare",
+            f"--template={template_directory}",
+            str(git_directory),
+        )
+        source_arguments = (
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "core.filemode=true",
+            "-c",
+            "core.symlinks=true",
+            f"--git-dir={git_directory}",
+            f"--work-tree={root}",
+        )
+        git(*source_arguments, "add", "--force", "--all", "--", ".")
+        tree = git(*source_arguments, "write-tree")
+        if not re.fullmatch(r"[0-9a-f]{40}", tree):
+            fail("reconstructed authenticated runtime source tree is invalid")
+        return tree
+
+
 def check_runtime_source(
     root: Path,
     metadata: dict[str, Any],
     product: dict[str, Any],
+    runtime_source_tree: str | None,
 ) -> set[str]:
     packages = metadata.get("packages")
     if not isinstance(packages, list):
@@ -534,40 +601,49 @@ def check_runtime_source(
     if not runtime_crates:
         fail("locked metadata resolves no canonical sibling runtime crates")
 
-    try:
-        top_level = subprocess.run(
-            ["git", "-C", str(runtime_root), "rev-parse", "--show-toplevel"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        head = subprocess.run(
-            ["git", "-C", str(runtime_root), "rev-parse", "--verify", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        status = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(runtime_root),
-                "status",
-                "--porcelain=v1",
-                "--untracked-files=all",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
-    except (OSError, subprocess.CalledProcessError) as error:
-        fail(f"cannot verify canonical sibling runtime source state: {error}")
-    if Path(top_level).resolve() != runtime_root:
-        fail("canonical sibling runtime is not one complete Git worktree")
-    if head != RUNTIME_COMMIT:
-        fail("canonical sibling runtime HEAD differs from the accepted runtime commit")
-    if status:
-        fail("canonical sibling runtime worktree or index is not clean")
+    if runtime_source_tree is None:
+        try:
+            top_level = subprocess.run(
+                ["git", "-C", str(runtime_root), "rev-parse", "--show-toplevel"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            head = subprocess.run(
+                ["git", "-C", str(runtime_root), "rev-parse", "--verify", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            status = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(runtime_root),
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        except (OSError, subprocess.CalledProcessError) as error:
+            fail(f"cannot verify canonical sibling runtime source state: {error}")
+        if Path(top_level).resolve() != runtime_root:
+            fail("canonical sibling runtime is not one complete Git worktree")
+        if head != RUNTIME_COMMIT:
+            fail("canonical sibling runtime HEAD differs from the accepted runtime commit")
+        if status:
+            fail("canonical sibling runtime worktree or index is not clean")
+    else:
+        if runtime_source_tree != RUNTIME_TREE:
+            fail("authenticated runtime source tree argument differs from the accepted runtime tree")
+        git_metadata = runtime_root / ".git"
+        if git_metadata.exists() or git_metadata.is_symlink():
+            fail("authenticated runtime source archive contains Git metadata")
+        if source_tree_for_directory(runtime_root) != runtime_source_tree:
+            fail("authenticated runtime source archive tree differs from the accepted runtime tree")
     return runtime_crates
 
 
@@ -852,6 +928,10 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--metadata", type=Path)
+    parser.add_argument(
+        "--runtime-source-tree",
+        type=str,
+    )
     args = parser.parse_args()
     root = args.root.resolve()
     try:
@@ -860,7 +940,12 @@ def main() -> int:
         metadata = load_metadata(root, args.metadata)
         product = resolved_product_package(root, metadata)
         check_transport_resolution(root, metadata, product)
-        shared_crates = check_runtime_source(root, metadata, product)
+        shared_crates = check_runtime_source(
+            root,
+            metadata,
+            product,
+            args.runtime_source_tree,
+        )
         check_notices(root, metadata)
         check_provenance(root, shared_crates)
         check_shipped_docs(root)
