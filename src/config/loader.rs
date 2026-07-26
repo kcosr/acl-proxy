@@ -240,18 +240,11 @@ fn load_selected_config(
             let main_rule_count = authored
                 .as_ref()
                 .map_or(0, |main: &AuthoringConfig| main.policy.rules.len());
-            let candidate_rule_count = fragment_rules
-                .len()
-                .checked_add(fragment.rules.len())
-                .and_then(|count| count.checked_add(main_rule_count))
-                .ok_or(ConfigLoadError::TooManyPolicyRules {
-                    max_rules: MAX_COMPOSED_POLICY_RULES,
-                })?;
-            if candidate_rule_count > MAX_COMPOSED_POLICY_RULES {
-                return Err(ConfigLoadError::TooManyPolicyRules {
-                    max_rules: MAX_COMPOSED_POLICY_RULES,
-                });
-            }
+            ensure_incremental_policy_rule_limit(
+                fragment_rules.len(),
+                fragment.rules.len(),
+                main_rule_count,
+            )?;
             fragment_rules
                 .try_reserve(fragment.rules.len())
                 .map_err(|_| ConfigLoadError::Provenance {
@@ -275,16 +268,7 @@ fn load_selected_config(
         source: source_snapshot::SourceSnapshotError::MissingMain,
     })?;
     let main_rule_count = authored.policy.rules.len();
-    let total_rule_count = fragment_rules.len().checked_add(main_rule_count).ok_or(
-        ConfigLoadError::TooManyPolicyRules {
-            max_rules: MAX_COMPOSED_POLICY_RULES,
-        },
-    )?;
-    if total_rule_count > MAX_COMPOSED_POLICY_RULES {
-        return Err(ConfigLoadError::TooManyPolicyRules {
-            max_rules: MAX_COMPOSED_POLICY_RULES,
-        });
-    }
+    let total_rule_count = ensure_final_policy_rule_limit(fragment_rules.len(), main_rule_count)?;
     fragment_rules
         .try_reserve(main_rule_count)
         .map_err(|_| ConfigLoadError::Provenance {
@@ -311,6 +295,31 @@ fn load_selected_config(
         config_root,
         path_source: selected.source,
     })
+}
+
+fn ensure_incremental_policy_rule_limit(
+    existing_fragment_rules: usize,
+    incoming_fragment_rules: usize,
+    main_rules: usize,
+) -> Result<usize, ConfigLoadError> {
+    let fragment_rules = existing_fragment_rules.checked_add(incoming_fragment_rules);
+    ensure_policy_rule_limit(fragment_rules.and_then(|count| count.checked_add(main_rules)))
+}
+
+fn ensure_final_policy_rule_limit(
+    fragment_rules: usize,
+    main_rules: usize,
+) -> Result<usize, ConfigLoadError> {
+    ensure_policy_rule_limit(fragment_rules.checked_add(main_rules))
+}
+
+fn ensure_policy_rule_limit(count: Option<usize>) -> Result<usize, ConfigLoadError> {
+    match count {
+        Some(count) if count <= MAX_COMPOSED_POLICY_RULES => Ok(count),
+        Some(_) | None => Err(ConfigLoadError::TooManyPolicyRules {
+            max_rules: MAX_COMPOSED_POLICY_RULES,
+        }),
+    }
 }
 
 fn parse_fragment_text(
@@ -982,10 +991,14 @@ rules = [{{ literals = "{SECRET_MARKER}" }}]
         fs::create_dir(&rules_path).unwrap();
         fs::write(&config_path, MINIMAL_CONFIG).unwrap();
         fs::write(rules_path.join(".editor.tmp"), "").unwrap();
-        assert!(matches!(
-            load_path(&config_path).unwrap_err(),
-            ConfigLoadError::Snapshot { .. }
-        ));
+        let error = load_path(&config_path).unwrap_err();
+        assert!(matches!(error, ConfigLoadError::Snapshot { .. }));
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains(".editor.tmp"), "{diagnostic}");
+        assert!(
+            !diagnostic.contains(directory.path().to_str().unwrap()),
+            "{diagnostic}"
+        );
         fs::remove_file(rules_path.join(".editor.tmp")).unwrap();
         for name in ["10-Users.toml", "10-users.toml"] {
             fs::write(
@@ -996,6 +1009,46 @@ rules = [{{ literals = "{SECRET_MARKER}" }}]
         }
         let error = load_path(&config_path).unwrap_err();
         assert!(error.to_string().contains("ASCII case folding"), "{error}");
+    }
+
+    #[test]
+    fn incremental_fragment_rule_limit_checks_boundary_and_overflow() {
+        assert_eq!(
+            ensure_incremental_policy_rule_limit(MAX_COMPOSED_POLICY_RULES - 2, 1, 1).unwrap(),
+            MAX_COMPOSED_POLICY_RULES
+        );
+        assert!(matches!(
+            ensure_incremental_policy_rule_limit(MAX_COMPOSED_POLICY_RULES - 2, 2, 1),
+            Err(ConfigLoadError::TooManyPolicyRules {
+                max_rules: MAX_COMPOSED_POLICY_RULES
+            })
+        ));
+        assert!(matches!(
+            ensure_incremental_policy_rule_limit(usize::MAX, 1, 0),
+            Err(ConfigLoadError::TooManyPolicyRules {
+                max_rules: MAX_COMPOSED_POLICY_RULES
+            })
+        ));
+    }
+
+    #[test]
+    fn final_rule_limit_checks_main_only_boundary_and_overflow() {
+        assert_eq!(
+            ensure_final_policy_rule_limit(0, MAX_COMPOSED_POLICY_RULES).unwrap(),
+            MAX_COMPOSED_POLICY_RULES
+        );
+        assert!(matches!(
+            ensure_final_policy_rule_limit(0, MAX_COMPOSED_POLICY_RULES + 1),
+            Err(ConfigLoadError::TooManyPolicyRules {
+                max_rules: MAX_COMPOSED_POLICY_RULES
+            })
+        ));
+        assert!(matches!(
+            ensure_final_policy_rule_limit(1, usize::MAX),
+            Err(ConfigLoadError::TooManyPolicyRules {
+                max_rules: MAX_COMPOSED_POLICY_RULES
+            })
+        ));
     }
 
     #[cfg(unix)]

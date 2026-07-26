@@ -34,6 +34,10 @@
 
 ### Added
 
+- Added schema-v4 implicit sibling `rules.d` policy fragments with secure
+  bounded snapshot loading, deterministic fragment-before-main composition,
+  global rule validation, source-aware diagnostics and policy dumps, and
+  atomic generation-preserving reload behavior.
 - Added host-owned transparent HTTP/HTTPS Unix listeners and the Linux-only
   `acl-proxy-access-flow-relay` adapter over the shared Access Flow engine,
   including strict AWAF framing, bounded relay resources, fail-closed pre-existing path refusal,

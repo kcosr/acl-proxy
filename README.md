@@ -436,6 +436,74 @@ Upgrades are denied unless every matched allow/delegate cursor explicitly sets
 `allow_upgrades = true`. The default allow decision never authorizes an
 upgrade.
 
+#### Policy Fragments (`rules.d`)
+
+For a selected main file such as `/etc/acl-proxy/acl-proxy.toml`, ACL Proxy
+implicitly discovers only the sibling `/etc/acl-proxy/rules.d` directory.
+Missing or empty `rules.d` means there are no fragment rules. A fragment is a
+strict schema-4 TOML document containing only the required version and one or
+more rules:
+
+```toml
+schema_version = 4
+
+[[rules]]
+id = "workstation-read"
+decision = "allow"
+urls = ["https://api.example.test/**"]
+methods = ["GET"]
+```
+
+Fragment `[[rules]]` use the same rule shape as main-file
+`[[policy.rules]]`. Product configuration, a fragment default, unknown fields,
+and empty rule lists are rejected.
+
+Eligible fragment names are at most 255 ASCII bytes and match
+`[A-Za-z0-9][A-Za-z0-9._-]*\.toml`. Windows reserved device basenames and
+names that collide under ASCII case folding are rejected on every platform.
+Every directory entry must be an eligible direct, single-link regular file;
+symlinks, Windows reparse points, hard links, nested directories, special
+files, and unrelated temporary files reject the complete candidate.
+
+The hard source bounds are:
+
+| Resource | Limit |
+| --- | ---: |
+| Direct `rules.d` entries and fragment files | 1,024 |
+| Bytes per fragment | 2 MiB |
+| Aggregate fragment bytes | 10 MiB |
+| Main configuration bytes | 10 MiB |
+| Composed policy rules | 100,000 |
+| Aggregate identity subjects | 4,096 |
+
+ACL Proxy composes one global first-match policy: fragment files in ascending
+ASCII filename order, rules within each fragment in authored order, then
+main-file rules in authored order, followed by the main-file default. Rule IDs
+and all references and compiler limits are global. A delegated `pass` advances
+to the next rule in this global order.
+
+Write access to `rules.d` grants policy authority equal to write access to the
+main rule list. A writer can prepend an allow, invoke any provider, credential,
+or redaction effect available from the main configuration, remove fragment
+denies, or make the next reload fail. There is no protected mandatory-rule
+tier. The main file, its parent and redirect-capable ancestors, and `rules.d`
+must therefore be writable only by principals granted full policy authority;
+group- or world-writable policy paths are a deployment security error.
+
+Use one trusted writer for the main file, fragments, and reload trigger. Stage
+temporary files outside `rules.d`, atomically rename completed files into
+place, request one reload only after the complete set is stable, and retain
+writer serialization until reload completes. Any file, membership, mutation,
+parse, reference, bounds, or activation failure preserves the complete prior
+generation.
+
+`config validate`, `policy dump`, startup, CA export, and reload all use the
+same composition facade. Diagnostics identify `main` or
+`rules.d/<filename>` plus the source-local rule index. Table dumps add
+`RULE_ID` and `SOURCE`; JSON rules contain a tagged `source` object. Absolute
+host paths are omitted from routine diagnostics, dumps, and reload
+observations.
+
 ### Authorization Providers
 
 Process providers exchange bounded newline-delimited JSON and are owned by the

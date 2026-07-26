@@ -4,6 +4,11 @@ use std::io;
 use std::path::Path;
 
 #[cfg(unix)]
+use std::os::unix::ffi::OsStrExt as _;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt as _;
+
+#[cfg(unix)]
 mod unix;
 #[cfg(windows)]
 mod windows;
@@ -20,6 +25,7 @@ pub(super) const MAX_MAIN_BYTES: usize = 10 * 1024 * 1024;
 pub(super) const MAX_FRAGMENT_BYTES: usize = 2 * 1024 * 1024;
 pub(super) const MAX_FRAGMENT_AGGREGATE_BYTES: usize = 10 * 1024 * 1024;
 pub(super) const MAX_FRAGMENT_ENTRIES: usize = 1_024;
+const MAX_DIAGNOSTIC_BASENAME_BYTES: usize = 96;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ObjectKind {
@@ -125,7 +131,9 @@ pub(super) enum SourceSnapshotError {
         max_bytes: usize,
     },
     TooManyEntries,
-    InvalidFragmentName,
+    InvalidFragmentName {
+        basename: String,
+    },
     CaseCollision {
         first: String,
         second: String,
@@ -163,8 +171,9 @@ impl fmt::Display for SourceSnapshotError {
                 formatter,
                 "rules.d exceeds the {MAX_FRAGMENT_ENTRIES}-entry limit"
             ),
-            Self::InvalidFragmentName => formatter.write_str(
-                "rules.d contains an entry whose name violates the fragment filename contract",
+            Self::InvalidFragmentName { basename } => write!(
+                formatter,
+                "rules.d entry basename `{basename}` violates the fragment filename contract"
             ),
             Self::CaseCollision { first, second } => write!(
                 formatter,
@@ -484,10 +493,10 @@ fn validate_names(raw_names: Vec<OsString>) -> Result<Vec<FragmentName>, SourceS
         .map_err(|_| SourceSnapshotError::Allocation)?;
     for raw_name in raw_names {
         let Some(name) = raw_name.to_str() else {
-            return Err(SourceSnapshotError::InvalidFragmentName);
+            return Err(invalid_fragment_name(&raw_name)?);
         };
         if !valid_fragment_name(name) {
-            return Err(SourceSnapshotError::InvalidFragmentName);
+            return Err(invalid_fragment_name(&raw_name)?);
         }
         if let Some(first) = names
             .iter()
@@ -501,6 +510,103 @@ fn validate_names(raw_names: Vec<OsString>) -> Result<Vec<FragmentName>, SourceS
         names.push(FragmentName(name.to_owned()));
     }
     Ok(names)
+}
+
+fn invalid_fragment_name(name: &OsStr) -> Result<SourceSnapshotError, SourceSnapshotError> {
+    Ok(SourceSnapshotError::InvalidFragmentName {
+        basename: sanitized_fragment_basename(name)?,
+    })
+}
+
+fn sanitized_fragment_basename(name: &OsStr) -> Result<String, SourceSnapshotError> {
+    let mut sanitized = String::new();
+    sanitized
+        .try_reserve_exact(MAX_DIAGNOSTIC_BASENAME_BYTES)
+        .map_err(|_| SourceSnapshotError::Allocation)?;
+
+    #[cfg(unix)]
+    {
+        let basename = name
+            .as_bytes()
+            .rsplit(|byte| matches!(byte, b'/' | b'\\'))
+            .next()
+            .unwrap_or_default();
+        append_unix_basename(&mut sanitized, basename);
+    }
+    #[cfg(windows)]
+    {
+        let basename_start = name
+            .encode_wide()
+            .enumerate()
+            .fold(0, |start, (index, unit)| {
+                if matches!(unit, 0x2f | 0x5c) {
+                    index + 1
+                } else {
+                    start
+                }
+            });
+        append_windows_basename(&mut sanitized, name.encode_wide().skip(basename_start));
+    }
+
+    if sanitized.is_empty() {
+        sanitized.push_str("<empty>");
+    }
+    Ok(sanitized)
+}
+
+#[cfg(unix)]
+fn append_unix_basename(sanitized: &mut String, basename: &[u8]) {
+    for &byte in basename {
+        let appended = if matches!(byte, 0x20..=0x7e) {
+            append_diagnostic_ascii(sanitized, byte)
+        } else {
+            append_diagnostic_escape(sanitized, b'x', u32::from(byte), 2)
+        };
+        if !appended {
+            sanitized.push_str("...");
+            break;
+        }
+    }
+}
+
+#[cfg(windows)]
+fn append_windows_basename(sanitized: &mut String, basename: impl Iterator<Item = u16>) {
+    for unit in basename {
+        let appended = if matches!(unit, 0x20..=0x7e) {
+            append_diagnostic_ascii(sanitized, unit as u8)
+        } else if unit <= 0xff {
+            append_diagnostic_escape(sanitized, b'x', u32::from(unit), 2)
+        } else {
+            append_diagnostic_escape(sanitized, b'u', u32::from(unit), 4)
+        };
+        if !appended {
+            sanitized.push_str("...");
+            break;
+        }
+    }
+}
+
+fn append_diagnostic_ascii(sanitized: &mut String, byte: u8) -> bool {
+    if sanitized.len() + 1 > MAX_DIAGNOSTIC_BASENAME_BYTES - 3 {
+        return false;
+    }
+    sanitized.push(char::from(byte));
+    true
+}
+
+fn append_diagnostic_escape(sanitized: &mut String, prefix: u8, value: u32, digits: usize) -> bool {
+    let encoded_len = 2 + digits;
+    if sanitized.len() + encoded_len > MAX_DIAGNOSTIC_BASENAME_BYTES - 3 {
+        return false;
+    }
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    sanitized.push('\\');
+    sanitized.push(char::from(prefix));
+    for shift in (0..digits).rev() {
+        let nibble = ((value >> (shift * 4)) & 0x0f) as usize;
+        sanitized.push(char::from(HEX[nibble]));
+    }
+    true
 }
 
 fn valid_fragment_name(name: &str) -> bool {
@@ -530,7 +636,7 @@ mod tests {
     use std::ffi::CString;
     use std::fs;
     #[cfg(unix)]
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     use tempfile::tempdir;
 
@@ -572,6 +678,36 @@ mod tests {
         ])
         .unwrap_err();
         assert!(matches!(error, SourceSnapshotError::CaseCollision { .. }));
+    }
+
+    #[test]
+    fn invalid_fragment_diagnostic_is_bounded_to_a_sanitized_basename() {
+        let raw = OsString::from(format!(
+            "/private/config/rules.d/bad-\n-{}.toml",
+            "z".repeat(128)
+        ));
+        let error = validate_names(vec![raw]).unwrap_err();
+        let SourceSnapshotError::InvalidFragmentName { basename } = &error else {
+            panic!("unexpected error: {error}");
+        };
+        let message = error.to_string();
+
+        assert!(basename.len() <= MAX_DIAGNOSTIC_BASENAME_BYTES);
+        assert!(message.contains(r#"bad-\x0a-"#), "{message}");
+        assert!(!message.contains("/private/config"), "{message}");
+        assert!(!message.contains('\n'), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_fragment_diagnostic_does_not_emit_raw_filename_bytes() {
+        let raw = OsString::from_vec(b"/private/rules.d/secret-\xff.toml".to_vec());
+        let error = validate_names(vec![raw]).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains(r#"secret-\xff.toml"#), "{message}");
+        assert!(!message.contains("/private"), "{message}");
+        assert!(message.is_ascii(), "{message}");
     }
 
     #[cfg(unix)]

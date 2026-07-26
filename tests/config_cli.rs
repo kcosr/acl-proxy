@@ -434,6 +434,52 @@ fn config_validate_reports_sanitized_syntax_errors() {
     assert!(!stderr.contains("secret-value-that-must-not-leak"));
 }
 
+#[test]
+fn config_validate_reports_only_the_invalid_fragment_basename() {
+    let directory = TempDir::new().expect("create temporary directory");
+    let config = directory.path().join("acl-proxy.toml");
+    let rules = directory.path().join("rules.d");
+    fs::write(&config, MINIMAL).expect("write config");
+    fs::create_dir(&rules).expect("create rules directory");
+    fs::write(rules.join(".editor.tmp"), "").expect("write invalid fragment");
+
+    let output = command()
+        .args(["config", "validate", "--config"])
+        .arg(&config)
+        .output()
+        .expect("run config validate");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains(".editor.tmp"), "{stderr}");
+    assert!(
+        !stderr.contains(directory.path().to_str().unwrap()),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn config_validate_escapes_controls_in_invalid_fragment_basename() {
+    let directory = TempDir::new().expect("create temporary directory");
+    let config = directory.path().join("acl-proxy.toml");
+    let rules = directory.path().join("rules.d");
+    fs::write(&config, MINIMAL).expect("write config");
+    fs::create_dir(&rules).expect("create rules directory");
+    fs::write(rules.join("bad-\n-name.toml"), "").expect("write invalid fragment");
+
+    let output = command()
+        .args(["config", "validate", "--config"])
+        .arg(&config)
+        .output()
+        .expect("run config validate");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains(r#"bad-\x0a-name.toml"#), "{stderr}");
+    assert!(!stderr.contains("bad-\n-name.toml"), "{stderr}");
+}
+
 #[cfg(unix)]
 #[test]
 fn static_cli_commands_never_execute_provider_or_resolve_secrets() {
