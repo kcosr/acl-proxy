@@ -197,11 +197,13 @@ impl std::error::Error for SourceSnapshotError {
 pub(super) enum SnapshotEvent<'a> {
     ParentOpened,
     MainProbed,
+    MainReadChunk(usize),
     MainReadComplete,
     RulesDirectoryProbed,
     InitialInventoryComplete,
     FragmentProbed(&'a str),
     FragmentOpened(&'a str),
+    FragmentReadChunk(&'a str, usize),
     FragmentReadComplete(&'a str),
     BeforeFinalInventory,
     FinalInventoryComplete,
@@ -240,8 +242,10 @@ pub(super) fn load_sources_with_observer<E>(
     let (mut main_file, main_open) = platform::open_file_at(&parent, main_name)
         .map_err(|source| snapshot_io("opening main", source))?;
     require_unchanged("main", main_probe, main_open).map_err(LoadSourcesError::Snapshot)?;
-    let main_bytes = platform::read_file_limited(&mut main_file, MAX_MAIN_BYTES + 1)
-        .map_err(|source| snapshot_io("reading main", source))?;
+    let main_bytes = platform::read_file_limited(&mut main_file, MAX_MAIN_BYTES + 1, |bytes| {
+        observe(SnapshotEvent::MainReadChunk(bytes));
+    })
+    .map_err(|source| snapshot_io("reading main", source))?;
     if main_bytes.len() > MAX_MAIN_BYTES {
         return Err(LoadSourcesError::Snapshot(SourceSnapshotError::TooLarge {
             source: "main".to_owned(),
@@ -335,8 +339,10 @@ pub(super) fn load_sources_with_observer<E>(
             .map_err(|source| snapshot_io("opening a rules.d fragment", source))?;
         observe(SnapshotEvent::FragmentOpened(name.as_str()));
         require_unchanged(&source_name, *probe, opened).map_err(LoadSourcesError::Snapshot)?;
-        let bytes = platform::read_file_limited(&mut file, MAX_FRAGMENT_BYTES + 1)
-            .map_err(|source| snapshot_io("reading a rules.d fragment", source))?;
+        let bytes = platform::read_file_limited(&mut file, MAX_FRAGMENT_BYTES + 1, |bytes| {
+            observe(SnapshotEvent::FragmentReadChunk(name.as_str(), bytes));
+        })
+        .map_err(|source| snapshot_io("reading a rules.d fragment", source))?;
         if bytes.len() > MAX_FRAGMENT_BYTES {
             return Err(LoadSourcesError::Snapshot(SourceSnapshotError::TooLarge {
                 source: source_name,
@@ -610,6 +616,44 @@ mod tests {
             |event| {
                 if matches!(event, SnapshotEvent::FragmentProbed("10-first.toml")) {
                     fs::rename(&replacement, &fragment).unwrap();
+                }
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(LoadSourcesError::Snapshot(
+                SourceSnapshotError::Changed { .. }
+            ))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn in_place_fragment_mutation_between_read_chunks_is_rejected() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let directory = tempdir().unwrap();
+        let main = directory.path().join("acl-proxy.toml");
+        let rules = directory.path().join("rules.d");
+        let fragment = rules.join("10-first.toml");
+        fs::create_dir(&rules).unwrap();
+        fs::write(&main, MAIN).unwrap();
+        let mut content = FRAGMENT.as_bytes().to_vec();
+        content.resize(128 * 1024, b' ');
+        fs::write(&fragment, content).unwrap();
+        let mut mutated = false;
+
+        let result = load_sources_with_observer(
+            &main,
+            |_, _| Ok::<_, ()>(()),
+            |event| {
+                if !mutated && matches!(event, SnapshotEvent::FragmentReadChunk("10-first.toml", _))
+                {
+                    let mut writer = fs::OpenOptions::new().write(true).open(&fragment).unwrap();
+                    writer.seek(SeekFrom::Start(80 * 1024)).unwrap();
+                    writer.write_all(b"changed").unwrap();
+                    writer.sync_all().unwrap();
+                    mutated = true;
                 }
             },
         );

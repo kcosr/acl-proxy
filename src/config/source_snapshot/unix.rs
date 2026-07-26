@@ -92,6 +92,7 @@ pub(super) fn read_directory(
 pub(super) fn read_file_limited(
     file: &mut FileHandle,
     limit_plus_one: usize,
+    mut on_chunk: impl FnMut(usize),
 ) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut remaining = limit_plus_one;
@@ -105,6 +106,7 @@ pub(super) fn read_file_limited(
         bytes.try_reserve(read).map_err(io::Error::other)?;
         bytes.extend_from_slice(&buffer[..read]);
         remaining -= read;
+        on_chunk(read);
     }
     Ok(bytes)
 }

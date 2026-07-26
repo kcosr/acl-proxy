@@ -228,6 +228,7 @@ pub(super) fn read_directory(
 pub(super) fn read_file_limited(
     file: &mut FileHandle,
     limit_plus_one: usize,
+    mut on_chunk: impl FnMut(usize),
 ) -> io::Result<Vec<u8>> {
     let capacity = limit_plus_one.min(READ_BUFFER_BYTES);
     let mut output = Vec::with_capacity(capacity);
@@ -241,6 +242,7 @@ pub(super) fn read_file_limited(
             break;
         }
         output.extend_from_slice(&buffer[..read]);
+        on_chunk(read);
     }
 
     Ok(output)
