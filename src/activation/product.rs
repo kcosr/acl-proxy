@@ -451,11 +451,14 @@ header = "x-acl-proxy-request-id"
     }
 
     #[derive(Default)]
-    struct ProductCandidateSource(Mutex<VecDeque<crate::config::CompiledConfig>>);
+    struct ProductCandidateSource(Mutex<VecDeque<crate::config::RuntimeCandidate>>);
 
     impl ProductCandidateSource {
         fn push(&self, candidate: crate::config::CompiledConfig) {
-            self.0.lock().unwrap().push_back(candidate);
+            self.0
+                .lock()
+                .unwrap()
+                .push_back(candidate.into_runtime_candidate());
         }
     }
 
@@ -463,7 +466,7 @@ header = "x-acl-proxy-request-id"
         fn load_latest(
             &self,
             cancellation: ActivationCancellation,
-        ) -> BoxFuture<'_, Result<crate::config::CompiledConfig, RuntimeError>> {
+        ) -> BoxFuture<'_, Result<crate::config::RuntimeCandidate, RuntimeError>> {
             Box::pin(async move {
                 cancellation.check()?;
                 self.0.lock().unwrap().pop_front().ok_or_else(|| {
@@ -575,7 +578,10 @@ redaction_profile = "environment"
         let initial = compile(&text);
         let successor = compile(&text);
         let (runtime, source) = product_runtime(&initial).await;
-        let first = runtime.start(initial).await.unwrap();
+        let first = runtime
+            .start(initial.into_runtime_candidate())
+            .await
+            .unwrap();
         let old_lease = runtime.lease().await.unwrap();
 
         std::env::set_var(VARIABLE, "new-generation-secret");
@@ -583,6 +589,7 @@ redaction_profile = "environment"
         let crate::runtime::ReloadTriggerResult::Completed {
             attempts,
             generation: second,
+            ..
         } = runtime.trigger_reload().await.unwrap()
         else {
             panic!("the sole reload attempt must publish its candidate");
@@ -617,7 +624,10 @@ redaction_profile = "environment"
         let initial = compile(&text);
         let failed_successor = compile(&text);
         let (runtime, source) = product_runtime(&initial).await;
-        let first = runtime.start(initial).await.unwrap();
+        let first = runtime
+            .start(initial.into_runtime_candidate())
+            .await
+            .unwrap();
 
         std::env::remove_var(VARIABLE);
         source.push(failed_successor);
@@ -698,7 +708,10 @@ variable = "{variable}"
         let runtime = crate::runtime::Runtime::new(ownership, source.clone(), activator)
             .await
             .unwrap();
-        let first = runtime.start(initial).await.unwrap();
+        let first = runtime
+            .start(initial.into_runtime_candidate())
+            .await
+            .unwrap();
         let resolver = publisher.generation_marker_for_test().unwrap();
         assert_eq!(publisher.connection_capacity_for_test(), 2);
 

@@ -785,7 +785,7 @@ mod tests {
     use super::*;
     use crate::activation::static_resources::ProductStaticResources;
     use crate::authorization::protocol::{ProviderBodyReplacement, ProviderCredentialSet};
-    use crate::config::{compile_config_text, CompiledConfig, ConfigTextInput};
+    use crate::config::{compile_config_text, CompiledConfig, ConfigTextInput, RuntimeCandidate};
     use crate::runtime::{
         ActivationCancellation, CandidateSource, GenerationLease, Runtime, RuntimeError,
         StaticOwnership,
@@ -913,7 +913,7 @@ header = "x-test-loop"
         fn load_latest(
             &self,
             _cancellation: ActivationCancellation,
-        ) -> BoxFuture<'_, Result<CompiledConfig, RuntimeError>> {
+        ) -> BoxFuture<'_, Result<RuntimeCandidate, RuntimeError>> {
             Box::pin(async { Err(RuntimeError::CandidateSource("unused".into())) })
         }
     }
@@ -973,7 +973,10 @@ header = "x-test-loop"
         let runtime = Runtime::new(ownership, Arc::new(EmptySource), activator)
             .await
             .unwrap();
-        runtime.start(initial).await.unwrap();
+        runtime
+            .start(initial.into_runtime_candidate())
+            .await
+            .unwrap();
         let lease = runtime.lease().await.unwrap();
         (runtime, lease, pool)
     }

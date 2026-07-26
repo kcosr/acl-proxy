@@ -7,11 +7,15 @@ use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
 use super::authoring::{AuthoringConfig, RulesFragmentConfig};
-use super::source_snapshot::{self, LoadSourcesError, SourceInventorySummary, SourceRef};
+use super::provenance::{
+    PolicyProvenance, PolicyProvenanceBuilder, PolicySourceSummary, ProvenanceError,
+};
+use super::source_snapshot::{self, LoadSourcesError, SourceRef};
 
 const CONFIG_PATH_ENV: &str = "ACL_PROXY_CONFIG";
 const DEFAULT_CONFIG_PATH: &str = "config/acl-proxy.toml";
 const MAX_CONFIG_BYTES: usize = source_snapshot::MAX_MAIN_BYTES;
+const MAX_COMPOSED_POLICY_RULES: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfigPathSource {
@@ -29,23 +33,11 @@ pub(super) struct SelectedConfigPath {
 #[derive(Debug)]
 pub(super) struct LoadedConfig {
     pub authored: AuthoringConfig,
-    pub rule_sources: Vec<RuleSource>,
-    pub source_summary: SourceInventorySummary,
+    pub provenance: PolicyProvenance,
+    pub source_summary: PolicySourceSummary,
     pub path: PathBuf,
     pub config_root: PathBuf,
     pub path_source: ConfigPathSource,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RuleSourceKind {
-    Main,
-    Fragment(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RuleSource {
-    pub(crate) source: RuleSourceKind,
-    pub(crate) source_rule_index: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,20 +101,17 @@ pub(super) enum ConfigLoadError {
         source: io::Error,
     },
 
-    #[error("configuration path {path} does not name a file with a parent directory")]
-    InvalidPath { path: PathBuf },
+    #[error("selected configuration path does not name a main file with a parent directory")]
+    InvalidPath,
 
-    #[error("configuration file {path} exceeds the {max_bytes}-byte limit")]
-    TooLarge { path: PathBuf, max_bytes: usize },
+    #[error("main exceeds the {max_bytes}-byte limit")]
+    TooLarge { max_bytes: usize },
 
-    #[error("configuration file {path} is not valid UTF-8 at byte {valid_up_to}")]
-    InvalidUtf8 { path: PathBuf, valid_up_to: usize },
+    #[error("main is not valid UTF-8 at byte {valid_up_to}")]
+    InvalidUtf8 { valid_up_to: usize },
 
-    #[error("configuration file {path} is not valid strict schema v4 TOML: {diagnostic}")]
-    ParseToml {
-        path: PathBuf,
-        diagnostic: SanitizedTomlDiagnostic,
-    },
+    #[error("main is not valid strict schema v4 TOML: {diagnostic}")]
+    ParseToml { diagnostic: SanitizedTomlDiagnostic },
 
     #[error("{source_name} is not valid strict schema v4 TOML: {diagnostic}")]
     ParseFragmentToml {
@@ -145,16 +134,22 @@ pub(super) enum ConfigLoadError {
         source: source_snapshot::SourceSnapshotError,
     },
 
-    #[error(
-        "configuration file {path} uses the removed data-listener field `bind`; use `endpoint = {{ kind = \"tcp\", address = \"127.0.0.1:8881\" }}` instead"
-    )]
-    LegacyListenerBind { path: PathBuf },
+    #[error("failed to compose policy source provenance: {source}")]
+    Provenance {
+        #[source]
+        source: ProvenanceError,
+    },
+
+    #[error("composed policy exceeds the {max_rules}-rule limit")]
+    TooManyPolicyRules { max_rules: usize },
 
     #[error(
-        "configuration file {path} uses removed configuration surface `{surface}`; {replacement}"
+        "main uses the removed data-listener field `bind`; use `endpoint = {{ kind = \"tcp\", address = \"127.0.0.1:8881\" }}` instead"
     )]
+    LegacyListenerBind,
+
+    #[error("main uses removed configuration surface `{surface}`; {replacement}")]
     RemovedConfigSurface {
-        path: PathBuf,
         surface: String,
         replacement: &'static str,
     },
@@ -177,9 +172,7 @@ pub(super) fn load_config(explicit_path: Option<&Path>) -> Result<LoadedConfig, 
 
 pub(super) fn load_exact_config(path: &Path) -> Result<LoadedConfig, ConfigLoadError> {
     if !path.is_absolute() {
-        return Err(ConfigLoadError::InvalidPath {
-            path: path.to_path_buf(),
-        });
+        return Err(ConfigLoadError::InvalidPath);
     }
     load_selected_config(
         SelectedConfigPath {
@@ -219,17 +212,17 @@ fn load_selected_config(
     let path = absolute_normalized_path(&selected.path, current_dir);
     let config_root = path
         .parent()
-        .ok_or_else(|| ConfigLoadError::InvalidPath { path: path.clone() })?
+        .ok_or(ConfigLoadError::InvalidPath)?
         .to_path_buf();
 
     let mut authored = None;
     let mut fragment_rules = Vec::new();
-    let mut fragment_sources = Vec::new();
+    let mut provenance =
+        PolicyProvenanceBuilder::new().map_err(|source| ConfigLoadError::Provenance { source })?;
     let source_summary = source_snapshot::load_sources(&path, |source, bytes| match source {
         SourceRef::Main => {
             let text =
                 std::str::from_utf8(bytes).map_err(|source| ConfigLoadError::InvalidUtf8 {
-                    path: path.clone(),
                     valid_up_to: source.valid_up_to(),
                 })?;
             authored = Some(parse_config_text(text, &path)?);
@@ -244,12 +237,32 @@ fn load_selected_config(
                 }
             })?;
             let mut fragment = parse_fragment_text(text, &source_name)?;
-            fragment_sources.extend((0..fragment.rules.len()).map(|source_rule_index| {
-                RuleSource {
-                    source: RuleSourceKind::Fragment(name.as_str().to_owned()),
-                    source_rule_index,
-                }
-            }));
+            let main_rule_count = authored
+                .as_ref()
+                .map_or(0, |main: &AuthoringConfig| main.policy.rules.len());
+            let candidate_rule_count = fragment_rules
+                .len()
+                .checked_add(fragment.rules.len())
+                .and_then(|count| count.checked_add(main_rule_count))
+                .ok_or(ConfigLoadError::TooManyPolicyRules {
+                    max_rules: MAX_COMPOSED_POLICY_RULES,
+                })?;
+            if candidate_rule_count > MAX_COMPOSED_POLICY_RULES {
+                return Err(ConfigLoadError::TooManyPolicyRules {
+                    max_rules: MAX_COMPOSED_POLICY_RULES,
+                });
+            }
+            fragment_rules
+                .try_reserve(fragment.rules.len())
+                .map_err(|_| ConfigLoadError::Provenance {
+                    source: ProvenanceError::Allocation,
+                })?;
+            let source_id = provenance
+                .add_fragment(name.as_str())
+                .map_err(|source| ConfigLoadError::Provenance { source })?;
+            provenance
+                .append_fragment_rules(source_id, fragment.rules.len())
+                .map_err(|source| ConfigLoadError::Provenance { source })?;
             fragment_rules.append(&mut fragment.rules);
             Ok(())
         }
@@ -262,16 +275,37 @@ fn load_selected_config(
         source: source_snapshot::SourceSnapshotError::MissingMain,
     })?;
     let main_rule_count = authored.policy.rules.len();
-    fragment_sources.extend((0..main_rule_count).map(|source_rule_index| RuleSource {
-        source: RuleSourceKind::Main,
-        source_rule_index,
-    }));
+    let total_rule_count = fragment_rules.len().checked_add(main_rule_count).ok_or(
+        ConfigLoadError::TooManyPolicyRules {
+            max_rules: MAX_COMPOSED_POLICY_RULES,
+        },
+    )?;
+    if total_rule_count > MAX_COMPOSED_POLICY_RULES {
+        return Err(ConfigLoadError::TooManyPolicyRules {
+            max_rules: MAX_COMPOSED_POLICY_RULES,
+        });
+    }
+    fragment_rules
+        .try_reserve(main_rule_count)
+        .map_err(|_| ConfigLoadError::Provenance {
+            source: ProvenanceError::Allocation,
+        })?;
+    provenance
+        .append_main_rules(main_rule_count)
+        .map_err(|source| ConfigLoadError::Provenance { source })?;
     fragment_rules.append(&mut authored.policy.rules);
     authored.policy.rules = fragment_rules;
+    let fragment_rule_count = total_rule_count - main_rule_count;
+    let source_summary =
+        PolicySourceSummary::new(source_summary, fragment_rule_count, main_rule_count)
+            .map_err(|source| ConfigLoadError::Provenance { source })?;
+    let provenance = provenance
+        .finish(total_rule_count)
+        .map_err(|source| ConfigLoadError::Provenance { source })?;
 
     Ok(LoadedConfig {
         authored,
-        rule_sources: fragment_sources,
+        provenance,
         source_summary,
         path,
         config_root,
@@ -300,28 +334,23 @@ fn parse_fragment_text(
 
 pub(super) fn parse_config_text(
     text: &str,
-    path: &Path,
+    _path: &Path,
 ) -> Result<AuthoringConfig, ConfigLoadError> {
     if text.len() > MAX_CONFIG_BYTES {
         return Err(ConfigLoadError::TooLarge {
-            path: path.to_path_buf(),
             max_bytes: MAX_CONFIG_BYTES,
         });
     }
     toml::from_str(text).map_err(|source| {
         if let Some((surface, replacement)) = removed_config_surface(text) {
             ConfigLoadError::RemovedConfigSurface {
-                path: path.to_path_buf(),
                 surface,
                 replacement,
             }
         } else if contains_legacy_listener_bind(text) {
-            ConfigLoadError::LegacyListenerBind {
-                path: path.to_path_buf(),
-            }
+            ConfigLoadError::LegacyListenerBind
         } else {
             ConfigLoadError::ParseToml {
-                path: path.to_path_buf(),
                 diagnostic: sanitize_toml_error(text, &source),
             }
         }
@@ -673,10 +702,7 @@ literal_environment_variables = ["MISSING_CONFIG_LOADER_REDACTION_SECRET"]
         )
         .unwrap();
         let legacy_bind = load_path(&config_path).unwrap_err();
-        assert!(matches!(
-            legacy_bind,
-            ConfigLoadError::LegacyListenerBind { .. }
-        ));
+        assert!(matches!(legacy_bind, ConfigLoadError::LegacyListenerBind));
         assert!(legacy_bind
             .to_string()
             .contains("endpoint = { kind = \"tcp\""));
@@ -741,6 +767,39 @@ identity_state = "authenticated"
             );
             assert!(error.to_string().contains(surface), "{error}");
             assert!(error.to_string().contains(replacement), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejected_main_diagnostics_never_disclose_the_selected_absolute_path() {
+        let directory = tempdir().unwrap();
+        let config_path = directory.path().join("private-config-root/acl-proxy.toml");
+        fs::create_dir(config_path.parent().unwrap()).unwrap();
+        let cases = vec![
+            vec![0xff],
+            b"schema_version = \"unterminated".to_vec(),
+            MINIMAL_CONFIG
+                .replace(
+                    "endpoint.kind = \"tcp\"\nendpoint.address = \"127.0.0.1:8881\"",
+                    "bind = \"127.0.0.1:8881\"",
+                )
+                .into_bytes(),
+            MINIMAL_CONFIG
+                .replace(
+                    "endpoint.kind = \"tcp\"",
+                    "endpoint.kind = \"unix_proxy_v2\"",
+                )
+                .into_bytes(),
+        ];
+
+        for contents in cases {
+            fs::write(&config_path, &contents).unwrap();
+            let rendered = load_path(&config_path).unwrap_err().to_string();
+            assert!(rendered.contains("main"), "{rendered}");
+            assert!(
+                !rendered.contains(directory.path().to_str().unwrap()),
+                "{rendered}"
+            );
         }
     }
 
@@ -834,8 +893,30 @@ rules = [{{ literals = "{SECRET_MARKER}" }}]
             .map(|rule| rule.id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(ids, ["first", "second", "main"]);
-        assert_eq!(loaded.rule_sources.len(), 3);
+        assert_eq!(loaded.provenance.rules().len(), 3);
+        assert_eq!(loaded.provenance.source_count(), 3);
+        assert_eq!(
+            loaded
+                .provenance
+                .resolve_cursor(0)
+                .unwrap()
+                .0
+                .display_name(),
+            "rules.d/02-first.toml"
+        );
+        assert_eq!(
+            loaded
+                .provenance
+                .resolve_cursor(2)
+                .unwrap()
+                .0
+                .display_name(),
+            "main"
+        );
         assert_eq!(loaded.source_summary.fragment_count, 2);
+        assert_eq!(loaded.source_summary.fragment_rule_count, 2);
+        assert_eq!(loaded.source_summary.main_rule_count, 1);
+        assert_eq!(loaded.source_summary.total_rule_count, 3);
         assert_eq!(
             loaded.source_summary.rules_directory,
             RulesDirectoryState::Populated

@@ -32,7 +32,7 @@ use crate::config::compiler::{
     AuthorizationCallbackPlan, AuthorizationPlan, AuthorizationProviderPlan,
     CompiledProviderFailureMode, CredentialsPlan, PendingOperationLimit, WebhookProviderPlan,
 };
-use crate::config::{compile_config_text, CompiledConfig, ConfigTextInput};
+use crate::config::{compile_config_text, ConfigTextInput, RuntimeCandidate};
 use crate::safety::{WireBodyPool, WireBodyQuotaKey};
 
 use super::*;
@@ -537,7 +537,7 @@ struct FakeSource {
 
 enum FakeCandidate {
     Text(String),
-    Compiled(Box<CompiledConfig>),
+    Compiled(Box<RuntimeCandidate>),
 }
 
 impl FakeSource {
@@ -548,7 +548,7 @@ impl FakeSource {
             .push_back(FakeCandidate::Text(config));
     }
 
-    fn push_compiled(&self, compiled: CompiledConfig) {
+    fn push_compiled(&self, compiled: RuntimeCandidate) {
         self.candidates
             .lock()
             .unwrap()
@@ -560,7 +560,7 @@ impl CandidateSource for FakeSource {
     fn load_latest(
         &self,
         cancellation: ActivationCancellation,
-    ) -> BoxFuture<'_, Result<CompiledConfig, RuntimeError>> {
+    ) -> BoxFuture<'_, Result<RuntimeCandidate, RuntimeError>> {
         Box::pin(async move {
             cancellation.check()?;
             self.calls.fetch_add(1, Ordering::AcqRel);
@@ -740,12 +740,13 @@ default = "deny"
     )
 }
 
-fn compile(text: &str) -> Result<CompiledConfig, String> {
+fn compile(text: &str) -> Result<RuntimeCandidate, String> {
     compile_config_text(ConfigTextInput {
         text,
         source_path: Path::new("/tmp/acl-proxy.toml"),
         config_root: Path::new("/tmp"),
     })
+    .map(crate::config::CompiledConfig::into_runtime_candidate)
     .map_err(|error| error.to_string())
 }
 
@@ -753,12 +754,24 @@ async fn runtime_fixture(
     initial: &str,
 ) -> (
     Arc<Runtime>,
-    CompiledConfig,
+    RuntimeCandidate,
     Arc<FakeSource>,
     Arc<FakeActivator>,
     Arc<FakeStaticResources>,
 ) {
     let compiled = compile(initial).expect("compile initial config");
+    runtime_fixture_from_candidate(compiled).await
+}
+
+async fn runtime_fixture_from_candidate(
+    compiled: RuntimeCandidate,
+) -> (
+    Arc<Runtime>,
+    RuntimeCandidate,
+    Arc<FakeSource>,
+    Arc<FakeActivator>,
+    Arc<FakeStaticResources>,
+) {
     let source = Arc::new(FakeSource::default());
     let static_resources = Arc::new(FakeStaticResources::default());
     let activator = Arc::new(FakeActivator::new(
@@ -881,8 +894,9 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
     .into_bound_for_runtime_test();
     let empty = Arc::new(EmptySnapshot);
     let forwarding_executor = test_forwarding_executor(&standalone);
-    let generation = Arc::new(Generation::from_activated(
+    let generation = Arc::new(Generation::from_activated_with_source_summary(
         GenerationId::new(1),
+        compiled.policy_source_summary.clone(),
         ActivatedGeneration {
             standalone,
             request_timeout: Duration::from_secs(30),
@@ -1493,7 +1507,7 @@ async fn live_upgrade_reload_retires_generation_and_releases_terminal_once() {
     .await
     .unwrap();
     assert_eq!(product.forwarding_terminal_completions_for_test(), 0);
-    let first_generation = product.activate_initial().await.unwrap();
+    let first_generation = product.activate_initial().await.unwrap().generation;
     product.start_listeners().await.unwrap();
 
     let origin_task = tokio::spawn(async move {
@@ -1600,6 +1614,7 @@ async fn live_upgrade_reload_retires_generation_and_releases_terminal_once() {
     let ReloadTriggerResult::Completed {
         attempts,
         generation: second_generation,
+        ..
     } = product.runtime().trigger_reload().await.unwrap()
     else {
         panic!("the live product reload unexpectedly coalesced");
@@ -1980,6 +1995,84 @@ async fn reload_is_atomic_and_static_fingerprint_rejection_preserves_active() {
 }
 
 #[tokio::test]
+async fn source_summary_tracks_publication_and_failed_reload_preserves_the_active_summary() {
+    let directory = tempfile::tempdir().unwrap();
+    let main = directory.path().join("acl-proxy.toml");
+    let rules = directory.path().join("rules.d");
+    fs::write(&main, config("30s", "127.0.0.1:8881", 2)).unwrap();
+    fs::create_dir(&rules).unwrap();
+    fs::write(
+        rules.join("10-fragment.toml"),
+        "schema_version = 4\n[[rules]]\nid = \"fragment\"\ndecision = \"deny\"\nurls = [\"https://example.test/**\"]\n",
+    )
+    .unwrap();
+
+    let initial = crate::config::load_and_compile_exact_config(&main)
+        .unwrap()
+        .compiled
+        .into_runtime_candidate();
+    let populated_summary = initial.policy_source_summary.clone();
+    let (runtime, initial, source, activator, _static_resources) =
+        runtime_fixture_from_candidate(initial).await;
+
+    let first = runtime.start(initial).await.unwrap();
+    assert_eq!(
+        runtime.active_policy_source_summary(),
+        Some(populated_summary.clone())
+    );
+
+    fs::remove_dir_all(&rules).unwrap();
+    let missing = crate::config::load_and_compile_exact_config(&main)
+        .unwrap()
+        .compiled
+        .into_runtime_candidate();
+    let missing_summary = missing.policy_source_summary.clone();
+    assert_ne!(missing_summary, populated_summary);
+    source.push_compiled(missing);
+
+    let ReloadTriggerResult::Completed {
+        generation: second,
+        policy_source_summary,
+        ..
+    } = runtime.trigger_reload().await.unwrap()
+    else {
+        panic!("reload unexpectedly coalesced");
+    };
+    assert_ne!(first, second);
+    assert_eq!(policy_source_summary, missing_summary);
+    assert_eq!(
+        runtime.active_policy_source_summary(),
+        Some(missing_summary.clone())
+    );
+
+    fs::create_dir(&rules).unwrap();
+    fs::write(
+        rules.join("10-fragment.toml"),
+        "schema_version = 4\n[[rules]]\nid = \"fragment\"\ndecision = \"deny\"\nurls = [\"https://example.test/**\"]\n",
+    )
+    .unwrap();
+    let rejected = crate::config::load_and_compile_exact_config(&main)
+        .unwrap()
+        .compiled
+        .into_runtime_candidate();
+    assert_eq!(rejected.policy_source_summary, populated_summary);
+    activator.fail_next.store(true, Ordering::Release);
+    source.push_compiled(rejected);
+
+    assert!(matches!(
+        runtime.trigger_reload().await,
+        Err(RuntimeError::CandidateActivation(_))
+    ));
+    assert_eq!(runtime.active_generation_id(), Some(second));
+    assert_eq!(
+        runtime.active_policy_source_summary(),
+        Some(missing_summary)
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn failed_activation_preserves_the_published_generation() {
     let text = config("30s", "127.0.0.1:8881", 2);
     let (runtime, initial, source, activator, _static_resources) = runtime_fixture(&text).await;
@@ -2023,6 +2116,7 @@ async fn concurrent_reload_triggers_coalesce_and_reread_latest() {
     let ReloadTriggerResult::Completed {
         attempts,
         generation,
+        ..
     } = first.await.unwrap().unwrap()
     else {
         panic!("reload owner unexpectedly coalesced");
@@ -2031,6 +2125,47 @@ async fn concurrent_reload_triggers_coalesce_and_reread_latest() {
     assert_eq!(generation.get(), 3);
     assert_eq!(runtime.active_generation_id(), Some(generation));
     assert_eq!(source.calls.load(Ordering::Acquire), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn successful_coalesced_publication_remains_observable_when_the_next_attempt_fails() {
+    let text = config("30s", "127.0.0.1:8881", 2);
+    let (runtime, initial, source, activator, _static_resources) = runtime_fixture(&text).await;
+    runtime.start(initial).await.unwrap();
+
+    let mut successful = compile(&config("31s", "127.0.0.1:8881", 2)).unwrap();
+    successful.policy_source_summary = crate::config::PolicySourceSummary::main_only(7);
+    let successful_summary = successful.policy_source_summary.clone();
+    source.push_compiled(successful);
+    source.push(config("32s", "127.0.0.1:8881", 2));
+    activator.block_commit_next.store(true, Ordering::Release);
+
+    let owner_runtime = runtime.clone();
+    let owner = tokio::spawn(async move { owner_runtime.trigger_reload().await });
+    activator.wait_until_entered(2).await;
+    let successful_owner = activator.owner(1);
+    successful_owner.wait_for_commit().await;
+    assert_eq!(
+        runtime.trigger_reload().await.unwrap(),
+        ReloadTriggerResult::Coalesced
+    );
+    activator.fail_next.store(true, Ordering::Release);
+    successful_owner.release_commit();
+
+    assert!(matches!(
+        owner.await.unwrap(),
+        Err(RuntimeError::CandidateActivation(_))
+    ));
+    assert_eq!(
+        runtime.active_generation_id().map(GenerationId::get),
+        Some(2)
+    );
+    assert_eq!(
+        runtime.active_policy_source_summary(),
+        Some(successful_summary)
+    );
+    assert_eq!(source.calls.load(Ordering::Acquire), 2);
+    assert_eq!(activator.calls.load(Ordering::Acquire), 3);
 }
 
 #[tokio::test]
@@ -2274,6 +2409,7 @@ async fn reload_trigger_at_worker_exit_is_handed_off_without_loss() {
     let ReloadTriggerResult::Completed {
         attempts,
         generation,
+        ..
     } = worker.await.unwrap().unwrap()
     else {
         panic!("reload worker unexpectedly coalesced");

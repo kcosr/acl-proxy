@@ -235,7 +235,7 @@ async fn run_product(
     let product = ProductRuntime::prepare(loaded, identity_sources)
         .await
         .map_err(|error| CliError::Product(error.to_string()))?;
-    let generation = product
+    let activation = product
         .activate_initial()
         .await
         .map_err(|error| CliError::Product(error.to_string()))?;
@@ -245,7 +245,13 @@ async fn run_product(
         .map_err(|error| CliError::Product(error.to_string()))?;
     tracing::info!(
         target: "acl_proxy::startup",
-        generation = generation.get(),
+        generation = activation.generation.get(),
+        rules_directory = activation.policy_source_summary.rules_directory_state(),
+        fragment_count = activation.policy_source_summary.fragment_count,
+        fragment_bytes = activation.policy_source_summary.fragment_bytes,
+        fragment_rule_count = activation.policy_source_summary.fragment_rule_count,
+        main_rule_count = activation.policy_source_summary.main_rule_count,
+        total_rule_count = activation.policy_source_summary.total_rule_count,
         "acl-proxy is ready"
     );
 
@@ -390,6 +396,7 @@ fn log_reload_result(result: Result<ReloadTriggerResult, crate::runtime::Runtime
         Ok(ReloadTriggerResult::Completed {
             attempts,
             generation,
+            ..
         }) => {
             tracing::info!(
                 attempts,
@@ -482,15 +489,17 @@ impl ProcessSignals {
 }
 
 fn print_policy_table(policy: &PolicyDump) {
-    println!("Default action: {}", policy.default.as_str());
+    println!("Default action: {} (source: main)", policy.default.as_str());
     println!(
-        "INDEX\tDECISION\tURLS\tMETHODS\tCLIENT_CIDRS\tIDENTITY_PREDICATES\tHEADER_PREDICATES\tDESCRIPTION\tAUTHORIZATION_PROVIDER\tREDACTION_PROFILE\tMUTATIONS"
+        "INDEX\tRULE_ID\tSOURCE\tDECISION\tURLS\tMETHODS\tCLIENT_CIDRS\tIDENTITY_PREDICATES\tHEADER_PREDICATES\tDESCRIPTION\tAUTHORIZATION_PROVIDER\tREDACTION_PROFILE\tMUTATIONS"
     );
 
     for row in policy.table_rows() {
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             row.index,
+            table_value(&row.rule_id),
+            table_value(&row.source),
             row.decision,
             table_value(&row.urls),
             table_value(&row.methods),

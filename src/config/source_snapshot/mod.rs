@@ -916,7 +916,7 @@ mod tests {
         fs::create_dir(&rules).unwrap();
         fs::write(&fragment, FRAGMENT).unwrap();
 
-        fs::set_permissions(&rules, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&rules, fs::Permissions::from_mode(0o0)).unwrap();
         let directory_error = load_sources(&main, |_, _| Ok::<_, ()>(())).unwrap_err();
         fs::set_permissions(&rules, fs::Permissions::from_mode(0o700)).unwrap();
         let directory_text = match directory_error {
@@ -925,7 +925,7 @@ mod tests {
         };
         assert!(!directory_text.contains(directory.path().to_str().unwrap()));
 
-        fs::set_permissions(&fragment, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&fragment, fs::Permissions::from_mode(0o0)).unwrap();
         let file_error = load_sources(&main, |_, _| Ok::<_, ()>(())).unwrap_err();
         fs::set_permissions(&fragment, fs::Permissions::from_mode(0o600)).unwrap();
         let file_text = match file_error {

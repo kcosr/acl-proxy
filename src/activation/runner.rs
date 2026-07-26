@@ -5,7 +5,7 @@ use http_access_runtime::{
     OriginalDestinationProvider, StandaloneRequestFactory,
 };
 
-use crate::config::{CompiledConfig, LoadedCompiledConfig};
+use crate::config::LoadedCompiledConfig;
 use crate::observation::ProductObservationRuntime;
 use crate::runtime::{GenerationId, Runtime, RuntimeError, StaticOwnership, StaticResources};
 
@@ -27,7 +27,12 @@ pub(crate) struct ProductRuntime {
     runtime: Arc<Runtime>,
     static_resources: Arc<ProductStaticResources>,
     observation_runtime: Arc<ProductObservationRuntime>,
-    initial: Mutex<Option<CompiledConfig>>,
+    initial: Mutex<Option<crate::config::RuntimeCandidate>>,
+}
+
+pub(crate) struct InitialActivationResult {
+    pub(crate) generation: GenerationId,
+    pub(crate) policy_source_summary: crate::config::PolicySourceSummary,
 }
 
 struct ProductListenerFailureObserver {
@@ -178,11 +183,12 @@ impl ProductRuntime {
         );
         let runtime = Runtime::new(static_ownership, source, activator).await?;
 
+        let initial = compiled.into_runtime_candidate();
         Ok(Arc::new(Self {
             runtime,
             static_resources,
             observation_runtime,
-            initial: Mutex::new(Some(compiled)),
+            initial: Mutex::new(Some(initial)),
         }))
     }
 
@@ -386,19 +392,25 @@ impl ProductRuntime {
         self.static_resources.wait_for_control_failure().await
     }
 
-    pub(crate) async fn activate_initial(&self) -> Result<GenerationId, ProductRuntimeError> {
+    pub(crate) async fn activate_initial(
+        &self,
+    ) -> Result<InitialActivationResult, ProductRuntimeError> {
         let initial = self
             .initial
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
             .ok_or(ProductRuntimeError::InitialActivationAlreadyAttempted)?;
+        let policy_source_summary = initial.policy_source_summary.clone();
         let runtime = self.runtime.clone();
         let activation_runtime = runtime.clone();
 
         let activation = tokio::spawn(async move {
             match activation_runtime.start(initial).await {
-                Ok(generation) => Ok(generation),
+                Ok(generation) => Ok(InitialActivationResult {
+                    generation,
+                    policy_source_summary,
+                }),
                 Err(error) => {
                     activation_runtime.shutdown().await;
                     Err(error)
@@ -505,6 +517,28 @@ default = "deny"
         fs::write(&path, text).unwrap();
         let loaded = load_and_compile_exact_config(&path).unwrap();
         (directory, loaded)
+    }
+
+    #[tokio::test]
+    async fn initial_activation_returns_the_published_source_summary() {
+        let test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let reservations = super::super::reserve_listeners::<2>(&test);
+        let addresses = reservations.addresses();
+        let (_directory, loaded) = loaded(&config(addresses[0], addresses[1], ""));
+        let expected = loaded.compiled.policy_source_summary.clone();
+        let product = ProductRuntime::prepare_from_prebound(loaded, reservations.into_listeners())
+            .await
+            .unwrap();
+
+        let activated = product.activate_initial().await.unwrap();
+
+        assert_eq!(activated.generation.get(), 1);
+        assert_eq!(activated.policy_source_summary, expected);
+        assert_eq!(
+            product.runtime().active_policy_source_summary(),
+            Some(expected)
+        );
+        product.shutdown().await;
     }
 
     async fn read_http_message(stream: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {

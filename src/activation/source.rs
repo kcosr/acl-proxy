@@ -47,7 +47,7 @@ impl CandidateSource for FileCandidateSource {
     fn load_latest(
         &self,
         cancellation: ActivationCancellation,
-    ) -> BoxFuture<'_, Result<crate::config::CompiledConfig, RuntimeError>> {
+    ) -> BoxFuture<'_, Result<crate::config::RuntimeCandidate, RuntimeError>> {
         let path = self.path.clone();
         Box::pin(async move {
             cancellation.check()?;
@@ -99,7 +99,7 @@ impl CandidateSource for FileCandidateSource {
                     .map_err(|error| RuntimeError::CandidateSource(error.to_string()))?,
             };
             cancellation.check()?;
-            Ok(loaded.compiled)
+            Ok(loaded.compiled.into_runtime_candidate())
         })
     }
 }
@@ -178,10 +178,13 @@ default = "deny"
         let source = FileCandidateSource::new(&initial.metadata);
         fs::write(&path, "schema_version = 2\nsecret = \"do-not-echo\"\n").unwrap();
 
-        let error = source
+        let error = match source
             .load_latest(ActivationCancellation::new_for_test())
             .await
-            .unwrap_err();
+        {
+            Ok(_) => panic!("invalid reload unexpectedly compiled"),
+            Err(error) => error,
+        };
 
         assert!(matches!(error, RuntimeError::CandidateSource(_)));
         assert!(!error.to_string().contains("do-not-echo"));

@@ -77,8 +77,8 @@ pub(super) fn read_directory(
     entries
         .try_reserve_exact(limit_plus_one)
         .map_err(io::Error::other)?;
-    let mut reader = Dir::read_from(&directory.fd).map_err(errno)?;
-    while let Some(entry) = reader.next() {
+    let reader = Dir::read_from(&directory.fd).map_err(errno)?;
+    for entry in reader {
         let entry = entry.map_err(errno)?;
         let name = entry.file_name().to_bytes();
         if name == b"." || name == b".." {
@@ -145,14 +145,14 @@ fn metadata_from_stat(stat: &Stat) -> ObjectMetadata {
         ObjectKind::Other
     };
     let mut file_id = [0_u8; 16];
-    file_id[..8].copy_from_slice(&(stat.st_ino as u64).to_ne_bytes());
+    file_id[..8].copy_from_slice(&stat_u64(stat.st_ino).to_ne_bytes());
     ObjectMetadata {
         kind,
         identity: ObjectIdentity {
-            volume: stat.st_dev as u64,
+            volume: stat_u64(stat.st_dev),
             file_id,
         },
-        links: stat.st_nlink as u64,
+        links: stat_u64(stat.st_nlink),
         size: u64::try_from(stat.st_size).unwrap_or(u64::MAX),
         mutation: MutationMetadata {
             modified_seconds: stat.st_mtime,
@@ -162,6 +162,13 @@ fn metadata_from_stat(stat: &Stat) -> ObjectMetadata {
             attributes: stat.st_mode as u64,
         },
     }
+}
+
+fn stat_u64<T>(value: T) -> u64
+where
+    u64: TryFrom<T>,
+{
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn errno(error: rustix::io::Errno) -> io::Error {
