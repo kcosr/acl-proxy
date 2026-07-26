@@ -23,7 +23,7 @@ or WebSocket implementation.
 - Source repository: this `acl-proxy` repository
 - Destination repository: `access-runtime`
 - Accepted runtime commit:
-  `d571d88011923b0d639d1c3ea88ce43cfcfe1a3f`
+  `935d64fa654987894fbf78e555f9da760e17e789`
 - Dependency version: `0.1.0`
 - License: MIT
 - Material changes: product-specific inputs were replaced by versionless,
