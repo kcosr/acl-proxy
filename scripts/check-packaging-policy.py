@@ -24,8 +24,8 @@ ALLOWED_LICENSES = {
 }
 REGISTRY = "https://github.com/rust-lang/crates.io-index"
 PRODUCT_VERSION = "0.3.0-rc.1"
-RUNTIME_COMMIT = "935d64fa654987894fbf78e555f9da760e17e789"
-RUNTIME_TREE = "2e5bf5997c3d6ac84660d13cbbcbfe8e7385b88b"
+RUNTIME_COMMIT = "3e28178dcc0c849aa5951b0a6e40c8860b3727db"
+RUNTIME_TREE = "c57572eed640806028fc73d84d27868dd2dd2431"
 PRODUCT_INITIAL_COMMIT = "a829f43552c7118d1f206b9e4112b3c747eecd50"
 PRIVATE_TRANSPORT_PACKAGES = {
     "h2",
@@ -628,6 +628,12 @@ def check_runtime_source(
                 capture_output=True,
                 text=True,
             ).stdout.strip()
+            tree = subprocess.run(
+                ["git", "-C", str(runtime_root), "rev-parse", "--verify", "HEAD^{tree}"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
             status = subprocess.run(
                 [
                     "git",
@@ -647,6 +653,8 @@ def check_runtime_source(
             fail("canonical sibling runtime is not one complete Git worktree")
         if head != RUNTIME_COMMIT:
             fail("canonical sibling runtime HEAD differs from the accepted runtime commit")
+        if tree != RUNTIME_TREE:
+            fail("canonical sibling runtime tree differs from the accepted runtime tree")
         if status:
             fail("canonical sibling runtime worktree or index is not clean")
     else:
