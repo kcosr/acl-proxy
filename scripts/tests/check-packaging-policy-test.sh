@@ -786,6 +786,22 @@ for file in README.md acl-proxy.sample.toml; do
 done
 expect_rejected archive-bin '  bin/acl-proxy-extract-capture-body' '  acl-proxy-extract-capture-body' README.md
 expect_rejected archive-relay-bin '  bin/acl-proxy-access-flow-relay  # Linux archives only' '  acl-proxy-access-flow-relay' README.md
+expect_rejected sample-schema 'schema_version = 4' 'schema_version = 3' acl-proxy.sample.toml
+expect_rejected sample-schema-type 'schema_version = 4' 'schema_version = 4.0' acl-proxy.sample.toml
+rules_directory_guidance=(
+    'implicit sibling rules.d'
+    'equal policy authority'
+    'stage outside rules.d'
+    'atomically rename'
+)
+for index in "${!rules_directory_guidance[@]}"; do
+    marker=${rules_directory_guidance[$index]}
+    expect_rejected \
+        "sample-rules-directory-guidance-$index" \
+        "$marker" \
+        "removed-rules-directory-guidance-$index" \
+        acl-proxy.sample.toml
+done
 expect_rejected sample-export 'acl-proxy export-ca' 'ca-cert.pem' acl-proxy.sample.toml
 
 printf 'packaging policy mutation suite passed\n'

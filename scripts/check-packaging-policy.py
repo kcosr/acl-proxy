@@ -925,8 +925,21 @@ def check_shipped_docs(root: Path) -> None:
         ):
             if obsolete in text:
                 fail(f"{path} contains obsolete configuration surface: {obsolete}")
-    if "schema_version = 4" not in sample:
+    sample_document = load_toml(root / "acl-proxy.sample.toml")
+    sample_schema_version = sample_document.get("schema_version")
+    if type(sample_schema_version) is not int or sample_schema_version != 4:
         fail("sample configuration is not schema version 4")
+    for required_rules_directory_guidance in (
+        "implicit sibling rules.d",
+        "equal policy authority",
+        "stage outside rules.d",
+        "atomically rename",
+    ):
+        if required_rules_directory_guidance not in sample:
+            fail(
+                "sample configuration lacks rules.d authority/publication guidance: "
+                + required_rules_directory_guidance
+            )
     if "acl-proxy export-ca" not in sample:
         fail("sample configuration lacks generated public-CA export guidance")
     if "ca-cert.pem" in sample or "ca-key.pem" in sample:

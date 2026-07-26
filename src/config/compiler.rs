@@ -14089,9 +14089,13 @@ client_cidrs = ["127.0.0.0/8"]
 
     #[cfg(unix)]
     #[test]
-    fn shipped_unix_host_example_compiles_strictly() {
-        compile(include_str!("../../examples/acl-proxy-access-flow.toml"))
-            .expect("shipped Unix host example should remain a strict valid config");
+    fn shipped_unix_host_example_loads_through_the_exact_facade() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/acl-proxy-access-flow.toml");
+        let loaded = super::super::facade::load_and_compile_exact_config(&path)
+            .expect("shipped Unix host example should pass the exact configuration facade");
+        assert_eq!(loaded.metadata.path, path);
+        assert_eq!(loaded.compiled.static_config.schema_version, 4);
     }
 
     #[test]

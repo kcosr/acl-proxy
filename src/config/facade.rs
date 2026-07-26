@@ -600,6 +600,33 @@ rules = [{{ expressions = ['\b{SECRET}\b'], literal_environment_variables = ["MI
     }
 
     #[test]
+    fn sanitized_production_v4_fixtures_load_through_the_exact_facade() {
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/production");
+        for (name, expected_rule_count) in [
+            ("host-proxy-tcp.toml", 44),
+            ("host-proxy-uds.toml", 1),
+            ("common-container-proxy.toml", 1),
+            ("internal-container-proxy.toml", 8),
+        ] {
+            let path = fixture_root.join(name);
+            let loaded = load_and_compile_exact_config(&path)
+                .unwrap_or_else(|error| panic!("{name} failed the exact facade: {error}"));
+
+            assert_eq!(loaded.metadata.path, path, "{name}");
+            assert_eq!(loaded.compiled.static_config.schema_version, 4, "{name}");
+            assert_eq!(
+                loaded.compiled.reloadable_plan.policy.rules.len(),
+                expected_rule_count,
+                "{name}"
+            );
+            assert_eq!(
+                loaded.compiled.policy_source_summary.main_rule_count, expected_rule_count,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn fragment_compile_diagnostics_use_source_local_rule_locations() {
         let directory = tempdir().unwrap();
         let config_path = directory.path().join("acl-proxy.toml");

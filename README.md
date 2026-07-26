@@ -444,6 +444,18 @@ Missing or empty `rules.d` means there are no fragment rules. A fragment is a
 strict schema-4 TOML document containing only the required version and one or
 more rules:
 
+The directory belongs to the parent, not to the main filename. Two selected
+main files in the same parent therefore consume the same `rules.d` authority.
+Before upgrading or selecting any main file, inventory that file's sibling
+directory and reject unrelated content. Validate the staged authority through
+the production facade in all three sanctioned views:
+
+```bash
+acl-proxy config validate --config /etc/acl-proxy/acl-proxy.toml
+acl-proxy policy dump --format table --config /etc/acl-proxy/acl-proxy.toml
+acl-proxy policy dump --format json --config /etc/acl-proxy/acl-proxy.toml
+```
+
 ```toml
 schema_version = 4
 
@@ -497,12 +509,24 @@ writer serialization until reload completes. Any file, membership, mutation,
 parse, reference, bounds, or activation failure preserves the complete prior
 generation.
 
+These permission and publication rules are operator controls, not checks
+performed by ACL Proxy. ACL Proxy does not validate owner, group, or mode; lock
+writers; or make hostile same-UID multi-file mutation transactional. Apply the
+same permission boundary to every redirect-capable symlink target and ancestor
+used to reach the selected main file.
+
 `config validate`, `policy dump`, startup, CA export, and reload all use the
 same composition facade. Diagnostics identify `main` or
 `rules.d/<filename>` plus the source-local rule index. Table dumps add
 `RULE_ID` and `SOURCE`; JSON rules contain a tagged `source` object. Absolute
 host paths are omitted from routine diagnostics, dumps, and reload
 observations.
+
+The ready event and every successful reload publication report `generation`,
+`rules_directory` (`missing`, `empty`, or `populated`), `fragment_count`,
+`fragment_bytes`, `fragment_rule_count`, `main_rule_count`, and
+`total_rule_count`. A rejected candidate emits no publication summary; the
+prior generation's summary remains authoritative.
 
 ### Authorization Providers
 

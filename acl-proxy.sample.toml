@@ -48,6 +48,13 @@ http_versions = ["http1", "http2"]
 [policy]
 default = "deny"
 
+# This file also authorizes its implicit sibling rules.d directory. Each direct
+# fragment is a strict schema-4 document containing only one or more
+# [[rules]] entries. Fragments run first in ASCII filename order. They have
+# equal policy authority to this main rule list. Keep both main and rules.d under
+# one trusted serialized writer; stage outside rules.d, atomically rename
+# complete fragments into place, then trigger one reload.
+#
 # Add narrowly scoped rules after reviewing canonical URL, method, client, and
 # header intent. An empty urls list means every canonical HTTP/HTTPS URL.
 #

@@ -12,6 +12,8 @@ use std::process::Command;
 #[cfg(unix)]
 use std::process::{Child, Stdio};
 #[cfg(unix)]
+use std::sync::mpsc;
+#[cfg(unix)]
 use std::thread;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
@@ -168,16 +170,15 @@ impl Drop for ChildGuard {
 fn wait_for_file_text_count(path: &Path, expected: &str, count: usize) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let actual = fs::read_to_string(path)
-            .map(|contents| contents.matches(expected).count())
-            .unwrap_or(0);
+        let contents = fs::read_to_string(path).unwrap_or_default();
+        let actual = contents.matches(expected).count();
         if actual >= count {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "{} never contained {count} occurrences of {expected:?}; found {actual}",
-            path.display()
+            "{} never contained {count} occurrences of {expected:?}; found {actual}:\n{contents}",
+            path.display(),
         );
         thread::sleep(Duration::from_millis(25));
     }
@@ -241,6 +242,47 @@ fn proxy_get(proxy: SocketAddr, url: &str, timeout: Duration) -> std::io::Result
     let mut response = Vec::new();
     stream.read_to_end(&mut response)?;
     Ok(response)
+}
+
+#[cfg(unix)]
+fn response_status(response: &[u8]) -> Option<u16> {
+    let head = std::str::from_utf8(response).ok()?;
+    head.split_whitespace()
+        .nth(1)
+        .and_then(|status| status.parse().ok())
+}
+
+#[cfg(unix)]
+fn read_request_head(stream: &mut TcpStream) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut received = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    while !received.windows(4).any(|window| window == b"\r\n\r\n") {
+        let count = stream.read(&mut chunk).expect("read origin request");
+        assert_ne!(count, 0, "proxy closed origin request before the head");
+        received.extend_from_slice(&chunk[..count]);
+        assert!(
+            received.len() <= 64 * 1024,
+            "origin request head is unbounded"
+        );
+    }
+}
+
+#[cfg(unix)]
+fn accept_origin(listener: &TcpListener, context: &str) -> TcpStream {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "{context}");
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("{context}: {error}"),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -680,6 +722,45 @@ fn run_rejects_schema_two_without_fallback() {
 
 #[cfg(unix)]
 #[test]
+fn run_rejects_invalid_rules_directory_before_logging_or_binding() {
+    let directory = TempDir::new().unwrap();
+    let (proxy, control) = ephemeral_addresses();
+    let config = directory.path().join("acl-proxy.toml");
+    let rules = directory.path().join("rules.d");
+    fs::write(
+        &config,
+        runtime_config(proxy, control, "2s", "[policy]\ndefault = \"deny\"\n"),
+    )
+    .unwrap();
+    fs::create_dir(&rules).unwrap();
+    fs::write(rules.join(".editor.tmp"), b"unpublished policy").unwrap();
+
+    let output = command()
+        .args(["run", "--config"])
+        .arg(&config)
+        .output()
+        .expect("run invalid composed configuration");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains(".editor.tmp"), "{stderr}");
+    assert!(
+        stderr.contains("violates the fragment filename contract"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains(directory.path().to_str().unwrap()),
+        "{stderr}"
+    );
+    assert!(
+        !directory.path().join("logs").exists(),
+        "invalid startup initialized logging"
+    );
+    TcpListener::bind(proxy).expect("invalid startup bound the proxy listener");
+    TcpListener::bind(control).expect("invalid startup bound the control listener");
+}
+
+#[cfg(unix)]
+#[test]
 fn strict_run_owns_reload_shutdown_and_listener_release() {
     let directory = TempDir::new().unwrap();
     let (proxy, control) = ephemeral_addresses();
@@ -815,6 +896,279 @@ fn invalid_reload_candidates_preserve_live_generation_until_corrected_reload() {
         "acl-proxy did not exit after corrected reload",
     );
     assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn fragment_only_reload_is_atomic_observable_and_generation_safe() {
+    let directory = TempDir::new().unwrap();
+    let (proxy, control) = ephemeral_addresses();
+    let origin = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    origin.set_nonblocking(true).unwrap();
+    let origin_address = origin.local_addr().unwrap();
+    let config = directory.path().join("acl-proxy.toml");
+    let rules = directory.path().join("rules.d");
+    let fragment = rules.join("10-policy.toml");
+    fs::create_dir(&rules).unwrap();
+    fs::write(
+        &config,
+        runtime_config(proxy, control, "2s", "[policy]\ndefault = \"deny\"\n"),
+    )
+    .unwrap();
+
+    let fragment_text = |decision: &str| {
+        format!(
+            r#"schema_version = 4
+
+[[rules]]
+id = "fragment-policy"
+decision = "{decision}"
+urls = ["http://{origin_address}/**"]
+methods = ["GET"]
+"#
+        )
+    };
+    let allow_fragment = fragment_text("allow");
+    let deny_fragment = fragment_text("deny");
+    fs::write(&fragment, &allow_fragment).unwrap();
+
+    let (held_accepted_tx, held_accepted_rx) = mpsc::sync_channel(1);
+    let (release_held_tx, release_held_rx) = mpsc::sync_channel(1);
+    let origin_worker = thread::spawn(move || {
+        let mut held = accept_origin(&origin, "held request never reached origin");
+        read_request_head(&mut held);
+        held_accepted_tx.send(()).unwrap();
+        release_held_rx.recv().unwrap();
+        held.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nheld")
+            .unwrap();
+
+        let mut successor = accept_origin(&origin, "successor request never reached origin");
+        read_request_head(&mut successor);
+        successor
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nsuccessor",
+            )
+            .unwrap();
+    });
+
+    let mut child = ChildGuard::spawn(&config);
+    wait_for_ready(&mut child, control);
+    let log = directory.path().join("logs/acl-proxy.log");
+    wait_for_file_text(&log, "acl-proxy is ready");
+    let startup_logs = fs::read_to_string(&log).unwrap();
+    let startup = startup_logs
+        .lines()
+        .find(|line| line.contains("acl-proxy is ready"))
+        .expect("startup source summary");
+    for field in [
+        "generation=1",
+        "rules_directory=\"populated\"",
+        "fragment_count=1",
+        &format!("fragment_bytes={}", allow_fragment.len()),
+        "fragment_rule_count=1",
+        "main_rule_count=0",
+        "total_rule_count=1",
+    ] {
+        assert!(startup.contains(field), "missing {field:?}: {startup}");
+    }
+    assert!(!startup.contains(directory.path().to_str().unwrap()));
+
+    let url = format!("http://{origin_address}/resource");
+    let held_url = url.clone();
+    let held_request =
+        thread::spawn(move || proxy_get(proxy, &held_url, Duration::from_secs(10)).unwrap());
+    held_accepted_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("held request reached the origin");
+
+    let staged = directory.path().join("staged-fragment.toml");
+    fs::write(&staged, &deny_fragment).unwrap();
+    fs::rename(&staged, &fragment).unwrap();
+    child.signal(libc::SIGHUP);
+    wait_for_file_text_count(&log, "configuration reload generation published", 1);
+    wait_for_file_text_count(&log, "configuration reload completed successfully", 1);
+    assert_eq!(readiness_status(control), Some(200));
+
+    let after_deny = proxy_get(proxy, &url, Duration::from_secs(5)).unwrap();
+    assert_eq!(response_status(&after_deny), Some(403));
+    release_held_tx.send(()).unwrap();
+    let held_response = held_request.join().unwrap();
+    assert_eq!(response_status(&held_response), Some(200));
+
+    let reload_logs = fs::read_to_string(&log).unwrap();
+    let second = reload_logs
+        .lines()
+        .find(|line| line.contains("configuration reload generation published"))
+        .expect("reload source summary");
+    for field in [
+        "generation=2",
+        "rules_directory=\"populated\"",
+        "fragment_count=1",
+        &format!("fragment_bytes={}", deny_fragment.len()),
+        "fragment_rule_count=1",
+        "main_rule_count=0",
+        "total_rule_count=1",
+    ] {
+        assert!(second.contains(field), "missing {field:?}: {second}");
+    }
+    assert!(!second.contains(directory.path().to_str().unwrap()));
+
+    fs::write(rules.join(".editor.tmp"), b"unstable candidate").unwrap();
+    child.signal(libc::SIGHUP);
+    wait_for_file_text_count(&log, "configuration reload failed", 1);
+    assert_eq!(readiness_status(control), Some(200));
+    assert_eq!(
+        fs::read_to_string(&log)
+            .unwrap()
+            .matches("configuration reload generation published")
+            .count(),
+        1,
+        "rejected candidate emitted a publication summary"
+    );
+    assert_eq!(
+        response_status(&proxy_get(proxy, &url, Duration::from_secs(5)).unwrap()),
+        Some(403),
+        "rejected candidate changed the active policy"
+    );
+
+    fs::remove_file(rules.join(".editor.tmp")).unwrap();
+    fs::write(rules.join("20-duplicate.toml"), fragment_text("allow")).unwrap();
+    child.signal(libc::SIGHUP);
+    wait_for_file_text_count(&log, "configuration reload failed", 2);
+    assert_eq!(readiness_status(control), Some(200));
+    assert_eq!(
+        fs::read_to_string(&log)
+            .unwrap()
+            .matches("configuration reload generation published")
+            .count(),
+        1,
+        "globally invalid candidate emitted a publication summary"
+    );
+    assert_eq!(
+        response_status(&proxy_get(proxy, &url, Duration::from_secs(5)).unwrap()),
+        Some(403),
+        "globally invalid candidate changed the active policy"
+    );
+
+    fs::remove_file(rules.join("20-duplicate.toml")).unwrap();
+    fs::write(&staged, &allow_fragment).unwrap();
+    fs::rename(&staged, &fragment).unwrap();
+    child.signal(libc::SIGHUP);
+    wait_for_file_text_count(&log, "configuration reload generation published", 2);
+    wait_for_file_text_count(&log, "configuration reload completed successfully", 2);
+    assert_eq!(readiness_status(control), Some(200));
+    assert_eq!(
+        response_status(&proxy_get(proxy, &url, Duration::from_secs(5)).unwrap()),
+        Some(200)
+    );
+    origin_worker.join().unwrap();
+
+    let final_logs = fs::read_to_string(&log).unwrap();
+    assert!(!final_logs.contains(directory.path().to_str().unwrap()));
+    child.signal(libc::SIGTERM);
+    assert!(child
+        .wait_for_exit(Duration::from_secs(10), "proxy did not stop cleanly")
+        .success());
+}
+
+#[cfg(unix)]
+#[test]
+fn source_summary_observes_missing_empty_and_populated_directory_states() {
+    let directory = TempDir::new().unwrap();
+    let (proxy, control) = ephemeral_addresses();
+    let config = directory.path().join("acl-proxy.toml");
+    let rules = directory.path().join("rules.d");
+    fs::write(
+        &config,
+        runtime_config(proxy, control, "2s", "[policy]\ndefault = \"deny\"\n"),
+    )
+    .unwrap();
+
+    let mut child = ChildGuard::spawn(&config);
+    wait_for_ready(&mut child, control);
+    let log = directory.path().join("logs/acl-proxy.log");
+    wait_for_file_text(&log, "acl-proxy is ready");
+    let startup = fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .find(|line| line.contains("acl-proxy is ready"))
+        .unwrap()
+        .to_owned();
+    for field in [
+        "generation=1",
+        "rules_directory=\"missing\"",
+        "fragment_count=0",
+        "fragment_bytes=0",
+        "fragment_rule_count=0",
+        "main_rule_count=0",
+        "total_rule_count=0",
+    ] {
+        assert!(startup.contains(field), "missing {field:?}: {startup}");
+    }
+
+    fs::create_dir(&rules).unwrap();
+    child.signal(libc::SIGHUP);
+    wait_for_file_text_count(&log, "configuration reload generation published", 1);
+    wait_for_file_text_count(&log, "configuration reload completed successfully", 1);
+    let empty = fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .find(|line| {
+            line.contains("configuration reload generation published")
+                && line.contains("generation=2")
+        })
+        .unwrap()
+        .to_owned();
+    for field in [
+        "rules_directory=\"empty\"",
+        "fragment_count=0",
+        "fragment_bytes=0",
+        "fragment_rule_count=0",
+        "main_rule_count=0",
+        "total_rule_count=0",
+    ] {
+        assert!(empty.contains(field), "missing {field:?}: {empty}");
+    }
+
+    let fragment = r#"schema_version = 4
+
+[[rules]]
+id = "observed-fragment"
+decision = "deny"
+urls = ["http://example.test/**"]
+"#;
+    fs::write(rules.join("10-observed.toml"), fragment).unwrap();
+    child.signal(libc::SIGHUP);
+    wait_for_file_text_count(&log, "configuration reload generation published", 2);
+    wait_for_file_text_count(&log, "configuration reload completed successfully", 2);
+    let populated = fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .find(|line| {
+            line.contains("configuration reload generation published")
+                && line.contains("generation=3")
+        })
+        .unwrap()
+        .to_owned();
+    for field in [
+        "rules_directory=\"populated\"",
+        "fragment_count=1",
+        &format!("fragment_bytes={}", fragment.len()),
+        "fragment_rule_count=1",
+        "main_rule_count=0",
+        "total_rule_count=1",
+    ] {
+        assert!(populated.contains(field), "missing {field:?}: {populated}");
+    }
+    assert!(!fs::read_to_string(&log)
+        .unwrap()
+        .contains(directory.path().to_str().unwrap()));
+    assert_eq!(readiness_status(control), Some(200));
+
+    child.signal(libc::SIGTERM);
+    assert!(child
+        .wait_for_exit(Duration::from_secs(10), "proxy did not stop cleanly")
+        .success());
 }
 
 #[cfg(unix)]
