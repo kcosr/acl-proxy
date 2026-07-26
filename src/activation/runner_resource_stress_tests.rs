@@ -672,7 +672,7 @@ fn deterministic_bytes(length: usize, salt: u8) -> Vec<u8> {
 
 fn stress_config(bind: SocketAddr, origins: &StressOrigins) -> String {
     format!(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [service]
 request_timeout = "25s"

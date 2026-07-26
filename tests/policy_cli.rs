@@ -83,7 +83,7 @@ fn command() -> Command {
 
 #[test]
 fn policy_dump_defaults_to_stable_secret_free_json_off_tty() {
-    let (_directory, path) = fixture(3);
+    let (_directory, path) = fixture(4);
     let output = command()
         .args(["policy", "dump", "--config"])
         .arg(path)
@@ -131,7 +131,7 @@ fn policy_dump_defaults_to_stable_secret_free_json_off_tty() {
 
 #[test]
 fn policy_dump_table_uses_the_same_compiled_projection() {
-    let (_directory, path) = fixture(3);
+    let (_directory, path) = fixture(4);
     command()
         .args(["policy", "dump", "--format", "table", "--config"])
         .arg(path)
@@ -155,7 +155,7 @@ fn policy_dump_table_uses_the_same_compiled_projection() {
 
 #[test]
 fn explicit_json_format_is_machine_readable() {
-    let (_directory, path) = fixture(3);
+    let (_directory, path) = fixture(4);
     let output = command()
         .args(["policy", "dump", "--format", "json", "--config"])
         .arg(path)
@@ -167,13 +167,13 @@ fn explicit_json_format_is_machine_readable() {
 }
 
 #[test]
-fn policy_dump_rejects_non_schema_three_without_fallback() {
+fn policy_dump_rejects_non_schema_four_without_fallback() {
     let (_directory, path) = fixture(2);
     command()
         .args(["policy", "dump", "--config"])
         .arg(path)
         .assert()
         .failure()
-        .stderr(contains("strict schema v3 TOML"))
+        .stderr(contains("strict schema v4 TOML"))
         .stderr(contains("invalid value"));
 }

@@ -118,7 +118,7 @@ pub(super) enum ConfigLoadError {
     #[error("configuration file {path} is not valid UTF-8 at byte {valid_up_to}")]
     InvalidUtf8 { path: PathBuf, valid_up_to: usize },
 
-    #[error("configuration file {path} is not valid strict schema v3 TOML: {diagnostic}")]
+    #[error("configuration file {path} is not valid strict schema v4 TOML: {diagnostic}")]
     ParseToml {
         path: PathBuf,
         diagnostic: SanitizedTomlDiagnostic,
@@ -429,7 +429,7 @@ mod tests {
     use super::*;
 
     const MINIMAL_CONFIG: &str = r#"
-schema_version = 3
+schema_version = 4
 
 [listeners.explicit_http]
 endpoint.kind = "tcp"
@@ -580,12 +580,12 @@ literal_environment_variables = ["MISSING_CONFIG_LOADER_REDACTION_SECRET"]
     }
 
     #[test]
-    fn strict_deserialization_rejects_non_v3_and_unknown_fields() {
+    fn strict_deserialization_rejects_non_v4_and_unknown_fields() {
         let directory = tempdir().unwrap();
         let config_path = directory.path().join("invalid.toml");
         fs::write(
             &config_path,
-            MINIMAL_CONFIG.replace("schema_version = 3", "schema_version = 2"),
+            MINIMAL_CONFIG.replace("schema_version = 4", "schema_version = 2"),
         )
         .unwrap();
         let wrong_version = load_path(&config_path).unwrap_err();

@@ -40,7 +40,7 @@ fn write_config(directory: &TempDir, mitm: Option<&str>) -> PathBuf {
     let config = directory.path().join("acl-proxy.toml");
     let connect_policy = if mitm.is_some() { "mitm" } else { "deny" };
     let text = format!(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [listeners.explicit_http]
 endpoint.kind = "tcp"
@@ -254,7 +254,7 @@ fn export_is_static_except_for_generated_ca_and_caller_output() {
     fs::write(
         &config,
         format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [listeners.explicit_http]
 endpoint.kind = "tcp"

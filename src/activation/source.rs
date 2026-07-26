@@ -114,7 +114,7 @@ mod tests {
     use super::*;
     use crate::config::load_and_compile_config;
 
-    const MINIMAL: &str = r#"schema_version = 3
+    const MINIMAL: &str = r#"schema_version = 4
 
 [service]
 request_timeout = "30s"
@@ -150,7 +150,7 @@ default = "deny"
             Duration::from_secs(17)
         );
         assert_eq!(reloaded.static_config.config_root, directory.path());
-        assert_eq!(reloaded.static_config.schema_version, 3);
+        assert_eq!(reloaded.static_config.schema_version, 4);
     }
 
     #[tokio::test]

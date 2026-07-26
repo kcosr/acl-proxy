@@ -6,8 +6,8 @@ ordered allow/deny/delegate policy, process and webhook authorization
 providers, typed credentials, bounded body handling, and generation-safe
 reloads.
 
-The only accepted configuration contract is integer `schema_version = 3`.
-Older schemas and mixed v2/v3 shapes are rejected; there is no compatibility
+The only accepted configuration contract is integer `schema_version = 4`.
+Every older schema and mixed shape is rejected; there is no compatibility
 parser or migration mode.
 
 ## Install
@@ -39,11 +39,12 @@ directory is the archive root. The current Linux archive has the three shown
 `bin/` entries; the planned macOS archive would omit the Linux-only relay and
 have the other two.
 
-The `0.3.0-rc.1` candidate requires `schema_version = 3`; configurations for
-the `0.2.x` contract must be rewritten rather than migrated through aliases or
-fallback parsing. This local candidate is validated for build and runtime on
-Linux x86_64 and for compilation on Linux aarch64. macOS arm64 and Windows MSVC
-x86_64 have not been validated because suitable hosts are unavailable.
+The `0.3.0-rc.1` candidate requires `schema_version = 4`; configurations for
+schema 3 and every earlier contract must be rewritten rather than migrated
+through aliases or fallback parsing. This local candidate is validated for
+build and runtime on Linux x86_64 and for compilation on Linux aarch64. macOS
+arm64 and Windows MSVC x86_64 have not been validated because suitable hosts
+are unavailable.
 
 ```bash
 cargo build --release --locked
@@ -86,7 +87,7 @@ curl --proxy http://127.0.0.1:8881 http://example.test/resource
 
 ## Architecture
 
-This repository owns the product shell: strict schema-3 compilation, listener
+This repository owns the product shell: strict schema-4 compilation, listener
 binding and OS integration, authorization/provider and credential-I/O adapters,
 capture/logging sinks, reload and signal policy, CLI, samples, and packaging.
 The sibling `access-runtime` repository owns canonical URLs, ACL/redaction and
@@ -108,7 +109,7 @@ directory containing the selected configuration file.
 ### Service And Control
 
 ```toml
-schema_version = 3
+schema_version = 4
 
 [service]
 request_timeout = "30s"
@@ -823,7 +824,7 @@ files and loopback listeners:
 scripts/loopback-smoke.sh
 ```
 
-It builds or uses `ACL_PROXY_BIN`, validates generated strict v3 config, probes
+It builds or uses `ACL_PROXY_BIN`, validates generated strict v4 config, probes
 readiness on the control listener, proves the data listener does not serve
 readiness, tests deny/allow HTTP and CONNECT/TLS, and checks graceful shutdown.
 

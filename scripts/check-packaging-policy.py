@@ -24,7 +24,7 @@ ALLOWED_LICENSES = {
 }
 REGISTRY = "https://github.com/rust-lang/crates.io-index"
 PRODUCT_VERSION = "0.3.0-rc.1"
-RUNTIME_COMMIT = "71bee2c6d3f3c70d7f4b79f77b99eafd8ef2b039"
+RUNTIME_COMMIT = "aa49f162085e17cee06bc43033bb4acf5571aa66"
 RUNTIME_TREE = "cbf64aae94422e526600fb8d8e309d535c01a72b"
 PRODUCT_INITIAL_COMMIT = "a829f43552c7118d1f206b9e4112b3c747eecd50"
 PRIVATE_TRANSPORT_PACKAGES = {
@@ -869,11 +869,11 @@ def check_provenance(root: Path, shared_crates: set[str]) -> None:
 def check_shipped_docs(root: Path) -> None:
     demos = root / "demos"
     if demos.exists() and any(path.is_file() or path.is_symlink() for path in demos.rglob("*")):
-        fail("obsolete pre-schema-3 demos are present")
+        fail("obsolete pre-schema-4 demos are present")
     readme = read_text(root / "README.md")
     normalized = " ".join(readme.split())
-    if f"The `{PRODUCT_VERSION}` candidate requires `schema_version = 3`" not in normalized:
-        fail("README lacks the exact strict-v3 candidate version marker")
+    if f"The `{PRODUCT_VERSION}` candidate requires `schema_version = 4`" not in normalized:
+        fail("README lacks the exact strict-v4 candidate version marker")
     archive_inventory = (
         "Release archives contain `acl-proxy`, the capture-body extraction helper, "
         "this README, `LICENSE`, `THIRD_PARTY_NOTICES`, and "
@@ -925,8 +925,8 @@ def check_shipped_docs(root: Path) -> None:
         ):
             if obsolete in text:
                 fail(f"{path} contains obsolete configuration surface: {obsolete}")
-    if "schema_version = 3" not in sample:
-        fail("sample configuration is not schema version 3")
+    if "schema_version = 4" not in sample:
+        fail("sample configuration is not schema version 4")
     if "acl-proxy export-ca" not in sample:
         fail("sample configuration lacks generated public-CA export guidance")
     if "ca-cert.pem" in sample or "ca-key.pem" in sample:

@@ -555,7 +555,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let marker = directory.path().join("provider-spawned");
         let input = format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [listeners.explicit_http]
 endpoint.kind = "tcp"
@@ -697,7 +697,7 @@ credential = "file_source"
 
     #[test]
     fn unix_provider_dump_projects_outputs_without_disclosing_socket_path() {
-        let input = r#"schema_version = 3
+        let input = r#"schema_version = 4
 
 [listeners.explicit_http]
 endpoint.kind = "tcp"
@@ -751,7 +751,7 @@ default = "deny"
     #[test]
     fn match_all_pattern_has_a_stable_dump_representation() {
         let compiled = compile_config_text(ConfigTextInput {
-            text: r#"schema_version = 3
+            text: r#"schema_version = 4
 
 [listeners.explicit_http]
 endpoint.kind = "tcp"

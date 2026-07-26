@@ -7,7 +7,7 @@ use tempfile::TempDir;
 
 fn policy_config(pattern: &str) -> String {
     format!(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [listeners.explicit_http]
 endpoint.kind = "tcp"

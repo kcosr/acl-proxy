@@ -84,7 +84,7 @@ fn initialize_generated_ca(directory: &Path, public_chain_path: &Path) {
 
 fn explicit_http_config(bind: SocketAddr, extra: &str) -> String {
     format!(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [service]
 request_timeout = "200ms"
@@ -108,7 +108,7 @@ default = "deny"
 
 fn explicit_https_config(bind: SocketAddr, identity: &TestIdentity, extra: &str) -> String {
     format!(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [service]
 request_timeout = "200ms"
@@ -139,7 +139,7 @@ default = "deny"
 
 fn transparent_https_config(bind: SocketAddr, directory: &Path, extra: &str) -> String {
     format!(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [service]
 request_timeout = "200ms"
@@ -362,7 +362,7 @@ async fn proxy_listener_cannot_reach_control_callback() {
     let reservations = crate::activation::reserve_listeners::<2>(&test);
     let [proxy, control] = reservations.addresses();
     let config = format!(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [service]
 request_timeout = "1s"
@@ -1090,7 +1090,7 @@ async fn provider_fixture(
         ca
     });
     let config = format!(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [service]
 request_timeout = "5s"

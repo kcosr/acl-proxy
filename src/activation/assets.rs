@@ -317,7 +317,7 @@ mod tests {
             identity.private_key_pem(),
         )
         .unwrap();
-        let text = r#"schema_version = 3
+        let text = r#"schema_version = 4
 
 [listeners.explicit_http]
 endpoint.kind = "tcp"

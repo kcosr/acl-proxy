@@ -17,7 +17,7 @@
 
 - `src/main.rs` — Entry point, delegates to CLI.
 - `src/cli/mod.rs` — CLI parsing, config validate/init, policy dump.
-- `src/config/` — Strict schema-3 authoring, loading, compilation, and templates.
+- `src/config/` — Strict schema-4 authoring, loading, compilation, and templates.
 - `src/policy/adapter.rs` — Product compilation and resources for the shared ACL evaluator.
 - `src/activation/` and `src/runtime/` — Product activation, reload, ownership, and shutdown.
 - `src/activation/listeners.rs` — Product listener binding, local-address refresh, and original-destination OS adaptation into the shared listener runtime.

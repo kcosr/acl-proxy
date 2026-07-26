@@ -192,7 +192,7 @@ mod tests {
     use crate::config::compiler::AuthorizationProviderPlan;
 
     const MINIMAL: &str = r#"
-schema_version = 3
+schema_version = 4
 
 [listeners.explicit_http]
 endpoint.kind = "tcp"
@@ -218,7 +218,7 @@ default = "deny"
         assert_eq!(loaded.metadata.path, path);
         assert_eq!(loaded.metadata.config_root, config_root);
         assert_eq!(loaded.metadata.path_source, ConfigPathSource::Explicit);
-        assert_eq!(loaded.compiled.static_config.schema_version, 3);
+        assert_eq!(loaded.compiled.static_config.schema_version, 4);
         assert_eq!(
             loaded.compiled.static_config.config_root,
             loaded.metadata.config_root
@@ -360,7 +360,7 @@ methods = ["GET"]"#,
     }
 
     #[test]
-    fn production_v1_shapes_are_rejected_by_v3_runtime() {
+    fn production_v1_shapes_are_rejected_by_v4_runtime() {
         let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/production");
         for name in [
             "v1-host-shape.toml",
@@ -369,7 +369,7 @@ methods = ["GET"]"#,
         ] {
             let error = load_and_compile_exact_config(&fixture_root.join(name)).unwrap_err();
             let rendered = error.to_string();
-            assert!(rendered.contains("strict schema v3"), "{name}: {rendered}");
+            assert!(rendered.contains("strict schema v4"), "{name}: {rendered}");
             assert!(rendered.contains("invalid value"), "{name}: {rendered}");
         }
     }
@@ -454,7 +454,7 @@ rules = [{{ expressions = ['\b{SECRET}\b'], literal_environment_variables = ["MI
         write_default_config_template(&path).unwrap();
         let loaded = load_and_compile_exact_config(&path).unwrap();
 
-        assert_eq!(loaded.compiled.static_config.schema_version, 3);
+        assert_eq!(loaded.compiled.static_config.schema_version, 4);
         assert_eq!(loaded.metadata.path, path);
         assert_eq!(loaded.compiled.reloadable_plan.policy.rules.len(), 0);
     }
@@ -467,7 +467,7 @@ rules = [{{ expressions = ['\b{SECRET}\b'], literal_environment_variables = ["MI
             .expect("shipped sample must pass the real strict loader and compiler");
 
         assert_eq!(loaded.metadata.path, path);
-        assert_eq!(loaded.compiled.static_config.schema_version, 3);
+        assert_eq!(loaded.compiled.static_config.schema_version, 4);
         assert_eq!(loaded.compiled.reloadable_plan.policy.rules.len(), 0);
         assert_eq!(
             loaded

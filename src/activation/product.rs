@@ -397,7 +397,7 @@ mod tests {
     const INITIAL_CAPTURE_LIMIT: usize = 128 * 1024 * 1024;
     const LOWER_CAPTURE_LIMIT: usize = 112 * 1024 * 1024;
 
-    const MINIMAL: &str = r#"schema_version = 3
+    const MINIMAL: &str = r#"schema_version = 4
 
 [service]
 request_timeout = "30s"

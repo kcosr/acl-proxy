@@ -81,7 +81,7 @@ fn connect_config(
     extra: &str,
 ) -> String {
     format!(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -278,7 +278,7 @@ async fn connect_deny_policy_returns_forbidden_without_mitm_activation() {
     let (proxy, listener) = prebound_listener();
     let directory = tempfile::tempdir().unwrap();
     let text = format!(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [service]
 shutdown_drain_timeout = "1s"

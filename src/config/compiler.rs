@@ -8112,7 +8112,7 @@ mod tests {
     }
 
     const MINIMAL: &str = r#"
-schema_version = 3
+schema_version = 4
 
 [listeners.explicit_http]
 endpoint.kind = "tcp"
@@ -8235,7 +8235,7 @@ path = "{oversized_component}"
     fn identity_config(token_source: &str) -> String {
         format!(
             r#"
-schema_version = 3
+schema_version = 4
 
 [listeners.explicit_http]
 endpoint.kind = "tcp"
@@ -9785,7 +9785,7 @@ rules = [{{ literal_environment_variables = ["TEST_REDACTION_SECRET"] }}]
     fn resource_config(service: &str, definitions: &str, rules: &str) -> String {
         format!(
             r#"
-schema_version = 3
+schema_version = 4
 
 [service]
 request_timeout = "1s"
@@ -10463,7 +10463,7 @@ methods = ["POST"]
     fn webhook_config(max_request_bytes: usize, max_response_bytes: usize) -> String {
         format!(
             r#"
-schema_version = 3
+schema_version = 4
 
 [control]
 bind = "127.0.0.1:8898"
@@ -12634,7 +12634,7 @@ console = false
     #[test]
     fn static_and_reloadable_ownership_matrix_covers_every_field_family() {
         let baseline = r#"
-schema_version = 3
+schema_version = 4
 
 [service]
 request_timeout = "30s"

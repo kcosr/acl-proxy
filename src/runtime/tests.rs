@@ -720,7 +720,7 @@ impl CandidateActivator for FakeActivator {
 fn config(request_timeout: &str, bind: &str, max_retiring_generations: usize) -> String {
     format!(
         r#"
-schema_version = 3
+schema_version = 4
 
 [service]
 request_timeout = "{request_timeout}"
@@ -1312,7 +1312,7 @@ fn live_upgrade_product_config(
         max_message_bytes: capture_max_message_bytes,
     } = capture;
     format!(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [service]
 shutdown_drain_timeout = "1s"

@@ -470,7 +470,7 @@ mod tests {
 
     fn config(explicit_http: SocketAddr, control: SocketAddr, extra: &str) -> String {
         format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 shutdown_drain_timeout = "1s"
@@ -1066,7 +1066,7 @@ urls = ["http://{origin_address}/capture-failure"]
             NormalizedListenerMode::Transparent => ("transparent_http", ""),
         };
         let text = format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -1281,7 +1281,7 @@ value = "policy"
         const VARIABLE: &str = "AW_PRODUCT_PARITY_IDENTITY_TOKEN";
         const BEARER: &str = "product-parity-identity-bearer-000000000000";
         let text = format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -1491,7 +1491,7 @@ for line in sys.stdin:
         const VARIABLE: &str = "AW_PROCESS_SATURATION_IDENTITY_TOKEN";
         const BEARER: &str = "process-saturation-identity-bearer-000000000";
         let text = format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -1709,7 +1709,7 @@ methods = ["GET"]
         const VARIABLE: &str = "AW_CONNECTION_SATURATION_IDENTITY_TOKEN";
         const BEARER: &str = "connection-saturation-identity-bearer-000000";
         let text = format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -1901,7 +1901,7 @@ default = "allow"
         const PARENT_VARIABLE: &str = "AW_PARENT_PRODUCT_IDENTITY_TOKEN";
         const PARENT_BEARER: &str = "parent-product-identity-bearer-0000000000000";
         let text = format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -2127,7 +2127,7 @@ default = "allow"
             .unwrap();
         let origin_address = origin.local_addr().unwrap();
         let text = format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -2238,7 +2238,7 @@ header = "x-test-loop"
             .unwrap();
         let origin_address = origin.local_addr().unwrap();
         let text = format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -2349,7 +2349,7 @@ methods = ["GET"]
             .unwrap();
         let origin_address = origin.local_addr().unwrap();
         let text = format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -2488,7 +2488,7 @@ methods = ["GET"]
             .unwrap();
         let origin_address = origin.local_addr().unwrap();
         let text = format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -2639,7 +2639,7 @@ allow_upgrades = true
         let origin_acceptor =
             TlsAcceptor::from(Arc::new(origin_identity.server_config(&[b"http/1.1"])));
         let text = format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 request_timeout = "5s"

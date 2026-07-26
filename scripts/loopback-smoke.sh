@@ -149,7 +149,7 @@ start_proxy() {
         CONTROL_PORT=$(ephemeral_port)
         [[ "$DATA_PORT" != "$CONTROL_PORT" ]] || continue
         cat >"$TMP_DIR/acl-proxy.toml" <<EOF
-schema_version = 3
+schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -210,7 +210,7 @@ EOF
         env -i HOME="$TMP_DIR/home" PATH="$PATH" \
             "$PROXY_BIN" config validate --config "$TMP_DIR/acl-proxy.toml" \
             >"$TMP_DIR/config-validate.log" 2>&1 \
-            || fail "generated strict v3 smoke configuration is invalid"
+            || fail "generated strict v4 smoke configuration is invalid"
 
         if [[ ! -s "$CA_CERT" ]]; then
             env -i HOME="$TMP_DIR/home" PATH="$PATH" \
@@ -307,4 +307,4 @@ PROXY_PID=""
     || fail "proxy exited with status $proxy_status after SIGINT"
 
 printf '%s\n' \
-    'loopback smoke passed: strict v3, control readiness, data isolation, deny, HTTP, CONNECT/TLS, graceful shutdown'
+    'loopback smoke passed: strict v4, control readiness, data isolation, deny, HTTP, CONNECT/TLS, graceful shutdown'

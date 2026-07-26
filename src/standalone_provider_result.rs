@@ -792,7 +792,7 @@ mod tests {
     };
     use crate::safety::WireBodyQuotaKey;
 
-    const CONFIG: &str = r#"schema_version = 3
+    const CONFIG: &str = r#"schema_version = 4
 
 [service]
 request_timeout = "30s"

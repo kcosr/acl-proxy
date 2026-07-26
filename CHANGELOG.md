@@ -16,9 +16,9 @@
   `allowedDestinationPorts` and a nested Unix `transport`; the removed
   `allowedOriginalPorts` and `upstreamSocket` fields are rejected without a
   dual parser. The Linux artifact is now `acl-proxy-access-flow-relay`.
-- Replaced the unreleased schema-2 draft with the strict integer
-  `schema_version = 3` contract. Missing, string, schema-1, schema-2, and future
-  versions are rejected without migration aliases or fallback parsing.
+- Replaced the unreleased schema-3 contract with strict integer
+  `schema_version = 4`. Missing, string, schema-1, schema-2, schema-3, and
+  future versions are rejected without migration aliases or fallback parsing.
 - Replaced the obsolete flat proxy, plugin, external-authorization, capture,
   logging, certificate, and loop-protection shapes with explicit `service`,
   `control`, `listeners`, `mitm`, `egress`, `policy`, `authorization`,

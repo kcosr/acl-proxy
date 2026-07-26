@@ -81,7 +81,7 @@ fn initialize_generated_ca(directory: &Path) -> Vec<Vec<u8>> {
 
 fn base_config(bind: SocketAddr, table: &str, versions: &str, extra: &str) -> String {
     format!(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [service]
 request_timeout = "5s"

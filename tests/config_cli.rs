@@ -12,7 +12,7 @@ use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use tempfile::{NamedTempFile, TempDir};
 
-const MINIMAL: &str = r#"schema_version = 3
+const MINIMAL: &str = r#"schema_version = 4
 
 [listeners.explicit_http]
 endpoint.kind = "tcp"
@@ -178,7 +178,7 @@ fn runtime_config(
     extra: &str,
 ) -> String {
     format!(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [service]
 shutdown_drain_timeout = "{drain_timeout}"
@@ -314,7 +314,7 @@ fn wait_for_file(path: &Path, child: &mut Child) {
 }
 
 #[test]
-fn config_validate_accepts_strict_schema_three() {
+fn config_validate_accepts_strict_schema_four() {
     let file = config_file(MINIMAL);
     command()
         .args(["config", "validate", "--config"])
@@ -343,13 +343,17 @@ fn config_validate_rejects_invalid_observation_logging_level() {
 fn config_validate_rejects_old_missing_and_future_schema_versions() {
     for (name, contents) in [
         (
-            "old",
-            MINIMAL.replace("schema_version = 3", "schema_version = 2"),
+            "old-two",
+            MINIMAL.replace("schema_version = 4", "schema_version = 2"),
         ),
-        ("missing", MINIMAL.replace("schema_version = 3\n\n", "")),
+        (
+            "old-three",
+            MINIMAL.replace("schema_version = 4", "schema_version = 3"),
+        ),
+        ("missing", MINIMAL.replace("schema_version = 4\n\n", "")),
         (
             "future",
-            MINIMAL.replace("schema_version = 3", "schema_version = 4"),
+            MINIMAL.replace("schema_version = 4", "schema_version = 5"),
         ),
     ] {
         let file = config_file(&contents);
@@ -358,7 +362,7 @@ fn config_validate_rejects_old_missing_and_future_schema_versions() {
             .arg(file.path())
             .assert()
             .failure()
-            .stderr(contains("strict schema v3 TOML"))
+            .stderr(contains("strict schema v4 TOML"))
             .stderr(contains(if name == "missing" {
                 "missing required field"
             } else {
@@ -380,7 +384,7 @@ fn config_validate_rejects_missing_policy_and_default() {
             .assert()
             .failure()
             .stdout(contains("Configuration is valid").not())
-            .stderr(contains("strict schema v3 TOML"))
+            .stderr(contains("strict schema v4 TOML"))
             .stderr(contains("missing required field"));
     }
 }
@@ -429,7 +433,7 @@ fn static_cli_commands_never_execute_provider_or_resolve_secrets() {
     fs::write(
         &path,
         format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [control]
 bind = "127.0.0.1:8898"
@@ -502,7 +506,7 @@ fn config_init_writes_a_strict_loopback_template_that_validates() {
         .stdout(contains("Wrote default config"));
 
     let contents = fs::read_to_string(&target).unwrap();
-    assert!(contents.starts_with("schema_version = 3\n"));
+    assert!(contents.starts_with("schema_version = 4\n"));
     assert!(contents.contains("[listeners.explicit_http]"));
     assert!(contents.contains("127.0.0.1:8881"));
     assert!(!contents.contains("[proxy]"));
@@ -578,7 +582,7 @@ fn explicit_config_path_overrides_a_non_unicode_environment_path() {
         .join(OsString::from_vec(b"rejected-\xff.toml".to_vec()));
     fs::write(
         &environment,
-        MINIMAL.replace("schema_version = 3", "schema_version = 2"),
+        MINIMAL.replace("schema_version = 4", "schema_version = 2"),
     )
     .expect("write environment config");
 
@@ -605,13 +609,13 @@ fn cli_help_describes_the_strict_toml_runtime() {
 
 #[test]
 fn run_rejects_schema_two_without_fallback() {
-    let file = config_file(&MINIMAL.replace("schema_version = 3", "schema_version = 2"));
+    let file = config_file(&MINIMAL.replace("schema_version = 4", "schema_version = 2"));
     command()
         .args(["run", "--config"])
         .arg(file.path())
         .assert()
         .failure()
-        .stderr(contains("strict schema v3 TOML"));
+        .stderr(contains("strict schema v4 TOML"));
 }
 
 #[cfg(unix)]
@@ -623,7 +627,7 @@ fn strict_run_owns_reload_shutdown_and_listener_release() {
     fs::write(
         &config,
         format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 shutdown_drain_timeout = "2s"
@@ -727,7 +731,7 @@ fn invalid_reload_candidates_preserve_live_generation_until_corrected_reload() {
 
     fs::write(
         &config,
-        valid.replace("schema_version = 3", "schema_version = 2"),
+        valid.replace("schema_version = 4", "schema_version = 2"),
     )
     .unwrap();
     child.signal(libc::SIGHUP);
