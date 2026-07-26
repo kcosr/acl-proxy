@@ -485,6 +485,8 @@ async fn serve_h2_origin_connection_with_hook(
         .expect("H2 origin connection failed")
         .expect("H2 origin closed before its request");
     let cancelled = request.uri().path().contains("/cancel/");
+    // Release the fixture's receive handle before passively awaiting peer shutdown.
+    drop(request);
     let driver = tokio::spawn(async move {
         if let Some(Ok(_)) = connection.accept().await {
             panic!("H2 origin connection received more than one request");
