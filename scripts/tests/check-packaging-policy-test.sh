@@ -89,6 +89,7 @@ printf '%s\n' '// metadata-only fixture' >"$BASELINE/crates/access-flow-relay/sr
 run_gate() {
     local fixture=$1
     local runtime_source_tree_argument=${2-$runtime_source_tree}
+    local gate=${3:-$GATE}
     local resolved_metadata
     resolved_metadata=$(mktemp "$TMP/resolved-metadata.XXXXXX.json")
     python3 - "$fixture/metadata.json" "$resolved_metadata" "$BASELINE" "$fixture" <<'PY'
@@ -114,7 +115,7 @@ PY
     if [[ -n $runtime_source_tree_argument ]]; then
         arguments+=(--runtime-source-tree "$runtime_source_tree_argument")
     fi
-    python3 "$GATE" "${arguments[@]}"
+    python3 "$gate" "${arguments[@]}"
 }
 
 run_gate "$BASELINE"
@@ -241,6 +242,29 @@ expect_runtime_rejected() {
 }
 
 if [[ -n $RUNTIME_REPOSITORY ]]; then
+    wrong_tree_gate="$TMP/check-packaging-policy-wrong-runtime-tree.py"
+    python3 - "$GATE" "$wrong_tree_gate" "$RUNTIME_TREE" <<'PY'
+from pathlib import Path
+import sys
+
+source, destination = map(Path, sys.argv[1:3])
+runtime_tree = sys.argv[3]
+text = source.read_text(encoding="utf-8")
+expected = f'RUNTIME_TREE = "{runtime_tree}"'
+replacement = 'RUNTIME_TREE = "0000000000000000000000000000000000000000"'
+if text.count(expected) != 1:
+    raise SystemExit("packaging gate Runtime tree authority is not unique")
+destination.write_text(text.replace(expected, replacement, 1), encoding="utf-8")
+PY
+    if run_gate "$BASELINE" "" "$wrong_tree_gate" \
+        >"$TMP/runtime-wrong-tree.out" 2>&1; then
+        printf '%s\n' 'packaging Runtime tree authority mutation unexpectedly passed' >&2
+        exit 1
+    fi
+    grep -Fq 'canonical sibling runtime tree differs from the accepted runtime tree' \
+        "$TMP/runtime-wrong-tree.out"
+    run_gate "$BASELINE" >/dev/null
+
     git -C "$RUNTIME_REPOSITORY" worktree remove --force "$RUNTIME_FIXTURE" >/dev/null
     git -C "$RUNTIME_REPOSITORY" worktree add --detach "$RUNTIME_FIXTURE" \
         "$RUNTIME_COMMIT^" >/dev/null
@@ -319,7 +343,7 @@ fi
 reject_runtime_authentication_failure() {
     local name=$1 output=$2
     if grep -Eq \
-        'authenticated runtime source|Git metadata|cannot inspect authenticated runtime|cannot verify canonical sibling runtime source state|canonical sibling runtime is not one complete Git worktree|canonical sibling runtime HEAD differs from the accepted runtime commit|canonical sibling runtime worktree or index is not clean' \
+        'authenticated runtime source|Git metadata|cannot inspect authenticated runtime|cannot verify canonical sibling runtime source state|canonical sibling runtime is not one complete Git worktree|canonical sibling runtime HEAD differs from the accepted runtime commit|canonical sibling runtime tree differs from the accepted runtime tree|canonical sibling runtime worktree or index is not clean' \
         "$output"; then
         printf 'packaging mutation failed through Runtime authentication instead of its target: %s\n' \
             "$name" >&2
@@ -344,6 +368,15 @@ if reject_runtime_authentication_failure \
     runtime-worktree-control "$TMP/runtime-worktree-control.out" \
     >"$TMP/runtime-worktree-control.log" 2>&1; then
     printf '%s\n' 'Runtime worktree control unexpectedly passed' >&2
+    exit 1
+fi
+printf '%s\n' \
+    'packaging policy check failed: canonical sibling runtime tree differs from the accepted runtime tree' \
+    >"$TMP/runtime-tree-control.out"
+if reject_runtime_authentication_failure \
+    runtime-tree-control "$TMP/runtime-tree-control.out" \
+    >"$TMP/runtime-tree-control.log" 2>&1; then
+    printf '%s\n' 'Runtime tree authentication control unexpectedly passed' >&2
     exit 1
 fi
 
