@@ -916,6 +916,15 @@ def check_shipped_docs(root: Path) -> None:
     ):
         fail("README hardcodes a future release SHA prefix")
     sample = read_text(root / "acl-proxy.sample.toml")
+    for migration_marker in (
+        "Treat the binary and its complete configuration directory as one deployment",
+        "fixed-width ordering prefixes",
+        "Raw ASCII filename order remains the normative ordering rule",
+        "Deploy the new binary, main file, and complete `rules.d` set together",
+        "Rollback must likewise restore the prior binary, main file, and complete",
+    ):
+        if migration_marker not in readme:
+            fail("README lacks schema-v4 migration guidance: " + migration_marker)
     for path, text in (("README.md", readme), ("acl-proxy.sample.toml", sample)):
         for obsolete in (
             "policy.external_auth_profiles",
@@ -934,12 +943,27 @@ def check_shipped_docs(root: Path) -> None:
         "equal policy authority",
         "stage outside rules.d",
         "atomically rename",
+        "fixed-width names",
+        "raw ASCII order",
+        "binary, main file, and complete rules.d",
     ):
         if required_rules_directory_guidance not in sample:
             fail(
                 "sample configuration lacks rules.d authority/publication guidance: "
                 + required_rules_directory_guidance
             )
+    historical_notice = (
+        "Historical pre-schema-4 implementation record. It does not describe "
+        "the current configuration contract; use `README.md` for supported authoring."
+    )
+    for relative_path in (
+        "docs/implementation/global-egress-header-actions/schema-proposal.md",
+        "docs/implementation/global-egress-header-actions/phase-task-plan.md",
+        "docs/implementation/egress-destination-forwarding/schema-proposal.md",
+        "docs/implementation/egress-destination-forwarding/phase-task-plan.md",
+    ):
+        if historical_notice not in read_text(root / relative_path):
+            fail(f"{relative_path} lacks the historical pre-v4 notice")
     if "acl-proxy export-ca" not in sample:
         fail("sample configuration lacks generated public-CA export guidance")
     if "ca-cert.pem" in sample or "ca-key.pem" in sample:

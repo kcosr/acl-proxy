@@ -1,5 +1,7 @@
 # Global Egress Header Actions Phase Task Plan
 
+> Historical pre-schema-4 implementation record. It does not describe the current configuration contract; use `README.md` for supported authoring.
+
 Status: Locked (2026-03-08)
 
 ## 1. Scope

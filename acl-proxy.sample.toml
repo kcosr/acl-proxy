@@ -54,6 +54,9 @@ default = "deny"
 # equal policy authority to this main rule list. Keep both main and rules.d under
 # one trusted serialized writer; stage outside rules.d, atomically rename
 # complete fragments into place, then trigger one reload.
+# Use fixed-width names such as 00-base.toml and 10-team.toml; raw ASCII order
+# is normative. Deploy or roll back the binary, main file, and complete rules.d
+# directory together as one coordinated transaction.
 #
 # Add narrowly scoped rules after reviewing canonical URL, method, client, and
 # header intent. An empty urls list means every canonical HTTP/HTTPS URL.

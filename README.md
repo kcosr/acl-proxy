@@ -46,6 +46,27 @@ build and runtime on Linux x86_64 and for compilation on Linux aarch64. macOS
 arm64 and Windows MSVC x86_64 have not been validated because suitable hosts
 are unavailable.
 
+### Schema 4 Migration
+
+Treat the binary and its complete configuration directory as one deployment
+transaction:
+
+1. Stage the new binary and a separate complete configuration directory.
+2. Inventory the staged main file's implicit sibling `rules.d`. Remove
+   unrelated content and convert the main file and every intended fragment to
+   strict integer `schema_version = 4`.
+3. Give fragments fixed-width ordering prefixes such as `00-`, `10-`, and
+   `20-`. Raw ASCII filename order remains the normative ordering rule.
+4. Run `config validate`, table `policy dump`, and JSON `policy dump` against
+   the staged main path. Review the complete fragment-before-main order and
+   source provenance.
+5. Deploy the new binary, main file, and complete `rules.d` set together, then
+   start or reload only after the complete set is in place.
+
+Rollback must likewise restore the prior binary, main file, and complete
+`rules.d` directory together. Do not run a schema-v4-only binary against a
+partial directory transaction or pair an older binary with v4 configuration.
+
 ```bash
 cargo build --release --locked
 ```
@@ -476,6 +497,9 @@ names that collide under ASCII case folding are rejected on every platform.
 Every directory entry must be an eligible direct, single-link regular file;
 symlinks, Windows reparse points, hard links, nested directories, special
 files, and unrelated temporary files reject the complete candidate.
+Use fixed-width prefixes such as `00-`, `10-`, and `20-` so intended insertion
+points remain obvious. This is authoring guidance; raw ASCII filename order is
+the normative composition rule.
 
 The hard source bounds are:
 
@@ -508,6 +532,10 @@ place, request one reload only after the complete set is stable, and retain
 writer serialization until reload completes. Any file, membership, mutation,
 parse, reference, bounds, or activation failure preserves the complete prior
 generation.
+
+During a schema cutover or rollback, deploy the binary, main file, and complete
+`rules.d` directory as one coordinated transaction. Mixing an old binary with
+v4 authoring or publishing only part of the v4 directory is unsupported.
 
 These permission and publication rules are operator controls, not checks
 performed by ACL Proxy. ACL Proxy does not validate owner, group, or mode; lock
