@@ -3302,6 +3302,7 @@ private_key = "missing-server-key.pem"
         include!("runner_parent_proxy_tests.rs");
     }
 
+    #[cfg(unix)]
     mod connect_mitm_tests {
         include!("runner_connect_mitm_tests.rs");
     }
@@ -3322,6 +3323,7 @@ private_key = "missing-server-key.pem"
         include!("runner_listener_lifecycle_tests.rs");
     }
 
+    #[cfg(unix)]
     mod identity_product_tests {
         include!("runner_identity_product_tests.rs");
     }

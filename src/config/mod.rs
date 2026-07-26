@@ -4,6 +4,7 @@ mod duration;
 mod facade;
 mod loader;
 mod policy_dump;
+mod source_snapshot;
 mod template;
 
 pub(crate) use compiler::{

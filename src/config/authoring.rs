@@ -77,6 +77,13 @@ pub(super) struct AuthoringConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct RulesFragmentConfig {
+    pub schema_version: SchemaVersion,
+    pub rules: Vec<PolicyRuleConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ServiceConfig {
     #[serde(default = "default_request_timeout")]
     pub request_timeout: PositiveDuration,

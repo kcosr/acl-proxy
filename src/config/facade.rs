@@ -6,6 +6,7 @@ use super::compiler::{
     StaticProductConfig,
 };
 use super::loader;
+use super::source_snapshot;
 
 pub(crate) use super::loader::ConfigPathSource;
 
@@ -32,6 +33,8 @@ pub(crate) struct CompiledConfig {
     pub(crate) static_config: StaticProductConfig,
     pub(crate) static_fingerprint: StaticFingerprint,
     pub(crate) reloadable_plan: ReloadableProductPlan,
+    pub(crate) rule_sources: Vec<loader::RuleSource>,
+    pub(crate) source_summary: source_snapshot::SourceInventorySummary,
 }
 
 impl fmt::Debug for CompiledConfig {
@@ -40,6 +43,8 @@ impl fmt::Debug for CompiledConfig {
             .debug_struct("CompiledConfig")
             .field("static_fingerprint", &self.static_fingerprint)
             .field("reloadable_plan", &self.reloadable_plan)
+            .field("rule_source_count", &self.rule_sources.len())
+            .field("source_summary", &self.source_summary)
             .finish_non_exhaustive()
     }
 }
@@ -123,7 +128,13 @@ pub(crate) fn load_and_compile_config(
         config_root: loaded.config_root,
         path_source: loaded.path_source,
     };
-    let compiled = compile_authored(loaded.authored, &metadata.config_root, &metadata.path)?;
+    let compiled = compile_authored(
+        loaded.authored,
+        loaded.rule_sources,
+        loaded.source_summary,
+        &metadata.config_root,
+        &metadata.path,
+    )?;
     Ok(LoadedCompiledConfig { metadata, compiled })
 }
 
@@ -136,7 +147,13 @@ pub(crate) fn load_and_compile_exact_config(
         config_root: loaded.config_root,
         path_source: loaded.path_source,
     };
-    let compiled = compile_authored(loaded.authored, &metadata.config_root, &metadata.path)?;
+    let compiled = compile_authored(
+        loaded.authored,
+        loaded.rule_sources,
+        loaded.source_summary,
+        &metadata.config_root,
+        &metadata.path,
+    )?;
     Ok(LoadedCompiledConfig { metadata, compiled })
 }
 
@@ -145,7 +162,23 @@ pub(crate) fn compile_config_text(
     input: ConfigTextInput<'_>,
 ) -> Result<CompiledConfig, ConfigFacadeError> {
     let authored = loader::parse_config_text(input.text, input.source_path).map_err(load_error)?;
-    compile_authored(authored, input.config_root, input.source_path)
+    let rule_sources = (0..authored.policy.rules.len())
+        .map(|source_rule_index| loader::RuleSource {
+            source: loader::RuleSourceKind::Main,
+            source_rule_index,
+        })
+        .collect();
+    compile_authored(
+        authored,
+        rule_sources,
+        source_snapshot::SourceInventorySummary {
+            rules_directory: source_snapshot::RulesDirectoryState::Missing,
+            fragment_count: 0,
+            fragment_bytes: 0,
+        },
+        input.config_root,
+        input.source_path,
+    )
 }
 
 pub(crate) fn write_default_config_template(path: &Path) -> Result<(), ConfigFacadeError> {
@@ -157,6 +190,8 @@ pub(crate) fn write_default_config_template(path: &Path) -> Result<(), ConfigFac
 
 fn compile_authored(
     authored: super::authoring::AuthoringConfig,
+    rule_sources: Vec<loader::RuleSource>,
+    source_summary: source_snapshot::SourceInventorySummary,
     config_root: &Path,
     source_path: &Path,
 ) -> Result<CompiledConfig, ConfigFacadeError> {
@@ -165,7 +200,7 @@ fn compile_authored(
             source_path: source_path.to_path_buf(),
             message: source.to_string(),
         })?;
-    Ok(split_compiled(compiled))
+    Ok(split_compiled(compiled, rule_sources, source_summary))
 }
 
 fn load_error(source: super::loader::ConfigLoadError) -> ConfigFacadeError {
@@ -174,11 +209,17 @@ fn load_error(source: super::loader::ConfigLoadError) -> ConfigFacadeError {
     }
 }
 
-fn split_compiled(compiled: CompiledProductConfig) -> CompiledConfig {
+fn split_compiled(
+    compiled: CompiledProductConfig,
+    rule_sources: Vec<loader::RuleSource>,
+    source_summary: source_snapshot::SourceInventorySummary,
+) -> CompiledConfig {
     CompiledConfig {
         static_config: compiled.static_config,
         static_fingerprint: compiled.static_fingerprint,
         reloadable_plan: compiled.reloadable_plan,
+        rule_sources,
+        source_summary,
     }
 }
 

@@ -1,10 +1,19 @@
 use std::fs;
-use std::io::{Read, Write};
+#[cfg(unix)]
+use std::io::Read;
+use std::io::Write;
+#[cfg(unix)]
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+#[cfg(unix)]
 use std::ops::{Deref, DerefMut};
+#[cfg(unix)]
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
+#[cfg(unix)]
+use std::process::{Child, Stdio};
+#[cfg(unix)]
 use std::thread;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use assert_cmd::prelude::*;
@@ -36,12 +45,14 @@ fn command() -> Command {
     Command::new(assert_cmd::cargo_bin!("acl-proxy"))
 }
 
+#[cfg(unix)]
 fn ephemeral_addresses() -> (SocketAddr, SocketAddr) {
     let first = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let second = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     (first.local_addr().unwrap(), second.local_addr().unwrap())
 }
 
+#[cfg(unix)]
 fn readiness_status(address: SocketAddr) -> Option<u16> {
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(100)).ok()?;
     stream
@@ -58,6 +69,7 @@ fn readiness_status(address: SocketAddr) -> Option<u16> {
         .and_then(|status| status.parse().ok())
 }
 
+#[cfg(unix)]
 fn wait_for_ready(child: &mut Child, address: SocketAddr) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -73,6 +85,7 @@ fn wait_for_ready(child: &mut Child, address: SocketAddr) {
     }
 }
 
+#[cfg(unix)]
 fn wait_for_file_text(path: &std::path::Path, expected: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -421,6 +434,7 @@ fn config_validate_reports_sanitized_syntax_errors() {
     assert!(!stderr.contains("secret-value-that-must-not-leak"));
 }
 
+#[cfg(unix)]
 #[test]
 fn static_cli_commands_never_execute_provider_or_resolve_secrets() {
     let directory = TempDir::new().expect("create temporary directory");
