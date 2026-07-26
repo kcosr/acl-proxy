@@ -166,7 +166,7 @@ mod tests {
 
     const BEARER: &[u8] = b"identity-file-bearer-000000000000";
 
-    fn effective_uid_home() -> std::path::PathBuf {
+    fn effective_uid_home() -> Result<std::path::PathBuf, String> {
         use std::ffi::{CStr, OsStr};
         use std::os::unix::ffi::OsStrExt;
 
@@ -188,12 +188,20 @@ mod tests {
                 &mut result,
             )
         };
-        assert_eq!(status, 0, "effective-UID passwd lookup failed");
-        assert!(!result.is_null(), "effective UID has no passwd entry");
+        if status != 0 {
+            return Err(format!(
+                "effective-UID passwd lookup failed with status {status}"
+            ));
+        }
+        if result.is_null() {
+            return Err("effective UID has no passwd entry".to_owned());
+        }
         let password = unsafe { password.assume_init() };
         let home = unsafe { CStr::from_ptr(password.pw_dir) }.to_bytes();
-        assert!(!home.is_empty(), "effective-UID passwd home is empty");
-        std::path::PathBuf::from(OsStr::from_bytes(home))
+        if home.is_empty() {
+            return Err("effective-UID passwd home is empty".to_owned());
+        }
+        Ok(std::path::PathBuf::from(OsStr::from_bytes(home)))
     }
 
     fn validate_trusted_test_root(path: &Path) -> Result<(), String> {
@@ -246,17 +254,17 @@ mod tests {
             }
         }
 
-        let passwd_home = effective_uid_home();
-        match try_trusted_tempdir(&passwd_home) {
-            Ok(directory) => directory,
-            Err(error) => {
-                failures.push(error);
-                panic!(
-                    "no trusted writable root for identity-file tests: {}",
-                    failures.join("; ")
-                )
-            }
+        match effective_uid_home() {
+            Ok(passwd_home) => match try_trusted_tempdir(&passwd_home) {
+                Ok(directory) => return directory,
+                Err(error) => failures.push(error),
+            },
+            Err(error) => failures.push(error),
         }
+        panic!(
+            "no trusted writable root for identity-file tests: {}",
+            failures.join("; ")
+        )
     }
 
     fn write_leaf(path: &Path, value: &[u8]) {
