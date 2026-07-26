@@ -134,6 +134,7 @@ pub(super) enum SourceSnapshotError {
         source: String,
     },
     AggregateTooLarge,
+    Allocation,
 }
 
 impl fmt::Display for SourceSnapshotError {
@@ -179,6 +180,7 @@ impl fmt::Display for SourceSnapshotError {
                 formatter,
                 "rules.d exceeds the {MAX_FRAGMENT_AGGREGATE_BYTES}-byte aggregate limit"
             ),
+            Self::Allocation => formatter.write_str("configuration snapshot allocation failed"),
         }
     }
 }
@@ -309,7 +311,10 @@ pub(super) fn load_sources_with_observer<E>(
     let mut names = validate_names(raw_names).map_err(LoadSourcesError::Snapshot)?;
     names.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
 
-    let mut inventory = Vec::with_capacity(names.len());
+    let mut inventory = Vec::new();
+    inventory
+        .try_reserve_exact(names.len())
+        .map_err(|_| LoadSourcesError::Snapshot(SourceSnapshotError::Allocation))?;
     for name in &names {
         let os_name = OsStr::new(name.as_str());
         let metadata = platform::probe_at(&rules, os_name)
@@ -339,7 +344,18 @@ pub(super) fn load_sources_with_observer<E>(
             .map_err(|source| snapshot_io("opening a rules.d fragment", source))?;
         observe(SnapshotEvent::FragmentOpened(name.as_str()));
         require_unchanged(&source_name, *probe, opened).map_err(LoadSourcesError::Snapshot)?;
-        let bytes = platform::read_file_limited(&mut file, MAX_FRAGMENT_BYTES + 1, |bytes| {
+        let remaining_aggregate = MAX_FRAGMENT_AGGREGATE_BYTES
+            .checked_sub(aggregate_bytes)
+            .ok_or(LoadSourcesError::Snapshot(
+                SourceSnapshotError::AggregateTooLarge,
+            ))?;
+        let read_limit = MAX_FRAGMENT_BYTES
+            .min(remaining_aggregate)
+            .checked_add(1)
+            .ok_or(LoadSourcesError::Snapshot(
+                SourceSnapshotError::AggregateTooLarge,
+            ))?;
+        let bytes = platform::read_file_limited(&mut file, read_limit, |bytes| {
             observe(SnapshotEvent::FragmentReadChunk(name.as_str(), bytes));
         })
         .map_err(|source| snapshot_io("reading a rules.d fragment", source))?;
@@ -348,6 +364,11 @@ pub(super) fn load_sources_with_observer<E>(
                 source: source_name,
                 max_bytes: MAX_FRAGMENT_BYTES,
             }));
+        }
+        if bytes.len() > remaining_aggregate {
+            return Err(LoadSourcesError::Snapshot(
+                SourceSnapshotError::AggregateTooLarge,
+            ));
         }
         aggregate_bytes =
             aggregate_bytes
@@ -457,8 +478,10 @@ fn validate_names(raw_names: Vec<OsString>) -> Result<Vec<FragmentName>, SourceS
     if raw_names.len() > MAX_FRAGMENT_ENTRIES {
         return Err(SourceSnapshotError::TooManyEntries);
     }
-    let mut names = Vec::with_capacity(raw_names.len());
-    let mut folded = std::collections::BTreeMap::<String, String>::new();
+    let mut names = Vec::new();
+    names
+        .try_reserve_exact(raw_names.len())
+        .map_err(|_| SourceSnapshotError::Allocation)?;
     for raw_name in raw_names {
         let Some(name) = raw_name.to_str() else {
             return Err(SourceSnapshotError::InvalidFragmentName);
@@ -466,10 +489,12 @@ fn validate_names(raw_names: Vec<OsString>) -> Result<Vec<FragmentName>, SourceS
         if !valid_fragment_name(name) {
             return Err(SourceSnapshotError::InvalidFragmentName);
         }
-        let case_folded = name.to_ascii_lowercase();
-        if let Some(first) = folded.insert(case_folded, name.to_owned()) {
+        if let Some(first) = names
+            .iter()
+            .find(|first: &&FragmentName| first.as_str().eq_ignore_ascii_case(name))
+        {
             return Err(SourceSnapshotError::CaseCollision {
-                first,
+                first: first.as_str().to_owned(),
                 second: name.to_owned(),
             });
         }
@@ -501,7 +526,11 @@ fn valid_fragment_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::ffi::CString;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt;
 
     use tempfile::tempdir;
 
@@ -547,6 +576,175 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn main_symlink_and_hard_link_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let main = directory.path().join("acl-proxy.toml");
+        let target = directory.path().join("target.toml");
+        fs::write(&target, MAIN).unwrap();
+
+        symlink(&target, &main).unwrap();
+        assert!(matches!(
+            load_sources(&main, |_, _| Ok::<_, ()>(())),
+            Err(LoadSourcesError::Snapshot(
+                SourceSnapshotError::InvalidType { .. }
+            ))
+        ));
+
+        fs::remove_file(&main).unwrap();
+        fs::hard_link(&target, &main).unwrap();
+        assert!(matches!(
+            load_sources(&main, |_, _| Ok::<_, ()>(())),
+            Err(LoadSourcesError::Snapshot(
+                SourceSnapshotError::MultipleLinks { .. }
+            ))
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_main_reparse_point_and_hard_link_are_rejected() {
+        use std::os::windows::fs::symlink_file;
+
+        let directory = tempdir().unwrap();
+        let main = directory.path().join("acl-proxy.toml");
+        let target = directory.path().join("target.toml");
+        fs::write(&target, MAIN).unwrap();
+
+        symlink_file(&target, &main).unwrap();
+        assert!(matches!(
+            load_sources(&main, |_, _| Ok::<_, ()>(())),
+            Err(LoadSourcesError::Snapshot(
+                SourceSnapshotError::InvalidType { .. }
+            ))
+        ));
+
+        fs::remove_file(&main).unwrap();
+        fs::hard_link(&target, &main).unwrap();
+        assert!(matches!(
+            load_sources(&main, |_, _| Ok::<_, ()>(())),
+            Err(LoadSourcesError::Snapshot(
+                SourceSnapshotError::MultipleLinks { .. }
+            ))
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rules_directory_reparse_point_is_rejected() {
+        use std::os::windows::fs::symlink_dir;
+
+        let directory = tempdir().unwrap();
+        let main = directory.path().join("acl-proxy.toml");
+        let target = directory.path().join("rules-target");
+        fs::write(&main, MAIN).unwrap();
+        fs::create_dir(&target).unwrap();
+        symlink_dir(&target, directory.path().join("rules.d")).unwrap();
+
+        assert!(matches!(
+            load_sources(&main, |_, _| Ok::<_, ()>(())),
+            Err(LoadSourcesError::Snapshot(
+                SourceSnapshotError::InvalidType { .. }
+            ))
+        ));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn same_name_main_replacement_between_probe_and_open_is_rejected() {
+        let directory = tempdir().unwrap();
+        let main = directory.path().join("acl-proxy.toml");
+        let replacement = directory.path().join("replacement.toml");
+        fs::write(&main, MAIN).unwrap();
+        fs::write(&replacement, MAIN.replace("deny", "allow")).unwrap();
+
+        let result = load_sources_with_observer(
+            &main,
+            |_, _| Ok::<_, ()>(()),
+            |event| {
+                if event == SnapshotEvent::MainProbed {
+                    fs::rename(&replacement, &main).unwrap();
+                }
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(LoadSourcesError::Snapshot(
+                SourceSnapshotError::Changed { .. }
+            ))
+        ));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn in_place_main_mutation_between_read_chunks_is_rejected() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let directory = tempdir().unwrap();
+        let main = directory.path().join("acl-proxy.toml");
+        let mut content = MAIN.as_bytes().to_vec();
+        content.resize(128 * 1024, b' ');
+        fs::write(&main, content).unwrap();
+        let mut mutated = false;
+
+        let result = load_sources_with_observer(
+            &main,
+            |_, _| Ok::<_, ()>(()),
+            |event| {
+                if !mutated && matches!(event, SnapshotEvent::MainReadChunk(_)) {
+                    let mut writer = fs::OpenOptions::new().write(true).open(&main).unwrap();
+                    writer.seek(SeekFrom::Start(80 * 1024)).unwrap();
+                    writer.write_all(b"changed").unwrap();
+                    writer.sync_all().unwrap();
+                    mutated = true;
+                }
+            },
+        );
+        assert!(mutated);
+        assert!(matches!(
+            result,
+            Err(LoadSourcesError::Snapshot(
+                SourceSnapshotError::Changed { .. }
+            ))
+        ));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn main_growth_between_read_chunks_is_rejected() {
+        use std::io::Write;
+
+        let directory = tempdir().unwrap();
+        let main = directory.path().join("acl-proxy.toml");
+        let mut content = MAIN.as_bytes().to_vec();
+        content.resize(128 * 1024, b' ');
+        fs::write(&main, content).unwrap();
+        let mut mutated = false;
+
+        let result = load_sources_with_observer(
+            &main,
+            |_, _| Ok::<_, ()>(()),
+            |event| {
+                if !mutated && matches!(event, SnapshotEvent::MainReadChunk(_)) {
+                    let mut writer = fs::OpenOptions::new().append(true).open(&main).unwrap();
+                    writer.write_all(b"growth").unwrap();
+                    writer.sync_all().unwrap();
+                    mutated = true;
+                }
+            },
+        );
+        assert!(mutated);
+        assert!(matches!(
+            result,
+            Err(LoadSourcesError::Snapshot(
+                SourceSnapshotError::Changed { .. }
+            ))
+        ));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
     fn missing_rules_directory_created_during_load_rejects_the_snapshot() {
         let directory = tempdir().unwrap();
         let main = directory.path().join("acl-proxy.toml");
@@ -570,7 +768,7 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn membership_change_before_final_inventory_rejects_the_snapshot() {
         let directory = tempdir().unwrap();
@@ -597,7 +795,125 @@ mod tests {
         ));
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn present_rules_directory_removed_after_final_inventory_is_rejected() {
+        let directory = tempdir().unwrap();
+        let main = directory.path().join("acl-proxy.toml");
+        let rules = directory.path().join("rules.d");
+        fs::write(&main, MAIN).unwrap();
+        fs::create_dir(&rules).unwrap();
+
+        let result = load_sources_with_observer(
+            &main,
+            |_, _| Ok::<_, ()>(()),
+            |event| {
+                if event == SnapshotEvent::FinalInventoryComplete {
+                    fs::remove_dir(&rules).unwrap();
+                }
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(LoadSourcesError::Snapshot(
+                SourceSnapshotError::Changed { .. }
+            ))
+        ));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn rules_directory_replacement_after_final_inventory_is_rejected() {
+        let directory = tempdir().unwrap();
+        let main = directory.path().join("acl-proxy.toml");
+        let rules = directory.path().join("rules.d");
+        let displaced = directory.path().join("rules.old");
+        fs::write(&main, MAIN).unwrap();
+        fs::create_dir(&rules).unwrap();
+
+        let result = load_sources_with_observer(
+            &main,
+            |_, _| Ok::<_, ()>(()),
+            |event| {
+                if event == SnapshotEvent::FinalInventoryComplete {
+                    fs::rename(&rules, &displaced).unwrap();
+                    fs::create_dir(&rules).unwrap();
+                }
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(LoadSourcesError::Snapshot(
+                SourceSnapshotError::Changed { .. }
+            ))
+        ));
+    }
+
     #[cfg(unix)]
+    #[test]
+    fn rules_directory_symlink_and_non_directory_leaf_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let main = directory.path().join("acl-proxy.toml");
+        let rules = directory.path().join("rules.d");
+        let target = directory.path().join("rules-target");
+        fs::write(&main, MAIN).unwrap();
+        fs::create_dir(&target).unwrap();
+
+        symlink(&target, &rules).unwrap();
+        assert!(matches!(
+            load_sources(&main, |_, _| Ok::<_, ()>(())),
+            Err(LoadSourcesError::Snapshot(
+                SourceSnapshotError::InvalidType { .. }
+            ))
+        ));
+        fs::remove_file(&rules).unwrap();
+        fs::write(&rules, b"not a directory").unwrap();
+        assert!(matches!(
+            load_sources(&main, |_, _| Ok::<_, ()>(())),
+            Err(LoadSourcesError::Snapshot(
+                SourceSnapshotError::InvalidType { .. }
+            ))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_directory_and_fragment_fail_without_disclosing_absolute_paths() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let directory = tempdir().unwrap();
+        let main = directory.path().join("acl-proxy.toml");
+        let rules = directory.path().join("rules.d");
+        let fragment = rules.join("10-policy.toml");
+        fs::write(&main, MAIN).unwrap();
+        fs::create_dir(&rules).unwrap();
+        fs::write(&fragment, FRAGMENT).unwrap();
+
+        fs::set_permissions(&rules, fs::Permissions::from_mode(0)).unwrap();
+        let directory_error = load_sources(&main, |_, _| Ok::<_, ()>(())).unwrap_err();
+        fs::set_permissions(&rules, fs::Permissions::from_mode(0o700)).unwrap();
+        let directory_text = match directory_error {
+            LoadSourcesError::Snapshot(error) => error.to_string(),
+            LoadSourcesError::Consumer(()) => panic!("consumer cannot fail"),
+        };
+        assert!(!directory_text.contains(directory.path().to_str().unwrap()));
+
+        fs::set_permissions(&fragment, fs::Permissions::from_mode(0)).unwrap();
+        let file_error = load_sources(&main, |_, _| Ok::<_, ()>(())).unwrap_err();
+        fs::set_permissions(&fragment, fs::Permissions::from_mode(0o600)).unwrap();
+        let file_text = match file_error {
+            LoadSourcesError::Snapshot(error) => error.to_string(),
+            LoadSourcesError::Consumer(()) => panic!("consumer cannot fail"),
+        };
+        assert!(!file_text.contains(directory.path().to_str().unwrap()));
+    }
+
+    #[cfg(any(unix, windows))]
     #[test]
     fn same_name_fragment_replacement_between_probe_and_open_is_rejected() {
         let directory = tempdir().unwrap();
@@ -629,6 +945,50 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn unix_socket_fragment_is_rejected_without_content_open() {
+        use std::os::unix::net::UnixListener;
+
+        let directory = tempdir().unwrap();
+        let main = directory.path().join("acl-proxy.toml");
+        let rules = directory.path().join("rules.d");
+        fs::write(&main, MAIN).unwrap();
+        fs::create_dir(&rules).unwrap();
+        let _listener = UnixListener::bind(rules.join("10-socket.toml")).unwrap();
+
+        assert!(matches!(
+            load_sources(&main, |_, _| Ok::<_, ()>(())),
+            Err(LoadSourcesError::Snapshot(
+                SourceSnapshotError::InvalidType { .. }
+            ))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regular_fragment_replaced_by_fifo_before_open_is_rejected_without_blocking() {
+        let directory = tempdir().unwrap();
+        let main = directory.path().join("acl-proxy.toml");
+        let rules = directory.path().join("rules.d");
+        let fragment = rules.join("10-policy.toml");
+        fs::write(&main, MAIN).unwrap();
+        fs::create_dir(&rules).unwrap();
+        fs::write(&fragment, FRAGMENT).unwrap();
+
+        let result = load_sources_with_observer(
+            &main,
+            |_, _| Ok::<_, ()>(()),
+            |event| {
+                if matches!(event, SnapshotEvent::FragmentProbed("10-policy.toml")) {
+                    fs::remove_file(&fragment).unwrap();
+                    create_fifo(&fragment);
+                }
+            },
+        );
+        assert!(matches!(result, Err(LoadSourcesError::Snapshot(_))));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
     fn in_place_fragment_mutation_between_read_chunks_is_rejected() {
         use std::io::{Seek, SeekFrom, Write};
 
@@ -657,6 +1017,44 @@ mod tests {
                 }
             },
         );
+        assert!(matches!(
+            result,
+            Err(LoadSourcesError::Snapshot(
+                SourceSnapshotError::Changed { .. }
+            ))
+        ));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn fragment_growth_between_read_chunks_is_rejected() {
+        use std::io::Write;
+
+        let directory = tempdir().unwrap();
+        let main = directory.path().join("acl-proxy.toml");
+        let rules = directory.path().join("rules.d");
+        let fragment = rules.join("10-first.toml");
+        fs::create_dir(&rules).unwrap();
+        fs::write(&main, MAIN).unwrap();
+        let mut content = FRAGMENT.as_bytes().to_vec();
+        content.resize(128 * 1024, b' ');
+        fs::write(&fragment, content).unwrap();
+        let mut mutated = false;
+
+        let result = load_sources_with_observer(
+            &main,
+            |_, _| Ok::<_, ()>(()),
+            |event| {
+                if !mutated && matches!(event, SnapshotEvent::FragmentReadChunk("10-first.toml", _))
+                {
+                    let mut writer = fs::OpenOptions::new().append(true).open(&fragment).unwrap();
+                    writer.write_all(b"growth").unwrap();
+                    writer.sync_all().unwrap();
+                    mutated = true;
+                }
+            },
+        );
+        assert!(mutated);
         assert!(matches!(
             result,
             Err(LoadSourcesError::Snapshot(
@@ -708,9 +1106,55 @@ mod tests {
         assert_eq!(sources[1].0, "rules.d/10-first.toml");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
-    fn fragment_file_and_aggregate_limits_are_exact() {
+    fn fragment_file_limit_is_exact() {
+        let directory = tempdir().unwrap();
+        let main = directory.path().join("acl-proxy.toml");
+        let rules = directory.path().join("rules.d");
+        fs::create_dir(&rules).unwrap();
+        fs::write(&main, MAIN).unwrap();
+
+        let mut exact = FRAGMENT.as_bytes().to_vec();
+        exact.resize(MAX_FRAGMENT_BYTES, b' ');
+        fs::write(rules.join("0.toml"), &exact).unwrap();
+        let summary = load_sources(&main, |_, _| Ok::<_, ()>(())).unwrap();
+        assert_eq!(summary.fragment_bytes, MAX_FRAGMENT_BYTES);
+
+        let mut too_large = exact;
+        too_large.push(b' ');
+        fs::write(rules.join("0.toml"), too_large).unwrap();
+        assert!(matches!(
+            load_sources(&main, |_, _| Ok::<_, ()>(())),
+            Err(LoadSourcesError::Snapshot(
+                SourceSnapshotError::TooLarge { .. }
+            ))
+        ));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn sparse_oversized_fragment_is_rejected_before_content_allocation() {
+        let directory = tempdir().unwrap();
+        let main = directory.path().join("acl-proxy.toml");
+        let rules = directory.path().join("rules.d");
+        let fragment = rules.join("0.toml");
+        fs::create_dir(&rules).unwrap();
+        fs::write(&main, MAIN).unwrap();
+        let file = fs::File::create(&fragment).unwrap();
+        file.set_len((MAX_FRAGMENT_BYTES + 1) as u64).unwrap();
+
+        assert!(matches!(
+            load_sources(&main, |_, _| Ok::<_, ()>(())),
+            Err(LoadSourcesError::Snapshot(
+                SourceSnapshotError::TooLarge { .. }
+            ))
+        ));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn fragment_aggregate_limit_is_exact_and_independent_of_file_limit() {
         let directory = tempdir().unwrap();
         let main = directory.path().join("acl-proxy.toml");
         let rules = directory.path().join("rules.d");
@@ -725,14 +1169,43 @@ mod tests {
         let summary = load_sources(&main, |_, _| Ok::<_, ()>(())).unwrap();
         assert_eq!(summary.fragment_bytes, MAX_FRAGMENT_AGGREGATE_BYTES);
 
-        let mut too_large = exact;
-        too_large.push(b' ');
-        fs::write(rules.join("4.toml"), too_large).unwrap();
+        fs::write(rules.join("5.toml"), b"x").unwrap();
         assert!(matches!(
             load_sources(&main, |_, _| Ok::<_, ()>(())),
             Err(LoadSourcesError::Snapshot(
-                SourceSnapshotError::TooLarge { .. }
+                SourceSnapshotError::AggregateTooLarge
             ))
         ));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn fragment_entry_count_limit_is_exact() {
+        let directory = tempdir().unwrap();
+        let main = directory.path().join("acl-proxy.toml");
+        let rules = directory.path().join("rules.d");
+        fs::create_dir(&rules).unwrap();
+        fs::write(&main, MAIN).unwrap();
+        for index in 0..MAX_FRAGMENT_ENTRIES {
+            fs::write(rules.join(format!("{index:04}.toml")), b"").unwrap();
+        }
+
+        let summary = load_sources(&main, |_, _| Ok::<_, ()>(())).unwrap();
+        assert_eq!(summary.fragment_count, MAX_FRAGMENT_ENTRIES);
+
+        fs::write(rules.join(format!("{MAX_FRAGMENT_ENTRIES:04}.toml")), b"").unwrap();
+        assert!(matches!(
+            load_sources(&main, |_, _| Ok::<_, ()>(())),
+            Err(LoadSourcesError::Snapshot(
+                SourceSnapshotError::TooManyEntries
+            ))
+        ));
+    }
+
+    #[cfg(unix)]
+    fn create_fifo(path: &Path) {
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
     }
 }

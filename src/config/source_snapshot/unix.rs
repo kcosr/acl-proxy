@@ -74,6 +74,9 @@ pub(super) fn read_directory(
     limit_plus_one: usize,
 ) -> io::Result<Vec<OsString>> {
     let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(limit_plus_one)
+        .map_err(io::Error::other)?;
     let mut reader = Dir::read_from(&directory.fd).map_err(errno)?;
     while let Some(entry) = reader.next() {
         let entry = entry.map_err(errno)?;

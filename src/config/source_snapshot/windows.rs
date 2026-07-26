@@ -140,8 +140,15 @@ pub(super) fn read_directory(
         return Ok(Vec::new());
     }
     let word_count = DIRECTORY_BUFFER_BYTES / size_of::<u64>();
-    let mut buffer = vec![0_u64; word_count];
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(word_count)
+        .map_err(io::Error::other)?;
+    buffer.resize(word_count, 0_u64);
     let mut names = Vec::new();
+    names
+        .try_reserve_exact(limit_plus_one)
+        .map_err(io::Error::other)?;
     let mut info_class = FileIdBothDirectoryRestartInfo;
 
     loop {
@@ -194,7 +201,11 @@ pub(super) fn read_directory(
                 return Err(invalid_directory_record());
             }
 
-            let mut wide_name = Vec::with_capacity(name_bytes / size_of::<u16>());
+            let name_units = name_bytes / size_of::<u16>();
+            let mut wide_name = Vec::new();
+            wide_name
+                .try_reserve_exact(name_units)
+                .map_err(io::Error::other)?;
             for byte_offset in (name_offset..name_end).step_by(size_of::<u16>()) {
                 wide_name.push(unsafe {
                     ptr::read_unaligned(buffer.as_ptr().cast::<u8>().add(byte_offset).cast::<u16>())
@@ -231,7 +242,10 @@ pub(super) fn read_file_limited(
     mut on_chunk: impl FnMut(usize),
 ) -> io::Result<Vec<u8>> {
     let capacity = limit_plus_one.min(READ_BUFFER_BYTES);
-    let mut output = Vec::with_capacity(capacity);
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(capacity)
+        .map_err(io::Error::other)?;
     let mut buffer = [0_u8; READ_BUFFER_BYTES];
 
     while output.len() < limit_plus_one {
@@ -241,6 +255,7 @@ pub(super) fn read_file_limited(
         if read == 0 {
             break;
         }
+        output.try_reserve(read).map_err(io::Error::other)?;
         output.extend_from_slice(&buffer[..read]);
         on_chunk(read);
     }
