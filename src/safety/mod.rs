@@ -337,7 +337,7 @@ mod tests {
     fn compiler_terminal_cursor_survives_final_delegate_resume() {
         let compiled = compile_config_text(ConfigTextInput {
             text: r#"
-schema_version = 3
+schema_version = 4
 
 [listeners.explicit_http]
 endpoint.kind = "tcp"

@@ -7,7 +7,7 @@ use tempfile::TempDir;
 
 fn policy_config(pattern: &str) -> String {
     format!(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [listeners.explicit_http]
 endpoint.kind = "tcp"
@@ -63,7 +63,8 @@ fn shared_patterns_cross_the_strict_config_compiler_boundary() {
             );
             let stderr = String::from_utf8_lossy(&validation.stderr);
             assert!(
-                stderr.contains("policy.rules[0].urls[0]"),
+                stderr.contains("main rule 0.urls[0]")
+                    && stderr.contains("[rule_id=\"url-contract\"]"),
                 "{}: compiler did not locate the invalid pattern: {stderr}",
                 case.id
             );

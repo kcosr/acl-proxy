@@ -445,6 +445,7 @@ const fn map_contract_error(_error: ContractError) -> ProductAclCompileError {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::net::IpAddr;
     use std::str::FromStr;
     use std::time::{Duration, Instant};
@@ -468,9 +469,11 @@ mod tests {
     };
     use http_access_url::{canonicalize_http_url, CompiledUrlPattern};
     use ipnet::IpNet;
+    use tempfile::tempdir;
 
     use super::*;
     use crate::config::compiler::HttpBodyReadLimits;
+    use crate::config::load_and_compile_exact_config;
 
     struct RequestFixture {
         facts: InterceptedRequestFacts,
@@ -1057,6 +1060,119 @@ mod tests {
             ),
             Ok(PolicyEvaluation::Deny { provenance })
                 if provenance.effective_policy() == &EffectivePolicy::Default
+        ));
+    }
+
+    #[test]
+    fn delegated_pass_resumes_across_fragment_boundaries_and_into_main() {
+        let directory = tempdir().unwrap();
+        let main_path = directory.path().join("acl-proxy.toml");
+        let rules_path = directory.path().join("rules.d");
+        fs::create_dir(&rules_path).unwrap();
+        fs::write(
+            &main_path,
+            r#"schema_version = 4
+
+[listeners.explicit_http]
+endpoint.kind = "tcp"
+endpoint.address = "127.0.0.1:8881"
+http_versions = ["http1"]
+
+[listeners.explicit_http.connect]
+http1 = "deny"
+
+[authorization.providers.first]
+kind = "process"
+command = "/bin/first"
+
+[authorization.providers.second]
+kind = "process"
+command = "/bin/second"
+
+[[policy.rules]]
+id = "main-allow"
+decision = "allow"
+urls = ["https://example.test/**"]
+
+[policy]
+default = "deny"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            rules_path.join("00-first.toml"),
+            r#"schema_version = 4
+[[rules]]
+id = "first-delegate"
+decision = "delegate"
+urls = ["https://example.test/**"]
+authorization_provider = "first"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            rules_path.join("10-second.toml"),
+            r#"schema_version = 4
+[[rules]]
+id = "second-delegate"
+decision = "delegate"
+urls = ["https://example.test/**"]
+authorization_provider = "second"
+"#,
+        )
+        .unwrap();
+
+        let compiled = load_and_compile_exact_config(&main_path).unwrap().compiled;
+        assert_eq!(
+            compiled
+                .reloadable_plan
+                .policy
+                .rules
+                .iter()
+                .map(|rule| rule.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first-delegate", "second-delegate", "main-allow"]
+        );
+        let snapshot = ProductAclSnapshot::compile(
+            &compiled.reloadable_plan.policy,
+            PolicyGeneration::new(90).unwrap(),
+            SnapshotIdentity::new(),
+            &[],
+        )
+        .unwrap();
+        let request = RequestFixture::new("GET", "https://example.test/resource", &[], &[], &[]);
+        let input = request.input("192.0.2.1", 1);
+
+        let first = delegated(snapshot.snapshot().evaluate(&input).unwrap());
+        assert_eq!(
+            snapshot.delegated_action(&first).unwrap().id().as_str(),
+            "first"
+        );
+        let second = delegated(
+            snapshot
+                .snapshot()
+                .resolve_delegate(first, ProviderDisposition::Pass, &input)
+                .unwrap(),
+        );
+        assert_eq!(
+            snapshot.delegated_action(&second).unwrap().id().as_str(),
+            "second"
+        );
+        let passed = snapshot
+            .snapshot()
+            .resolve_delegate(second, ProviderDisposition::Pass, &input)
+            .unwrap();
+        let PolicyEvaluation::Allow {
+            provenance,
+            effects: MatchedEffects::Rule(effects),
+        } = passed
+        else {
+            panic!("second pass did not reach the main-file allow")
+        };
+        assert_eq!(effects.ordinal(), 2);
+        assert!(matches!(
+            provenance.effective_policy(),
+            EffectivePolicy::Rule { ordinal: 2, .. }
         ));
     }
 

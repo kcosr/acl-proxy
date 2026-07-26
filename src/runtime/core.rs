@@ -6,7 +6,9 @@ use arc_swap::ArcSwapOption;
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 
-use crate::config::{CompiledConfig, StaticFingerprint, StaticProductConfig};
+use crate::config::{
+    PolicySourceSummary, RuntimeCandidate, StaticFingerprint, StaticProductConfig,
+};
 
 use super::activation::{
     ActivationCancellation, BoxFuture, CandidateActivator, CandidateSource, RuntimeError,
@@ -94,13 +96,19 @@ impl StaticOwnership {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ReloadTriggerResult {
     Coalesced,
     Completed {
         attempts: usize,
         generation: GenerationId,
+        policy_source_summary: PolicySourceSummary,
     },
+}
+
+struct PublishedCandidate {
+    generation: GenerationId,
+    policy_source_summary: PolicySourceSummary,
 }
 
 pub(crate) struct Runtime {
@@ -305,6 +313,13 @@ impl Runtime {
     }
 
     #[cfg(test)]
+    pub(crate) fn active_policy_source_summary(&self) -> Option<PolicySourceSummary> {
+        self.active
+            .load_full()
+            .map(|generation| generation.policy_source_summary().clone())
+    }
+
+    #[cfg(test)]
     pub(crate) fn retiring_generations(&self) -> usize {
         self.retiring_count.load(Ordering::Acquire)
     }
@@ -368,7 +383,7 @@ impl Runtime {
 
     pub(crate) async fn start(
         self: &Arc<Self>,
-        initial: CompiledConfig,
+        initial: RuntimeCandidate,
     ) -> Result<GenerationId, RuntimeError> {
         let runtime = self.clone();
         tokio::spawn(async move { runtime.start_owned(initial).await })
@@ -378,7 +393,7 @@ impl Runtime {
 
     async fn start_owned(
         self: &Arc<Self>,
-        initial: CompiledConfig,
+        initial: RuntimeCandidate,
     ) -> Result<GenerationId, RuntimeError> {
         let _activation = self.activation.lock().await;
         match self.lifecycle() {
@@ -399,8 +414,15 @@ impl Runtime {
             .await;
         self.clear_cancellation(&cancellation);
         let activated = activated?;
-        self.publish(id, activated, LifecycleState::Starting, &cancellation)
-            .await
+        self.publish(
+            id,
+            initial.policy_source_summary,
+            activated,
+            LifecycleState::Starting,
+            &cancellation,
+        )
+        .await
+        .map(|published| published.generation)
     }
 
     pub(crate) async fn trigger_reload(
@@ -465,15 +487,16 @@ impl Runtime {
         }
 
         match last_result.unwrap_or(Err(RuntimeError::ShuttingDown)) {
-            Ok(generation) => Ok(ReloadTriggerResult::Completed {
+            Ok(published) => Ok(ReloadTriggerResult::Completed {
                 attempts,
-                generation,
+                generation: published.generation,
+                policy_source_summary: published.policy_source_summary,
             }),
             Err(error) => Err(error),
         }
     }
 
-    async fn reload_once(self: &Arc<Self>) -> Result<GenerationId, RuntimeError> {
+    async fn reload_once(self: &Arc<Self>) -> Result<PublishedCandidate, RuntimeError> {
         self.check_retiring_ceiling()?;
         let cancellation = self.register_cancellation();
         let compiled = self.source.load_latest(cancellation.clone()).await;
@@ -487,9 +510,9 @@ impl Runtime {
 
     async fn activate_compiled(
         self: &Arc<Self>,
-        compiled: CompiledConfig,
+        compiled: RuntimeCandidate,
         cancellation: &ActivationCancellation,
-    ) -> Result<GenerationId, RuntimeError> {
+    ) -> Result<PublishedCandidate, RuntimeError> {
         cancellation.check()?;
         self.validate_compiled_static(&compiled)?;
         let id = self.allocate_generation_id();
@@ -497,11 +520,17 @@ impl Runtime {
             .activator
             .activate(id, compiled.reloadable_plan, cancellation.clone())
             .await?;
-        self.publish(id, activated, LifecycleState::Running, cancellation)
-            .await
+        self.publish(
+            id,
+            compiled.policy_source_summary,
+            activated,
+            LifecycleState::Running,
+            cancellation,
+        )
+        .await
     }
 
-    fn validate_compiled_static(&self, compiled: &CompiledConfig) -> Result<(), RuntimeError> {
+    fn validate_compiled_static(&self, compiled: &RuntimeCandidate) -> Result<(), RuntimeError> {
         let canonical = StaticFingerprint::from_config(&compiled.static_config)
             .map_err(|_| RuntimeError::StaticFingerprintDerivationFailed)?;
         if canonical != compiled.static_fingerprint || canonical != self.static_fingerprint {
@@ -513,11 +542,16 @@ impl Runtime {
     async fn publish(
         self: &Arc<Self>,
         id: GenerationId,
+        policy_source_summary: PolicySourceSummary,
         activated: ActivatedGeneration,
         expected: LifecycleState,
         cancellation: &ActivationCancellation,
-    ) -> Result<GenerationId, RuntimeError> {
-        let generation = Arc::new(Generation::from_activated(id, activated));
+    ) -> Result<PublishedCandidate, RuntimeError> {
+        let generation = Arc::new(Generation::from_activated_with_source_summary(
+            id,
+            policy_source_summary,
+            activated,
+        ));
         let retirement = match self.publish_sync(&generation, expected, cancellation) {
             Ok(retirement) => retirement,
             Err(error) => {
@@ -531,7 +565,24 @@ impl Runtime {
         if let Some(retirement) = retirement {
             self.schedule_retirement(retirement).await;
         }
-        Ok(id)
+        if expected == LifecycleState::Running {
+            let summary = generation.policy_source_summary();
+            tracing::info!(
+                target: "acl_proxy::reload",
+                generation = id.get(),
+                rules_directory = summary.rules_directory_state(),
+                fragment_count = summary.fragment_count,
+                fragment_bytes = summary.fragment_bytes,
+                fragment_rule_count = summary.fragment_rule_count,
+                main_rule_count = summary.main_rule_count,
+                total_rule_count = summary.total_rule_count,
+                "configuration reload generation published"
+            );
+        }
+        Ok(PublishedCandidate {
+            generation: id,
+            policy_source_summary: generation.policy_source_summary().clone(),
+        })
     }
 
     fn publish_sync(

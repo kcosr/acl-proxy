@@ -73,7 +73,7 @@ fn sanitized_production_role_structure_matches_difference_record() {
         let config = parse_fixture(name);
         assert_eq!(
             config.get("schema_version").and_then(TomlValue::as_integer),
-            Some(3)
+            Some(4)
         );
         assert!(
             config.get("proxy").is_none(),
@@ -121,7 +121,7 @@ fn sanitized_production_role_structure_matches_difference_record() {
             .map(|rule| {
                 rule.get("id")
                     .and_then(TomlValue::as_str)
-                    .expect("every v3 production rule must have an ID")
+                    .expect("every v4 production rule must have an ID")
             })
             .collect();
         assert_eq!(ids.len(), rule_count, "{name} rule IDs must be unique");
@@ -312,7 +312,7 @@ fn sanitized_production_role_structure_matches_difference_record() {
 }
 
 #[test]
-fn sanitized_v1_fixtures_are_structurally_incompatible_with_v3() {
+fn sanitized_v1_fixtures_are_structurally_incompatible_with_v4() {
     for name in [
         "v1-host-shape.toml",
         "v1-common-container-shape.toml",
@@ -340,7 +340,7 @@ fn sanitized_v1_fixtures_are_structurally_incompatible_with_v3() {
 }
 
 #[test]
-fn legacy_single_star_host_rules_receive_explicit_v3_intent() {
+fn legacy_single_star_host_rules_receive_explicit_v4_intent() {
     let host = parse_fixture("host-proxy-tcp.toml");
     let internal = parse_fixture("internal-container-proxy.toml");
     let patterns: BTreeSet<_> = rules(&host)

@@ -335,6 +335,10 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/../../tests/fixtures/production/access-flow-relay.json"
     );
+    const SHIPPED_EXAMPLE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/access-flow-relay.json"
+    );
     const CONFORMANCE_VARIABLE: &str = "AW_ACCESS_FLOW_CONFORMANCE_VECTOR";
     const CONFORMANCE_BEARER: &str = "abcdefghijklmnopqrstuvwxyzABCDEF";
     const PRODUCT_HTTP_PATH: &str = "/run/acl-proxy/transparent-http.sock";
@@ -433,6 +437,25 @@ mod tests {
         let error = normalized_product_transport(&unknown).unwrap_err();
         assert_eq!(error, "unrecognized product Access Flow transport");
         assert!(!error.contains(unknown.path().as_str()));
+    }
+
+    #[test]
+    fn shipped_example_is_the_validated_production_relay_contract() {
+        let shipped_bytes = std::fs::read(SHIPPED_EXAMPLE).unwrap();
+        let production_bytes = std::fs::read(PRODUCTION_FIXTURE).unwrap();
+        assert_eq!(
+            shipped_bytes, production_bytes,
+            "the shipped relay example and production fixture drifted"
+        );
+
+        let validated = Config::load(Path::new(SHIPPED_EXAMPLE))
+            .unwrap()
+            .validate_with_socket_probe(no_socket_probe)
+            .unwrap();
+        let actual = project_relay_plan(&validated.plan, validated.drain_timeout, |endpoint| {
+            normalized_product_transport(endpoint).unwrap()
+        });
+        assert_eq!(actual, *load_adapter_parity_fixture().unwrap().relay_plan());
     }
 
     #[tokio::test]

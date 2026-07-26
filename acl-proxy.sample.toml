@@ -1,7 +1,7 @@
-# Strict schema-v3 sample. Unknown or obsolete fields are rejected.
+# Strict schema-v4 sample. Unknown or obsolete fields are rejected.
 # This active configuration is loopback-only and deny-by-default.
 
-schema_version = 3
+schema_version = 4
 
 [service]
 request_timeout = "30s"
@@ -48,6 +48,16 @@ http_versions = ["http1", "http2"]
 [policy]
 default = "deny"
 
+# This file also authorizes its implicit sibling rules.d directory. Each direct
+# fragment is a strict schema-4 document containing only one or more
+# [[rules]] entries. Fragments run first in ASCII filename order. They have
+# equal policy authority to this main rule list. Keep both main and rules.d under
+# one trusted serialized writer; stage outside rules.d, atomically rename
+# complete fragments into place, then trigger one reload.
+# Use fixed-width names such as 00-base.toml and 10-team.toml; raw ASCII order
+# is normative. Deploy or roll back the binary, main file, and complete rules.d
+# directory together as one coordinated transaction.
+#
 # Add narrowly scoped rules after reviewing canonical URL, method, client, and
 # header intent. An empty urls list means every canonical HTTP/HTTPS URL.
 #

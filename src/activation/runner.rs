@@ -5,7 +5,7 @@ use http_access_runtime::{
     OriginalDestinationProvider, StandaloneRequestFactory,
 };
 
-use crate::config::{CompiledConfig, LoadedCompiledConfig};
+use crate::config::LoadedCompiledConfig;
 use crate::observation::ProductObservationRuntime;
 use crate::runtime::{GenerationId, Runtime, RuntimeError, StaticOwnership, StaticResources};
 
@@ -27,7 +27,12 @@ pub(crate) struct ProductRuntime {
     runtime: Arc<Runtime>,
     static_resources: Arc<ProductStaticResources>,
     observation_runtime: Arc<ProductObservationRuntime>,
-    initial: Mutex<Option<CompiledConfig>>,
+    initial: Mutex<Option<crate::config::RuntimeCandidate>>,
+}
+
+pub(crate) struct InitialActivationResult {
+    pub(crate) generation: GenerationId,
+    pub(crate) policy_source_summary: crate::config::PolicySourceSummary,
 }
 
 struct ProductListenerFailureObserver {
@@ -178,11 +183,12 @@ impl ProductRuntime {
         );
         let runtime = Runtime::new(static_ownership, source, activator).await?;
 
+        let initial = compiled.into_runtime_candidate();
         Ok(Arc::new(Self {
             runtime,
             static_resources,
             observation_runtime,
-            initial: Mutex::new(Some(compiled)),
+            initial: Mutex::new(Some(initial)),
         }))
     }
 
@@ -386,19 +392,25 @@ impl ProductRuntime {
         self.static_resources.wait_for_control_failure().await
     }
 
-    pub(crate) async fn activate_initial(&self) -> Result<GenerationId, ProductRuntimeError> {
+    pub(crate) async fn activate_initial(
+        &self,
+    ) -> Result<InitialActivationResult, ProductRuntimeError> {
         let initial = self
             .initial
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
             .ok_or(ProductRuntimeError::InitialActivationAlreadyAttempted)?;
+        let policy_source_summary = initial.policy_source_summary.clone();
         let runtime = self.runtime.clone();
         let activation_runtime = runtime.clone();
 
         let activation = tokio::spawn(async move {
             match activation_runtime.start(initial).await {
-                Ok(generation) => Ok(generation),
+                Ok(generation) => Ok(InitialActivationResult {
+                    generation,
+                    policy_source_summary,
+                }),
                 Err(error) => {
                     activation_runtime.shutdown().await;
                     Err(error)
@@ -470,7 +482,7 @@ mod tests {
 
     fn config(explicit_http: SocketAddr, control: SocketAddr, extra: &str) -> String {
         format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 shutdown_drain_timeout = "1s"
@@ -505,6 +517,28 @@ default = "deny"
         fs::write(&path, text).unwrap();
         let loaded = load_and_compile_exact_config(&path).unwrap();
         (directory, loaded)
+    }
+
+    #[tokio::test]
+    async fn initial_activation_returns_the_published_source_summary() {
+        let test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let reservations = super::super::reserve_listeners::<2>(&test);
+        let addresses = reservations.addresses();
+        let (_directory, loaded) = loaded(&config(addresses[0], addresses[1], ""));
+        let expected = loaded.compiled.policy_source_summary.clone();
+        let product = ProductRuntime::prepare_from_prebound(loaded, reservations.into_listeners())
+            .await
+            .unwrap();
+
+        let activated = product.activate_initial().await.unwrap();
+
+        assert_eq!(activated.generation.get(), 1);
+        assert_eq!(activated.policy_source_summary, expected);
+        assert_eq!(
+            product.runtime().active_policy_source_summary(),
+            Some(expected)
+        );
+        product.shutdown().await;
     }
 
     async fn read_http_message(stream: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
@@ -1066,7 +1100,7 @@ urls = ["http://{origin_address}/capture-failure"]
             NormalizedListenerMode::Transparent => ("transparent_http", ""),
         };
         let text = format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -1281,7 +1315,7 @@ value = "policy"
         const VARIABLE: &str = "AW_PRODUCT_PARITY_IDENTITY_TOKEN";
         const BEARER: &str = "product-parity-identity-bearer-000000000000";
         let text = format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -1491,7 +1525,7 @@ for line in sys.stdin:
         const VARIABLE: &str = "AW_PROCESS_SATURATION_IDENTITY_TOKEN";
         const BEARER: &str = "process-saturation-identity-bearer-000000000";
         let text = format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -1709,7 +1743,7 @@ methods = ["GET"]
         const VARIABLE: &str = "AW_CONNECTION_SATURATION_IDENTITY_TOKEN";
         const BEARER: &str = "connection-saturation-identity-bearer-000000";
         let text = format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -1901,7 +1935,7 @@ default = "allow"
         const PARENT_VARIABLE: &str = "AW_PARENT_PRODUCT_IDENTITY_TOKEN";
         const PARENT_BEARER: &str = "parent-product-identity-bearer-0000000000000";
         let text = format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -2127,7 +2161,7 @@ default = "allow"
             .unwrap();
         let origin_address = origin.local_addr().unwrap();
         let text = format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -2238,7 +2272,7 @@ header = "x-test-loop"
             .unwrap();
         let origin_address = origin.local_addr().unwrap();
         let text = format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -2349,7 +2383,7 @@ methods = ["GET"]
             .unwrap();
         let origin_address = origin.local_addr().unwrap();
         let text = format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -2488,7 +2522,7 @@ methods = ["GET"]
             .unwrap();
         let origin_address = origin.local_addr().unwrap();
         let text = format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -2639,7 +2673,7 @@ allow_upgrades = true
         let origin_acceptor =
             TlsAcceptor::from(Arc::new(origin_identity.server_config(&[b"http/1.1"])));
         let text = format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -3302,6 +3336,7 @@ private_key = "missing-server-key.pem"
         include!("runner_parent_proxy_tests.rs");
     }
 
+    #[cfg(unix)]
     mod connect_mitm_tests {
         include!("runner_connect_mitm_tests.rs");
     }
@@ -3322,6 +3357,7 @@ private_key = "missing-server-key.pem"
         include!("runner_listener_lifecycle_tests.rs");
     }
 
+    #[cfg(unix)]
     mod identity_product_tests {
         include!("runner_identity_product_tests.rs");
     }

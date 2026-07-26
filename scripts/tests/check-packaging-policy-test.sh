@@ -71,6 +71,8 @@ mkdir -p "$BASELINE/scripts"
 mkdir -p "$BASELINE/crates/access-flow-relay"
 mkdir -p "$BASELINE/src/bin"
 mkdir -p "$BASELINE/crates/access-flow-relay/src"
+mkdir -p "$BASELINE/docs/implementation/global-egress-header-actions"
+mkdir -p "$BASELINE/docs/implementation/egress-destination-forwarding"
 reset_runtime_fixture
 for file in Cargo.toml Cargo.lock README.md acl-proxy.sample.toml deny.toml PROVENANCE.md THIRD_PARTY_NOTICES; do
     cp "$ROOT/$file" "$BASELINE/$file"
@@ -78,6 +80,13 @@ done
 cp "$ROOT/crates/access-flow-relay/Cargo.toml" "$BASELINE/crates/access-flow-relay/"
 cp "$ROOT/scripts/check-packaging-policy.sh" "$BASELINE/scripts/"
 cp "$ROOT/scripts/release.mjs" "$BASELINE/scripts/"
+for historical_doc in \
+    docs/implementation/global-egress-header-actions/schema-proposal.md \
+    docs/implementation/global-egress-header-actions/phase-task-plan.md \
+    docs/implementation/egress-destination-forwarding/schema-proposal.md \
+    docs/implementation/egress-destination-forwarding/phase-task-plan.md; do
+    cp "$ROOT/$historical_doc" "$BASELINE/$historical_doc"
+done
 printf '%s\n' '// metadata-only fixture' >"$BASELINE/src/lib.rs"
 printf '%s\n' 'fn main() {}' >"$BASELINE/src/bin/extract-capture-body.rs"
 printf '%s\n' '// metadata-only fixture' >"$BASELINE/crates/access-flow-relay/src/lib.rs"
@@ -786,6 +795,53 @@ for file in README.md acl-proxy.sample.toml; do
 done
 expect_rejected archive-bin '  bin/acl-proxy-extract-capture-body' '  acl-proxy-extract-capture-body' README.md
 expect_rejected archive-relay-bin '  bin/acl-proxy-access-flow-relay  # Linux archives only' '  acl-proxy-access-flow-relay' README.md
+expect_rejected sample-schema 'schema_version = 4' 'schema_version = 3' acl-proxy.sample.toml
+expect_rejected sample-schema-type 'schema_version = 4' 'schema_version = 4.0' acl-proxy.sample.toml
+rules_directory_guidance=(
+    'implicit sibling rules.d'
+    'equal policy authority'
+    'stage outside rules.d'
+    'atomically rename'
+    'fixed-width names'
+    'raw ASCII order'
+    'binary, main file, and complete rules.d'
+)
+for index in "${!rules_directory_guidance[@]}"; do
+    marker=${rules_directory_guidance[$index]}
+    expect_rejected \
+        "sample-rules-directory-guidance-$index" \
+        "$marker" \
+        "removed-rules-directory-guidance-$index" \
+        acl-proxy.sample.toml
+done
+readme_migration_guidance=(
+    'Treat the binary and its complete configuration directory as one deployment'
+    'fixed-width ordering prefixes'
+    'Raw ASCII filename order remains the normative ordering rule'
+    'Deploy the new binary, main file, and complete `rules.d` set together'
+    'Rollback must likewise restore the prior binary, main file, and complete'
+)
+for index in "${!readme_migration_guidance[@]}"; do
+    marker=${readme_migration_guidance[$index]}
+    expect_rejected \
+        "readme-schema-v4-migration-guidance-$index" \
+        "$marker" \
+        "removed-schema-v4-migration-guidance-$index" \
+        README.md
+done
+historical_pre_v4_docs=(
+    docs/implementation/global-egress-header-actions/schema-proposal.md
+    docs/implementation/global-egress-header-actions/phase-task-plan.md
+    docs/implementation/egress-destination-forwarding/schema-proposal.md
+    docs/implementation/egress-destination-forwarding/phase-task-plan.md
+)
+for index in "${!historical_pre_v4_docs[@]}"; do
+    expect_rejected \
+        "historical-pre-v4-notice-$index" \
+        'Historical pre-schema-4 implementation record.' \
+        'Removed historical implementation warning.' \
+        "${historical_pre_v4_docs[$index]}"
+done
 expect_rejected sample-export 'acl-proxy export-ca' 'ca-cert.pem' acl-proxy.sample.toml
 
 printf 'packaging policy mutation suite passed\n'

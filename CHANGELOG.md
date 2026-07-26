@@ -16,9 +16,9 @@
   `allowedDestinationPorts` and a nested Unix `transport`; the removed
   `allowedOriginalPorts` and `upstreamSocket` fields are rejected without a
   dual parser. The Linux artifact is now `acl-proxy-access-flow-relay`.
-- Replaced the unreleased schema-2 draft with the strict integer
-  `schema_version = 3` contract. Missing, string, schema-1, schema-2, and future
-  versions are rejected without migration aliases or fallback parsing.
+- Replaced the unreleased schema-3 contract with strict integer
+  `schema_version = 4`. Missing, string, schema-1, schema-2, schema-3, and
+  future versions are rejected without migration aliases or fallback parsing.
 - Replaced the obsolete flat proxy, plugin, external-authorization, capture,
   logging, certificate, and loop-protection shapes with explicit `service`,
   `control`, `listeners`, `mitm`, `egress`, `policy`, `authorization`,
@@ -34,6 +34,11 @@
 
 ### Added
 
+- Added schema-v4 implicit sibling `rules.d` policy fragments with secure
+  bounded snapshot loading, deterministic fragment-before-main composition,
+  global rule validation, source-aware diagnostics and policy dumps, and
+  atomic generation-preserving reload behavior
+  ([#4](https://github.com/kcosr/acl-proxy-access-runtime/pull/4)).
 - Added host-owned transparent HTTP/HTTPS Unix listeners and the Linux-only
   `acl-proxy-access-flow-relay` adapter over the shared Access Flow engine,
   including strict AWAF framing, bounded relay resources, fail-closed pre-existing path refusal,

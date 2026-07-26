@@ -6,8 +6,8 @@ ordered allow/deny/delegate policy, process and webhook authorization
 providers, typed credentials, bounded body handling, and generation-safe
 reloads.
 
-The only accepted configuration contract is integer `schema_version = 3`.
-Older schemas and mixed v2/v3 shapes are rejected; there is no compatibility
+The only accepted configuration contract is integer `schema_version = 4`.
+Every older schema and mixed shape is rejected; there is no compatibility
 parser or migration mode.
 
 ## Install
@@ -39,11 +39,33 @@ directory is the archive root. The current Linux archive has the three shown
 `bin/` entries; the planned macOS archive would omit the Linux-only relay and
 have the other two.
 
-The `0.3.0-rc.1` candidate requires `schema_version = 3`; configurations for
-the `0.2.x` contract must be rewritten rather than migrated through aliases or
-fallback parsing. This local candidate is validated for build and runtime on
-Linux x86_64 and for compilation on Linux aarch64. macOS arm64 and Windows MSVC
-x86_64 have not been validated because suitable hosts are unavailable.
+The `0.3.0-rc.1` candidate requires `schema_version = 4`; configurations for
+schema 3 and every earlier contract must be rewritten rather than migrated
+through aliases or fallback parsing. This local candidate is validated for
+build and runtime on Linux x86_64 and for compilation on Linux aarch64. macOS
+arm64 and Windows MSVC x86_64 have not been validated because suitable hosts
+are unavailable.
+
+### Schema 4 Migration
+
+Treat the binary and its complete configuration directory as one deployment
+transaction:
+
+1. Stage the new binary and a separate complete configuration directory.
+2. Inventory the staged main file's implicit sibling `rules.d`. Remove
+   unrelated content and convert the main file and every intended fragment to
+   strict integer `schema_version = 4`.
+3. Give fragments fixed-width ordering prefixes such as `00-`, `10-`, and
+   `20-`. Raw ASCII filename order remains the normative ordering rule.
+4. Run `config validate`, table `policy dump`, and JSON `policy dump` against
+   the staged main path. Review the complete fragment-before-main order and
+   source provenance.
+5. Deploy the new binary, main file, and complete `rules.d` set together, then
+   start or reload only after the complete set is in place.
+
+Rollback must likewise restore the prior binary, main file, and complete
+`rules.d` directory together. Do not run a schema-v4-only binary against a
+partial directory transaction or pair an older binary with v4 configuration.
 
 ```bash
 cargo build --release --locked
@@ -86,7 +108,7 @@ curl --proxy http://127.0.0.1:8881 http://example.test/resource
 
 ## Architecture
 
-This repository owns the product shell: strict schema-3 compilation, listener
+This repository owns the product shell: strict schema-4 compilation, listener
 binding and OS integration, authorization/provider and credential-I/O adapters,
 capture/logging sinks, reload and signal policy, CLI, samples, and packaging.
 The sibling `access-runtime` repository owns canonical URLs, ACL/redaction and
@@ -108,7 +130,7 @@ directory containing the selected configuration file.
 ### Service And Control
 
 ```toml
-schema_version = 3
+schema_version = 4
 
 [service]
 request_timeout = "30s"
@@ -434,6 +456,105 @@ URL patterns are component aware:
 Upgrades are denied unless every matched allow/delegate cursor explicitly sets
 `allow_upgrades = true`. The default allow decision never authorizes an
 upgrade.
+
+#### Policy Fragments (`rules.d`)
+
+For a selected main file such as `/etc/acl-proxy/acl-proxy.toml`, ACL Proxy
+implicitly discovers only the sibling `/etc/acl-proxy/rules.d` directory.
+Missing or empty `rules.d` means there are no fragment rules. A fragment is a
+strict schema-4 TOML document containing only the required version and one or
+more rules:
+
+The directory belongs to the parent, not to the main filename. Two selected
+main files in the same parent therefore consume the same `rules.d` authority.
+Before upgrading or selecting any main file, inventory that file's sibling
+directory and reject unrelated content. Validate the staged authority through
+the production facade in all three sanctioned views:
+
+```bash
+acl-proxy config validate --config /etc/acl-proxy/acl-proxy.toml
+acl-proxy policy dump --format table --config /etc/acl-proxy/acl-proxy.toml
+acl-proxy policy dump --format json --config /etc/acl-proxy/acl-proxy.toml
+```
+
+```toml
+schema_version = 4
+
+[[rules]]
+id = "workstation-read"
+decision = "allow"
+urls = ["https://api.example.test/**"]
+methods = ["GET"]
+```
+
+Fragment `[[rules]]` use the same rule shape as main-file
+`[[policy.rules]]`. Product configuration, a fragment default, unknown fields,
+and empty rule lists are rejected.
+
+Eligible fragment names are at most 255 ASCII bytes and match
+`[A-Za-z0-9][A-Za-z0-9._-]*\.toml`. Windows reserved device basenames and
+names that collide under ASCII case folding are rejected on every platform.
+Every directory entry must be an eligible direct, single-link regular file;
+symlinks, Windows reparse points, hard links, nested directories, special
+files, and unrelated temporary files reject the complete candidate.
+Use fixed-width prefixes such as `00-`, `10-`, and `20-` so intended insertion
+points remain obvious. This is authoring guidance; raw ASCII filename order is
+the normative composition rule.
+
+The hard source bounds are:
+
+| Resource | Limit |
+| --- | ---: |
+| Direct `rules.d` entries and fragment files | 1,024 |
+| Bytes per fragment | 2 MiB |
+| Aggregate fragment bytes | 10 MiB |
+| Main configuration bytes | 10 MiB |
+| Composed policy rules | 100,000 |
+| Aggregate identity subjects | 4,096 |
+
+ACL Proxy composes one global first-match policy: fragment files in ascending
+ASCII filename order, rules within each fragment in authored order, then
+main-file rules in authored order, followed by the main-file default. Rule IDs
+and all references and compiler limits are global. A delegated `pass` advances
+to the next rule in this global order.
+
+Write access to `rules.d` grants policy authority equal to write access to the
+main rule list. A writer can prepend an allow, invoke any provider, credential,
+or redaction effect available from the main configuration, remove fragment
+denies, or make the next reload fail. There is no protected mandatory-rule
+tier. The main file, its parent and redirect-capable ancestors, and `rules.d`
+must therefore be writable only by principals granted full policy authority;
+group- or world-writable policy paths are a deployment security error.
+
+Use one trusted writer for the main file, fragments, and reload trigger. Stage
+temporary files outside `rules.d`, atomically rename completed files into
+place, request one reload only after the complete set is stable, and retain
+writer serialization until reload completes. Any file, membership, mutation,
+parse, reference, bounds, or activation failure preserves the complete prior
+generation.
+
+During a schema cutover or rollback, deploy the binary, main file, and complete
+`rules.d` directory as one coordinated transaction. Mixing an old binary with
+v4 authoring or publishing only part of the v4 directory is unsupported.
+
+These permission and publication rules are operator controls, not checks
+performed by ACL Proxy. ACL Proxy does not validate owner, group, or mode; lock
+writers; or make hostile same-UID multi-file mutation transactional. Apply the
+same permission boundary to every redirect-capable symlink target and ancestor
+used to reach the selected main file.
+
+`config validate`, `policy dump`, startup, CA export, and reload all use the
+same composition facade. Diagnostics identify `main` or
+`rules.d/<filename>` plus the source-local rule index. Table dumps add
+`RULE_ID` and `SOURCE`; JSON rules contain a tagged `source` object. Absolute
+host paths are omitted from routine diagnostics, dumps, and reload
+observations.
+
+The ready event and every successful reload publication report `generation`,
+`rules_directory` (`missing`, `empty`, or `populated`), `fragment_count`,
+`fragment_bytes`, `fragment_rule_count`, `main_rule_count`, and
+`total_rule_count`. A rejected candidate emits no publication summary; the
+prior generation's summary remains authoritative.
 
 ### Authorization Providers
 
@@ -823,7 +944,7 @@ files and loopback listeners:
 scripts/loopback-smoke.sh
 ```
 
-It builds or uses `ACL_PROXY_BIN`, validates generated strict v3 config, probes
+It builds or uses `ACL_PROXY_BIN`, validates generated strict v4 config, probes
 readiness on the control listener, proves the data listener does not serve
 readiness, tests deny/allow HTTP and CONNECT/TLS, and checks graceful shutdown.
 

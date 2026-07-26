@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use tokio::sync::Notify;
 
-use crate::config::{CompiledConfig, ReloadableProductPlan, StaticFingerprint};
+use crate::config::{ReloadableProductPlan, RuntimeCandidate, StaticFingerprint};
 
 use super::generation::{ActivatedGeneration, GenerationId};
 use super::StaticResourceBrand;
@@ -81,7 +81,7 @@ pub(crate) trait CandidateSource: Send + Sync {
     fn load_latest(
         &self,
         cancellation: ActivationCancellation,
-    ) -> BoxFuture<'_, Result<CompiledConfig, RuntimeError>>;
+    ) -> BoxFuture<'_, Result<RuntimeCandidate, RuntimeError>>;
 }
 
 pub(crate) trait CandidateActivator: Send + Sync {

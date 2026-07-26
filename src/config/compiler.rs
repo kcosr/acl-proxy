@@ -1016,47 +1016,257 @@ impl fmt::Debug for CompiledProductConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ConfigCompileDiagnosticCategory {
+    InvalidValue,
+    UnknownReference,
+    DuplicateRuleId,
+    LimitExceeded,
+    SecurityConstraint,
+    ResourceProjection,
+    InternalInvariant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ConfigCompileDiagnosticPath {
+    Main { field: String },
+    PolicyRule { cursor: usize, field: String },
+}
+
+impl ConfigCompileDiagnosticPath {
+    pub(super) fn field(&self) -> &str {
+        match self {
+            Self::Main { field } | Self::PolicyRule { field, .. } => field,
+        }
+    }
+
+    pub(super) fn rule_cursor(&self) -> Option<usize> {
+        match self {
+            Self::Main { .. } => None,
+            Self::PolicyRule { cursor, .. } => Some(*cursor),
+        }
+    }
+}
+
+impl fmt::Display for ConfigCompileDiagnosticPath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Main { field } => formatter.write_str(field),
+            Self::PolicyRule { cursor, field } if field.is_empty() => {
+                write!(formatter, "policy.rules[{cursor}]")
+            }
+            Self::PolicyRule { cursor, field } => {
+                write!(formatter, "policy.rules[{cursor}].{field}")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DuplicateRuleIdCursors {
+    first_cursor: usize,
+    duplicate_cursor: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DuplicateRuleIdDiagnostic<'a> {
+    cursors: DuplicateRuleIdCursors,
+    safe_rule_id: Option<&'a str>,
+}
+
+impl DuplicateRuleIdDiagnostic<'_> {
+    pub(super) fn first_cursor(&self) -> usize {
+        self.cursors.first_cursor
+    }
+
+    pub(super) fn duplicate_cursor(&self) -> usize {
+        self.cursors.duplicate_cursor
+    }
+
+    pub(super) fn safe_rule_id(&self) -> Option<&str> {
+        self.safe_rule_id
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("invalid configuration at {path}: {message}")]
 pub(super) struct ConfigCompileError {
-    path: String,
+    category: ConfigCompileDiagnosticCategory,
+    path: ConfigCompileDiagnosticPath,
     message: String,
+    safe_rule_id: Option<String>,
+    duplicate_rule_id: Option<DuplicateRuleIdCursors>,
 }
 
 impl ConfigCompileError {
     fn at(path: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::at_category(ConfigCompileDiagnosticCategory::InvalidValue, path, message)
+    }
+
+    fn at_category(
+        category: ConfigCompileDiagnosticCategory,
+        path: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
-            path: path.into(),
+            category,
+            path: ConfigCompileDiagnosticPath::Main { field: path.into() },
             message: message.into(),
+            safe_rule_id: None,
+            duplicate_rule_id: None,
         }
     }
+
+    fn at_rule(cursor: usize, path: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::at_rule_category(
+            ConfigCompileDiagnosticCategory::InvalidValue,
+            cursor,
+            path,
+            message,
+        )
+    }
+
+    fn at_rule_category(
+        category: ConfigCompileDiagnosticCategory,
+        cursor: usize,
+        path: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            category,
+            path: ConfigCompileDiagnosticPath::PolicyRule {
+                cursor,
+                field: path.into(),
+            },
+            message: message.into(),
+            safe_rule_id: None,
+            duplicate_rule_id: None,
+        }
+    }
+
+    fn duplicate_rule_id(first_cursor: usize, duplicate_cursor: usize, rule_id: &str) -> Self {
+        let safe_rule_id = safe_diagnostic_rule_id(rule_id);
+        Self {
+            category: ConfigCompileDiagnosticCategory::DuplicateRuleId,
+            path: ConfigCompileDiagnosticPath::PolicyRule {
+                cursor: duplicate_cursor,
+                field: "id".to_string(),
+            },
+            message: "duplicates an earlier rule ID".to_string(),
+            safe_rule_id,
+            duplicate_rule_id: Some(DuplicateRuleIdCursors {
+                first_cursor,
+                duplicate_cursor,
+            }),
+        }
+    }
+
+    fn with_rule_cursor(mut self, cursor: usize) -> Self {
+        if let ConfigCompileDiagnosticPath::Main { field } = self.path {
+            let field = match field.as_str() {
+                "policy.rules" => String::new(),
+                "policy.rules.authorization_provider" => "authorization_provider".to_string(),
+                _ => field,
+            };
+            self.path = ConfigCompileDiagnosticPath::PolicyRule { cursor, field };
+        }
+        self
+    }
+
+    fn with_rule_cursor_category(
+        mut self,
+        cursor: usize,
+        category: ConfigCompileDiagnosticCategory,
+    ) -> Self {
+        self = self.with_rule_cursor(cursor);
+        self.category = category;
+        self
+    }
+
+    fn with_safe_rule_id(mut self, rule_id: Option<&str>) -> Self {
+        if self.safe_rule_id.is_none() {
+            self.safe_rule_id = rule_id.and_then(safe_diagnostic_rule_id);
+        }
+        self
+    }
+
+    pub(super) fn category(&self) -> ConfigCompileDiagnosticCategory {
+        self.category
+    }
+
+    pub(super) fn path(&self) -> &ConfigCompileDiagnosticPath {
+        &self.path
+    }
+
+    pub(super) fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub(super) fn safe_rule_id(&self) -> Option<&str> {
+        self.safe_rule_id.as_deref()
+    }
+
+    pub(super) fn duplicate_rule_id_diagnostic(&self) -> Option<DuplicateRuleIdDiagnostic<'_>> {
+        self.duplicate_rule_id
+            .map(|cursors| DuplicateRuleIdDiagnostic {
+                cursors,
+                safe_rule_id: self.safe_rule_id(),
+            })
+    }
+}
+
+fn safe_diagnostic_rule_id(rule_id: &str) -> Option<String> {
+    if rule_id.is_empty()
+        || rule_id.len() > MAX_PROVIDER_RULE_ID_BYTES
+        || rule_id.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let mut safe = String::new();
+    safe.try_reserve_exact(rule_id.len()).ok()?;
+    safe.push_str(rule_id);
+    Some(safe)
 }
 
 pub(super) fn compile_config(
     mut config: super::authoring::AuthoringConfig,
     config_root: &Path,
 ) -> Result<CompiledProductConfig, ConfigCompileError> {
-    let config_root = normalize_config_root(config_root)?;
-    normalize_authored_paths(&mut config, &config_root)?;
-    let endpoint_urls = canonical_endpoint_urls(&config)?;
+    compile_config_inner(&mut config, config_root).map_err(|error| {
+        let rule_id = error
+            .path()
+            .rule_cursor()
+            .and_then(|cursor| config.policy.rules.get(cursor))
+            .map(|rule| rule.id.as_str());
+        error.with_safe_rule_id(rule_id)
+    })
+}
 
-    validate_positive_limits(&config)?;
-    validate_identity(&config)?;
-    validate_protected_identity_locators(&config)?;
-    let listener_facts = validate_listener_control_mitm_matrix(&config)?;
-    validate_tls_and_parent_matrix(&config, &listener_facts, &endpoint_urls)?;
-    let validation = validate_references_and_security_boundaries(&config)?;
+fn compile_config_inner(
+    config: &mut super::authoring::AuthoringConfig,
+    config_root: &Path,
+) -> Result<CompiledProductConfig, ConfigCompileError> {
+    let config_root = normalize_config_root(config_root)?;
+    normalize_authored_paths(config, &config_root)?;
+    let endpoint_urls = canonical_endpoint_urls(config)?;
+
+    validate_positive_limits(config)?;
+    validate_identity(config)?;
+    validate_protected_identity_locators(config)?;
+    let listener_facts = validate_listener_control_mitm_matrix(config)?;
+    validate_tls_and_parent_matrix(config, &listener_facts, &endpoint_urls)?;
+    let validation = validate_references_and_security_boundaries(config)?;
     let redaction = compile_redaction_plan(&config.redaction)?;
-    let resource_plan = compile_resource_plan(&config, &redaction)?;
+    let resource_plan = compile_resource_plan(config, &redaction)?;
 
     let static_config =
-        compile_static_config(&config, config_root.clone(), endpoint_urls.callback.clone())?;
+        compile_static_config(config, config_root.clone(), endpoint_urls.callback.clone())?;
     let ValidationFacts {
         compiled_urls_by_rule,
         capture_sink,
     } = validation;
     let reloadable_plan = compile_reloadable_plan(
-        &config,
+        config,
         &config_root,
         &endpoint_urls,
         compiled_urls_by_rule,
@@ -1064,10 +1274,20 @@ pub(super) fn compile_config(
         resource_plan,
         redaction,
     )?;
-    UnboundStandaloneGenerationPlan::preflight(&reloadable_plan)
-        .map_err(|error| ConfigCompileError::at("compiled_generation", error.to_string()))?;
-    let static_fingerprint = StaticFingerprint::from_config(&static_config)
-        .map_err(|error| ConfigCompileError::at("schema_version", error.to_string()))?;
+    UnboundStandaloneGenerationPlan::preflight(&reloadable_plan).map_err(|error| {
+        ConfigCompileError::at_category(
+            ConfigCompileDiagnosticCategory::InternalInvariant,
+            "compiled_generation",
+            error.to_string(),
+        )
+    })?;
+    let static_fingerprint = StaticFingerprint::from_config(&static_config).map_err(|error| {
+        ConfigCompileError::at_category(
+            ConfigCompileDiagnosticCategory::InternalInvariant,
+            "schema_version",
+            error.to_string(),
+        )
+    })?;
 
     Ok(CompiledProductConfig {
         static_fingerprint,
@@ -1592,14 +1812,17 @@ fn validate_identity(config: &super::authoring::AuthoringConfig) -> Result<(), C
                 "is required when a listener enables identity",
             ));
         }
-        if config
+        if let Some((index, _)) = config
             .policy
             .rules
             .iter()
-            .any(|rule| rule.identity_subjects.is_some())
+            .enumerate()
+            .find(|(_, rule)| rule.identity_subjects.is_some())
         {
-            return Err(ConfigCompileError::at(
-                "policy.rules.identity_subjects",
+            return Err(ConfigCompileError::at_rule_category(
+                ConfigCompileDiagnosticCategory::UnknownReference,
+                index,
+                "identity_subjects",
                 "requires a configured identity resolver",
             ));
         }
@@ -1856,26 +2079,28 @@ fn validate_policy_identity_shapes(
 ) -> Result<(), ConfigCompileError> {
     let mut aggregate_identity_subjects = 0usize;
     for (index, rule) in config.policy.rules.iter().enumerate() {
-        let prefix = format!("policy.rules[{index}]");
         if let Some(states) = &rule.identity_states {
             if states.is_empty() {
-                return Err(ConfigCompileError::at(
-                    format!("{prefix}.identity_states"),
+                return Err(ConfigCompileError::at_rule(
+                    index,
+                    "identity_states",
                     "must not be empty when present",
                 ));
             }
             let mut unique = BTreeSet::new();
             for state in states {
                 if !unique.insert(*state) {
-                    return Err(ConfigCompileError::at(
-                        format!("{prefix}.identity_states"),
+                    return Err(ConfigCompileError::at_rule(
+                        index,
+                        "identity_states",
                         "must not contain duplicates",
                     ));
                 }
             }
             if states.contains(&IdentityStateConfig::Anonymous) && !optional_listener {
-                return Err(ConfigCompileError::at(
-                    format!("{prefix}.identity_states"),
+                return Err(ConfigCompileError::at_rule(
+                    index,
+                    "identity_states",
                     "anonymous identity requires at least one optional identity listener",
                 ));
             }
@@ -1884,14 +2109,18 @@ fn validate_policy_identity_shapes(
             aggregate_identity_subjects = aggregate_identity_subjects
                 .checked_add(subjects.len())
                 .ok_or_else(|| {
-                ConfigCompileError::at(
-                    format!("{prefix}.identity_subjects"),
+                ConfigCompileError::at_rule_category(
+                    ConfigCompileDiagnosticCategory::LimitExceeded,
+                    index,
+                    "identity_subjects",
                     "aggregate identity subject count overflowed",
                 )
             })?;
             if aggregate_identity_subjects > MAX_IDENTITY_SUBJECTS_PER_SNAPSHOT {
-                return Err(ConfigCompileError::at(
-                    format!("{prefix}.identity_subjects"),
+                return Err(ConfigCompileError::at_rule_category(
+                    ConfigCompileDiagnosticCategory::LimitExceeded,
+                    index,
+                    "identity_subjects",
                     format!(
                         "would exceed the aggregate policy limit of \
                          {MAX_IDENTITY_SUBJECTS_PER_SNAPSHOT} identity subjects"
@@ -1899,20 +2128,23 @@ fn validate_policy_identity_shapes(
                 ));
             }
             if subjects.is_empty() {
-                return Err(ConfigCompileError::at(
-                    format!("{prefix}.identity_subjects"),
+                return Err(ConfigCompileError::at_rule(
+                    index,
+                    "identity_subjects",
                     "must not be empty when present",
                 ));
             }
             if rule.identity_states.as_deref() != Some(&[IdentityStateConfig::Authenticated]) {
-                return Err(ConfigCompileError::at(
-                    format!("{prefix}.identity_subjects"),
+                return Err(ConfigCompileError::at_rule(
+                    index,
+                    "identity_subjects",
                     "requires identity_states = [\"authenticated\"]",
                 ));
             }
             if !enabled_listener {
-                return Err(ConfigCompileError::at(
-                    format!("{prefix}.identity_subjects"),
+                return Err(ConfigCompileError::at_rule(
+                    index,
+                    "identity_subjects",
                     "authenticated subjects require at least one identity-enabled listener",
                 ));
             }
@@ -1931,29 +2163,37 @@ fn validate_policy_identity_subjects(
         let Some(subjects) = &rule.identity_subjects else {
             continue;
         };
-        let path = format!("policy.rules[{rule_index}].identity_subjects");
+        let path = "identity_subjects";
         let mut unique = BTreeSet::new();
         for (subject_index, subject) in subjects.iter().enumerate() {
             let subject_path = format!("{path}[{subject_index}]");
             let compiled = match subject {
                 IdentitySubjectConfig::Principal { authority, id } => {
                     let authority = AuthorityId::new(authority.clone()).map_err(|error| {
-                        ConfigCompileError::at(
+                        ConfigCompileError::at_rule(
+                            rule_index,
                             format!("{subject_path}.authority"),
                             error.to_string(),
                         )
                     })?;
                     if &authority != resolver_authority {
-                        return Err(ConfigCompileError::at(
+                        return Err(ConfigCompileError::at_rule(
+                            rule_index,
                             format!("{subject_path}.authority"),
                             "must match the configured identity resolver authority",
                         ));
                     }
                     let id = PrincipalId::new(id.clone()).map_err(|error| {
-                        ConfigCompileError::at(format!("{subject_path}.id"), error.to_string())
+                        ConfigCompileError::at_rule(
+                            rule_index,
+                            format!("{subject_path}.id"),
+                            error.to_string(),
+                        )
                     })?;
                     if !principals.contains(&id) {
-                        return Err(ConfigCompileError::at(
+                        return Err(ConfigCompileError::at_rule_category(
+                            ConfigCompileDiagnosticCategory::UnknownReference,
+                            rule_index,
                             format!("{subject_path}.id"),
                             "references an unknown identity principal",
                         ));
@@ -1962,22 +2202,30 @@ fn validate_policy_identity_subjects(
                 }
                 IdentitySubjectConfig::Group { authority, id } => {
                     let authority = AuthorityId::new(authority.clone()).map_err(|error| {
-                        ConfigCompileError::at(
+                        ConfigCompileError::at_rule(
+                            rule_index,
                             format!("{subject_path}.authority"),
                             error.to_string(),
                         )
                     })?;
                     if &authority != resolver_authority {
-                        return Err(ConfigCompileError::at(
+                        return Err(ConfigCompileError::at_rule(
+                            rule_index,
                             format!("{subject_path}.authority"),
                             "must match the configured identity resolver authority",
                         ));
                     }
                     let id = GroupId::new(id.clone()).map_err(|error| {
-                        ConfigCompileError::at(format!("{subject_path}.id"), error.to_string())
+                        ConfigCompileError::at_rule(
+                            rule_index,
+                            format!("{subject_path}.id"),
+                            error.to_string(),
+                        )
                     })?;
                     if !groups.contains(&id) {
-                        return Err(ConfigCompileError::at(
+                        return Err(ConfigCompileError::at_rule_category(
+                            ConfigCompileDiagnosticCategory::UnknownReference,
+                            rule_index,
                             format!("{subject_path}.id"),
                             "references an unknown identity group",
                         ));
@@ -1986,7 +2234,8 @@ fn validate_policy_identity_subjects(
                 }
             };
             if !unique.insert(compiled) {
-                return Err(ConfigCompileError::at(
+                return Err(ConfigCompileError::at_rule(
+                    rule_index,
                     subject_path,
                     "duplicates an earlier identity subject",
                 ));
@@ -2518,8 +2767,10 @@ fn validate_listener_control_mitm_matrix(
     if facts.uses_access_flow {
         for (index, rule) in config.policy.rules.iter().enumerate() {
             if !rule.client_cidrs.is_empty() {
-                return Err(ConfigCompileError::at(
-                    format!("policy.rules[{index}].client_cidrs"),
+                return Err(ConfigCompileError::at_rule_category(
+                    ConfigCompileDiagnosticCategory::SecurityConstraint,
+                    index,
+                    "client_cidrs",
                     "must be empty when an access_flow listener uses the local-workstation principal",
                 ));
             }
@@ -3448,9 +3699,10 @@ fn collect_all_credential_destinations(
         let mut local = credential_action_destinations(
             &rule.credential_actions,
             &config.credentials,
-            &format!("policy.rules[{index}].credential_actions"),
+            "credential_actions",
             allowed_custom,
-        )?;
+        )
+        .map_err(|error| error.with_rule_cursor(index))?;
         if let Some(provider_name) = &rule.authorization_provider {
             if let Some(provider) = config.authorization.providers.get(provider_name) {
                 for destination in provider_output_destinations(
@@ -3459,8 +3711,9 @@ fn collect_all_credential_destinations(
                     &format!("authorization.providers.{provider_name}.outputs"),
                 )? {
                     if !local.insert(destination) {
-                        return Err(ConfigCompileError::at(
-                            format!("policy.rules[{index}]"),
+                        return Err(ConfigCompileError::at_rule(
+                            index,
+                            "",
                             "credential destinations collide between rule actions and provider outputs",
                         ));
                     }
@@ -3468,8 +3721,9 @@ fn collect_all_credential_destinations(
             }
         }
         if local.iter().any(|destination| global.contains(destination)) {
-            return Err(ConfigCompileError::at(
-                format!("policy.rules[{index}]"),
+            return Err(ConfigCompileError::at_rule(
+                index,
+                "",
                 "credential destination collides with a global egress credential action",
             ));
         }
@@ -3536,7 +3790,8 @@ fn require_credential_source(
     path: &str,
 ) -> Result<(), ConfigCompileError> {
     if !credentials.sources.contains_key(source) {
-        return Err(ConfigCompileError::at(
+        return Err(ConfigCompileError::at_category(
+            ConfigCompileDiagnosticCategory::UnknownReference,
             path,
             format!("references unknown credential source {source:?}"),
         ));
@@ -3740,7 +3995,8 @@ fn validate_policy(
     config: &super::authoring::AuthoringConfig,
 ) -> Result<Vec<Vec<CompiledUrlPattern>>, ConfigCompileError> {
     if config.policy.rules.len() > MAX_POLICY_RULES {
-        return Err(ConfigCompileError::at(
+        return Err(ConfigCompileError::at_category(
+            ConfigCompileDiagnosticCategory::LimitExceeded,
             "policy.rules",
             "contains too many rules",
         ));
@@ -3757,42 +4013,80 @@ fn validate_policy(
         .values()
         .map(|value| value.header.to_ascii_lowercase())
         .collect();
-    let mut ids = BTreeSet::new();
+    let mut ids = BTreeMap::new();
     let mut compiled_urls_by_rule = Vec::with_capacity(config.policy.rules.len());
     for (index, rule) in config.policy.rules.iter().enumerate() {
-        let prefix = format!("policy.rules[{index}]");
-        if rule.id.trim().is_empty() || !ids.insert(rule.id.clone()) {
-            return Err(ConfigCompileError::at(
-                format!("{prefix}.id"),
-                "must be nonempty and unique",
+        if rule.id.trim().is_empty() {
+            return Err(ConfigCompileError::at_rule(index, "id", "must be nonempty"));
+        }
+        if let Some(first_cursor) = ids.get(&rule.id).copied() {
+            return Err(ConfigCompileError::duplicate_rule_id(
+                first_cursor,
+                index,
+                &rule.id,
             ));
         }
+        ids.insert(rule.id.clone(), index);
         if rule.id.len() > MAX_PROVIDER_RULE_ID_BYTES {
-            return Err(ConfigCompileError::at(
-                format!("{prefix}.id"),
+            return Err(ConfigCompileError::at_rule(
+                index,
+                "id",
                 format!(
                     "must be at most {MAX_PROVIDER_RULE_ID_BYTES} bytes for authorization-provider dispatch"
                 ),
             ));
         }
-        let predicate_count = rule.urls.len()
-            + rule.methods.len()
-            + rule.client_cidrs.len()
-            + rule.identity_states.as_ref().map_or(0, Vec::len)
-            + rule.identity_subjects.as_ref().map_or(0, Vec::len)
-            + rule.headers.absent_any.len()
-            + rule.headers.present_all.len()
-            + rule.headers.all.len()
-            + rule.headers.none.len();
+        if StableId::new(rule.id.clone()).is_err() {
+            return Err(ConfigCompileError::at_rule(
+                index,
+                "id",
+                "must be a valid stable identifier",
+            ));
+        }
+        let predicate_count = [
+            rule.urls.len(),
+            rule.methods.len(),
+            rule.client_cidrs.len(),
+            rule.identity_states.as_ref().map_or(0, Vec::len),
+            rule.identity_subjects.as_ref().map_or(0, Vec::len),
+            rule.headers.absent_any.len(),
+            rule.headers.present_all.len(),
+            rule.headers.all.values().map(Vec::len).sum(),
+            rule.headers.none.values().map(Vec::len).sum(),
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+        .ok_or_else(|| {
+            ConfigCompileError::at_rule_category(
+                ConfigCompileDiagnosticCategory::LimitExceeded,
+                index,
+                "",
+                "semantic predicate count overflowed",
+            )
+        })?;
         if predicate_count == 0 {
-            return Err(ConfigCompileError::at(
-                &prefix,
+            return Err(ConfigCompileError::at_rule(
+                index,
+                "",
                 "must define at least one request predicate",
             ));
         }
+        if predicate_count > http_access_policy_acl::MAX_SEMANTIC_PREDICATES_PER_RULE {
+            return Err(ConfigCompileError::at_rule_category(
+                ConfigCompileDiagnosticCategory::LimitExceeded,
+                index,
+                "",
+                format!(
+                    "contains more than {} semantic predicates",
+                    http_access_policy_acl::MAX_SEMANTIC_PREDICATES_PER_RULE
+                ),
+            ));
+        }
         if rule.urls.len() > MAX_URLS_PER_RULE {
-            return Err(ConfigCompileError::at(
-                format!("{prefix}.urls"),
+            return Err(ConfigCompileError::at_rule_category(
+                ConfigCompileDiagnosticCategory::LimitExceeded,
+                index,
+                "urls",
                 "contains too many URL patterns",
             ));
         }
@@ -3801,14 +4095,16 @@ fn validate_policy(
             .iter()
             .enumerate()
             .map(|(pattern_index, pattern)| {
-                let path = format!("{prefix}.urls[{pattern_index}]");
-                let compiled = CompiledUrlPattern::compile(pattern)
-                    .map_err(|error| ConfigCompileError::at(&path, error.to_string()))?;
+                let path = format!("urls[{pattern_index}]");
+                let compiled = CompiledUrlPattern::compile(pattern).map_err(|error| {
+                    ConfigCompileError::at_rule(index, &path, error.to_string())
+                })?;
                 if compiled
                     .path_pattern()
                     .is_some_and(|path_pattern| path_pattern.contains("//"))
                 {
-                    return Err(ConfigCompileError::at(
+                    return Err(ConfigCompileError::at_rule(
+                        index,
                         path,
                         "path must not contain an empty segment",
                     ));
@@ -3817,28 +4113,34 @@ fn validate_policy(
             })
             .collect::<Result<Vec<_>, _>>()?;
         compiled_urls_by_rule.push(patterns);
-        validate_methods(&rule.methods, &format!("{prefix}.methods"))?;
-        validate_header_predicates(rule, &prefix, &contexts, &inbound)?;
+        validate_methods(&rule.methods, "methods")
+            .map_err(|error| error.with_rule_cursor(index))?;
+        validate_header_predicates(rule, &contexts, &inbound)
+            .map_err(|error| error.with_rule_cursor(index))?;
 
         match rule.decision {
             RuleDecision::Delegate => {
                 let provider = rule.authorization_provider.as_ref().ok_or_else(|| {
-                    ConfigCompileError::at(
-                        format!("{prefix}.authorization_provider"),
+                    ConfigCompileError::at_rule(
+                        index,
+                        "authorization_provider",
                         "is required for a delegate rule",
                     )
                 })?;
                 if !config.authorization.providers.contains_key(provider) {
-                    return Err(ConfigCompileError::at(
-                        format!("{prefix}.authorization_provider"),
+                    return Err(ConfigCompileError::at_rule_category(
+                        ConfigCompileDiagnosticCategory::UnknownReference,
+                        index,
+                        "authorization_provider",
                         format!("references unknown provider {provider:?}"),
                     ));
                 }
             }
             RuleDecision::Allow | RuleDecision::Deny => {
                 if rule.authorization_provider.is_some() {
-                    return Err(ConfigCompileError::at(
-                        format!("{prefix}.authorization_provider"),
+                    return Err(ConfigCompileError::at_rule(
+                        index,
+                        "authorization_provider",
                         "is valid only for a delegate rule",
                     ));
                 }
@@ -3846,14 +4148,17 @@ fn validate_policy(
         }
         if let Some(profile) = &rule.redaction_profile {
             if matches!(rule.decision, RuleDecision::Deny) {
-                return Err(ConfigCompileError::at(
-                    format!("{prefix}.redaction_profile"),
+                return Err(ConfigCompileError::at_rule(
+                    index,
+                    "redaction_profile",
                     "is forbidden on a deny rule",
                 ));
             }
             if !config.redaction.profiles.contains_key(profile) {
-                return Err(ConfigCompileError::at(
-                    format!("{prefix}.redaction_profile"),
+                return Err(ConfigCompileError::at_rule_category(
+                    ConfigCompileDiagnosticCategory::UnknownReference,
+                    index,
+                    "redaction_profile",
                     format!("references unknown profile {profile:?}"),
                 ));
             }
@@ -3863,8 +4168,9 @@ fn validate_policy(
                 || !rule.response_headers.is_empty()
                 || !rule.credential_actions.is_empty())
         {
-            return Err(ConfigCompileError::at(
-                &prefix,
+            return Err(ConfigCompileError::at_rule(
+                index,
+                "",
                 "deny rules cannot contain forwarding effects",
             ));
         }
@@ -3872,7 +4178,12 @@ fn validate_policy(
             || rule.response_headers.len() > MAX_EFFECTS_PER_SCOPE
             || rule.credential_actions.len() > MAX_EFFECTS_PER_SCOPE
         {
-            return Err(ConfigCompileError::at(&prefix, "contains too many effects"));
+            return Err(ConfigCompileError::at_rule_category(
+                ConfigCompileDiagnosticCategory::LimitExceeded,
+                index,
+                "",
+                "contains too many effects",
+            ));
         }
     }
     Ok(compiled_urls_by_rule)
@@ -3907,10 +4218,8 @@ fn validate_credential_transport_security(
             &config.egress.credential_actions,
             "egress.credential_actions",
         )?;
-        require_cleartext_credential_actions(
-            &rule.credential_actions,
-            &format!("policy.rules[{index}].credential_actions"),
-        )?;
+        require_cleartext_credential_actions(&rule.credential_actions, "credential_actions")
+            .map_err(|error| error.with_rule_cursor(index))?;
 
         let Some(provider_name) = &rule.authorization_provider else {
             continue;
@@ -4024,7 +4333,6 @@ fn is_http_token_byte(byte: u8) -> bool {
 
 fn validate_header_predicates(
     rule: &PolicyRuleConfig,
-    prefix: &str,
     contexts: &BTreeSet<String>,
     inbound: &BTreeSet<String>,
 ) -> Result<(), ConfigCompileError> {
@@ -4033,8 +4341,9 @@ fn validate_header_predicates(
         + rule.headers.all.values().map(Vec::len).sum::<usize>()
         + rule.headers.none.values().map(Vec::len).sum::<usize>();
     if count > MAX_HEADER_PREDICATES_PER_RULE {
-        return Err(ConfigCompileError::at(
-            format!("{prefix}.headers"),
+        return Err(ConfigCompileError::at_category(
+            ConfigCompileDiagnosticCategory::LimitExceeded,
+            "headers",
             "contains too many names",
         ));
     }
@@ -4044,16 +4353,16 @@ fn validate_header_predicates(
         ("present_all", &rule.headers.present_all),
     ] {
         for name in names {
-            let header = normalize_header_name(name, &format!("{prefix}.headers.{kind}"))?;
+            let header = normalize_header_name(name, &format!("headers.{kind}"))?;
             if contexts.contains(&header) {
                 return Err(ConfigCompileError::at(
-                    format!("{prefix}.headers.{kind}"),
+                    format!("headers.{kind}"),
                     "internal context headers cannot be policy predicates",
                 ));
             }
             if !all_names.insert(header) {
                 return Err(ConfigCompileError::at(
-                    format!("{prefix}.headers"),
+                    "headers",
                     "predicate names must be unique across predicate kinds",
                 ));
             }
@@ -4061,33 +4370,33 @@ fn validate_header_predicates(
     }
     for (kind, values) in [("all", &rule.headers.all), ("none", &rule.headers.none)] {
         for (name, expected) in values {
-            let header = normalize_header_name(name, &format!("{prefix}.headers.{kind}"))?;
+            let header = normalize_header_name(name, &format!("headers.{kind}"))?;
             if contexts.contains(&header)
                 || inbound.contains(&header)
                 || base_sensitive_value_headers().contains(header.as_str())
             {
                 return Err(ConfigCompileError::at(
-                    format!("{prefix}.headers.{kind}"),
+                    format!("headers.{kind}"),
                     "protected or credential-bearing headers cannot be value predicates",
                 ));
             }
             if expected.is_empty() {
                 return Err(ConfigCompileError::at(
-                    format!("{prefix}.headers.{kind}.{name}"),
+                    format!("headers.{kind}.{name}"),
                     "must contain at least one value",
                 ));
             }
             for value in expected {
                 HeaderValue::from_str(value).map_err(|error| {
                     ConfigCompileError::at(
-                        format!("{prefix}.headers.{kind}.{name}"),
+                        format!("headers.{kind}.{name}"),
                         format!("contains an invalid header value: {error}"),
                     )
                 })?;
             }
             if !all_names.insert(header) {
                 return Err(ConfigCompileError::at(
-                    format!("{prefix}.headers"),
+                    "headers",
                     "predicate names must be unique across predicate kinds",
                 ));
             }
@@ -4115,22 +4424,24 @@ fn validate_all_literal_effects(
     for (index, rule) in config.policy.rules.iter().enumerate() {
         validate_literal_effects(
             &rule.request_headers,
-            &format!("policy.rules[{index}].request_headers"),
+            "request_headers",
             loop_header,
             credential_destinations,
             inbound_headers,
             internal_context_headers,
             false,
-        )?;
+        )
+        .map_err(|error| error.with_rule_cursor(index))?;
         validate_literal_effects(
             &rule.response_headers,
-            &format!("policy.rules[{index}].response_headers"),
+            "response_headers",
             loop_header,
             credential_destinations,
             inbound_headers,
             internal_context_headers,
             false,
-        )?;
+        )
+        .map_err(|error| error.with_rule_cursor(index))?;
     }
     Ok(())
 }
@@ -4952,7 +5263,15 @@ fn compile_resource_plan(
         .policy
         .rules
         .iter()
-        .map(|rule| compile_http_rule_schedule_with_redaction(config, redaction, rule))
+        .enumerate()
+        .map(|(index, rule)| {
+            compile_http_rule_schedule_with_redaction(config, redaction, rule).map_err(|error| {
+                error.with_rule_cursor_category(
+                    index,
+                    ConfigCompileDiagnosticCategory::ResourceProjection,
+                )
+            })
+        })
         .collect::<Result<Vec<_>, _>>()?;
     validate_forwarding_request_bounds(config, body_read_plans, &rule_schedules)?;
     let webhook_request_allocation_bytes_by_rule = rule_schedules
@@ -5030,7 +5349,13 @@ fn compile_resource_plan(
                 body_read_compilation.specialized_by_rule[index].get(variant.as_deref()),
                 staging_bytes,
                 index,
-            )?;
+            )
+            .map_err(|error| {
+                error.with_rule_cursor_category(
+                    index,
+                    ConfigCompileDiagnosticCategory::ResourceProjection,
+                )
+            })?;
             specialized_paths.insert(variant.as_deref(), path);
         }
 
@@ -5041,7 +5366,13 @@ fn compile_resource_plan(
             body_read_plans[index],
             staging_bytes,
             index,
-        )?
+        )
+        .map_err(|error| {
+            error.with_rule_cursor_category(
+                index,
+                ConfigCompileDiagnosticCategory::ResourceProjection,
+            )
+        })?
         .1;
 
         for variant in &variants {
@@ -5109,27 +5440,36 @@ fn compile_resource_plan(
         .policy
         .rules
         .iter()
-        .map(|rule| {
-            if !rule.allow_upgrades {
-                return Ok(None);
-            }
-            let wire_working_set = rule
-                .redaction_profile
-                .as_ref()
-                .map(|name| {
-                    let profile = redaction
-                        .profiles
-                        .get(name)
-                        .expect("profile references validated before resource compilation");
-                    upgrade_wire_peak(
-                        profile.limits.max_message_bytes(),
-                        profile.limits.allow_permessage_deflate(),
-                        profile.projection.matcher_scratch_bytes(),
-                    )
-                })
-                .transpose()?
-                .unwrap_or(0);
-            Ok(Some(wire_working_set))
+        .enumerate()
+        .map(|(index, rule)| {
+            let result = (|| {
+                if !rule.allow_upgrades {
+                    return Ok(None);
+                }
+                let wire_working_set = rule
+                    .redaction_profile
+                    .as_ref()
+                    .map(|name| {
+                        let profile = redaction
+                            .profiles
+                            .get(name)
+                            .expect("profile references validated before resource compilation");
+                        upgrade_wire_peak(
+                            profile.limits.max_message_bytes(),
+                            profile.limits.allow_permessage_deflate(),
+                            profile.projection.matcher_scratch_bytes(),
+                        )
+                    })
+                    .transpose()?
+                    .unwrap_or(0);
+                Ok(Some(wire_working_set))
+            })();
+            result.map_err(|error: ConfigCompileError| {
+                error.with_rule_cursor_category(
+                    index,
+                    ConfigCompileDiagnosticCategory::ResourceProjection,
+                )
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let max_wire_working_set = upgrade_wire_working_set_bytes_by_rule
@@ -5309,7 +5649,7 @@ fn compile_reachable_http_path(
             path.product_peak_bytes.max(checked_add(
                 retained,
                 compatible_later.incoming_stage_peak_bytes,
-                &format!("policy.rules[{index}]"),
+                "",
                 "delegate-pass body retention arithmetic overflow",
             )?)
         } else {
@@ -5326,7 +5666,7 @@ fn finalize_http_body_resource(
     mut path: ReachableHttpPath,
     body_read_plan: HttpBodyReadPlan,
     staging_bytes: usize,
-    index: usize,
+    _index: usize,
 ) -> Result<(ReachableHttpPath, HttpBodyResourcePlan), ConfigCompileError> {
     if let Some(limits) = body_read_plan.limits() {
         path.canonical_output_or_replacement_limit = path
@@ -5338,13 +5678,13 @@ fn finalize_http_body_resource(
         )?);
         let merged_original = project_guarded_body_allocation(
             limits.max_decoded_bytes(),
-            &format!("policy.rules[{index}]"),
+            "",
             "post-decode merged body allocation arithmetic overflow",
         )?;
         path.product_peak_bytes = path.product_peak_bytes.max(checked_add(
             merged_original,
             path.body_free_stage_peak_bytes,
-            &format!("policy.rules[{index}]"),
+            "",
             "post-decode body-free rule arithmetic overflow",
         )?);
     }
@@ -5355,7 +5695,7 @@ fn finalize_http_body_resource(
         runtime_replay_capacity(
             config,
             NonZeroUsize::new(path.canonical_output_or_replacement_limit),
-            &format!("policy.rules[{index}]"),
+            "",
         )?
     } else {
         0
@@ -5363,7 +5703,7 @@ fn finalize_http_body_resource(
     let combined_peak = checked_add(
         path.product_peak_bytes,
         replay_capacity,
-        &format!("policy.rules[{index}]"),
+        "",
         "HTTP body combined peak arithmetic overflow",
     )?;
     Ok((
@@ -6127,8 +6467,10 @@ fn compile_http_body_read_plans(
                 HttpBodyReadLimits::try_new(max_encoded_bytes, max_decoded_bytes)
                     .map(HttpBodyReadPlan::Mandatory)
                     .ok_or_else(|| {
-                        ConfigCompileError::at(
-                            format!("policy.rules[{index}]"),
+                        ConfigCompileError::at_rule_category(
+                            ConfigCompileDiagnosticCategory::ResourceProjection,
+                            index,
+                            "",
                             "mandatory HTTP body read limits must be nonzero and decoded must be at least encoded",
                         )
                     })
@@ -7058,7 +7400,6 @@ fn compile_policy_rule_plan(
     urls: Vec<CompiledUrlPattern>,
     index: usize,
 ) -> Result<PolicyRulePlan, ConfigCompileError> {
-    let prefix = format!("policy.rules[{index}]");
     Ok(PolicyRulePlan {
         id: value.id.clone(),
         description: value.description.clone(),
@@ -7074,38 +7415,38 @@ fn compile_policy_rule_plan(
             .enumerate()
             .map(|(method_index, method)| {
                 Method::from_bytes(method.to_ascii_uppercase().as_bytes()).map_err(|error| {
-                    ConfigCompileError::at(
-                        format!("{prefix}.methods[{method_index}]"),
+                    ConfigCompileError::at_rule(
+                        index,
+                        format!("methods[{method_index}]"),
                         format!("invalid method after validation: {error}"),
                     )
                 })
             })
             .collect::<Result<Vec<_>, _>>()?,
-        client_cidrs: compile_client_cidrs(&value.client_cidrs, &format!("{prefix}.client_cidrs"))?,
-        identity: compile_identity_predicate_plan(value, &prefix)?,
-        headers: compile_header_predicates_plan(&value.headers, &prefix)?,
+        client_cidrs: compile_client_cidrs(&value.client_cidrs, "client_cidrs")
+            .map_err(|error| error.with_rule_cursor(index))?,
+        identity: compile_identity_predicate_plan(value)
+            .map_err(|error| error.with_rule_cursor(index))?,
+        headers: compile_header_predicates_plan(&value.headers)
+            .map_err(|error| error.with_rule_cursor(index))?,
         request_timeout: value.request_timeout.as_ref().map(|timeout| timeout.get()),
         allow_upgrades: value.allow_upgrades,
         authorization_provider: value.authorization_provider.clone(),
         redaction_profile: value.redaction_profile.clone(),
-        request_headers: compile_header_effects(
-            &value.request_headers,
-            &format!("{prefix}.request_headers"),
-        )?,
-        response_headers: compile_header_effects(
-            &value.response_headers,
-            &format!("{prefix}.response_headers"),
-        )?,
+        request_headers: compile_header_effects(&value.request_headers, "request_headers")
+            .map_err(|error| error.with_rule_cursor(index))?,
+        response_headers: compile_header_effects(&value.response_headers, "response_headers")
+            .map_err(|error| error.with_rule_cursor(index))?,
         credential_actions: compile_credential_actions(
             &value.credential_actions,
-            &format!("{prefix}.credential_actions"),
-        )?,
+            "credential_actions",
+        )
+        .map_err(|error| error.with_rule_cursor(index))?,
     })
 }
 
 fn compile_identity_predicate_plan(
     value: &PolicyRuleConfig,
-    prefix: &str,
 ) -> Result<Option<IdentityPredicatePlan>, ConfigCompileError> {
     let Some(authored_states) = &value.identity_states else {
         return Ok(None);
@@ -7131,7 +7472,7 @@ fn compile_identity_predicate_plan(
         .iter()
         .enumerate()
         .map(|(index, subject)| {
-            let path = format!("{prefix}.identity_subjects[{index}]");
+            let path = format!("identity_subjects[{index}]");
             match subject {
                 IdentitySubjectConfig::Principal { authority, id } => {
                     Ok(IdentitySubject::Principal {
@@ -7199,19 +7540,12 @@ fn compile_client_cidrs(
 
 fn compile_header_predicates_plan(
     value: &super::authoring::HeaderPredicatesConfig,
-    prefix: &str,
 ) -> Result<HeaderPredicatesPlan, ConfigCompileError> {
     Ok(HeaderPredicatesPlan {
-        absent_any: compile_header_names(
-            &value.absent_any,
-            &format!("{prefix}.headers.absent_any"),
-        )?,
-        present_all: compile_header_names(
-            &value.present_all,
-            &format!("{prefix}.headers.present_all"),
-        )?,
-        all: compile_header_value_predicates(&value.all, &format!("{prefix}.headers.all"))?,
-        none: compile_header_value_predicates(&value.none, &format!("{prefix}.headers.none"))?,
+        absent_any: compile_header_names(&value.absent_any, "headers.absent_any")?,
+        present_all: compile_header_names(&value.present_all, "headers.present_all")?,
+        all: compile_header_value_predicates(&value.all, "headers.all")?,
+        none: compile_header_value_predicates(&value.none, "headers.none")?,
     })
 }
 
@@ -8112,7 +8446,7 @@ mod tests {
     }
 
     const MINIMAL: &str = r#"
-schema_version = 3
+schema_version = 4
 
 [listeners.explicit_http]
 endpoint.kind = "tcp"
@@ -8125,6 +8459,15 @@ http1 = "deny"
 [policy]
 default = "deny"
 "#;
+
+    fn assert_main_path(error: &ConfigCompileError, expected: &str) {
+        assert_eq!(
+            error.path(),
+            &ConfigCompileDiagnosticPath::Main {
+                field: expected.to_owned(),
+            }
+        );
+    }
 
     #[test]
     fn credential_source_locators_enforce_exact_authored_bounds() {
@@ -8235,7 +8578,7 @@ path = "{oversized_component}"
     fn identity_config(token_source: &str) -> String {
         format!(
             r#"
-schema_version = 3
+schema_version = 4
 
 [listeners.explicit_http]
 endpoint.kind = "tcp"
@@ -9568,6 +9911,88 @@ methods = {methods:?}
         )
     }
 
+    fn policy_rules_with_ids(ids: &[&str]) -> String {
+        let rules = ids
+            .iter()
+            .map(|id| {
+                format!(
+                    r#"[[policy.rules]]
+id = {id:?}
+decision = "allow"
+methods = ["GET"]
+"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{MINIMAL}\n{rules}")
+    }
+
+    #[test]
+    fn duplicate_rule_ids_retain_both_global_cursors_and_a_safe_id() {
+        let error = compile(&policy_rules_with_ids(&["shared", "different", "shared"]))
+            .expect_err("duplicate rule ID must fail");
+
+        assert_eq!(
+            error.category(),
+            ConfigCompileDiagnosticCategory::DuplicateRuleId
+        );
+        assert_eq!(error.path().rule_cursor(), Some(2));
+        assert_eq!(error.path().field(), "id");
+        let duplicate = error
+            .duplicate_rule_id_diagnostic()
+            .expect("duplicate metadata");
+        assert_eq!(duplicate.first_cursor(), 0);
+        assert_eq!(duplicate.duplicate_cursor(), 2);
+        assert_eq!(duplicate.safe_rule_id(), Some("shared"));
+        assert!(error.to_string().contains("policy.rules[2].id"));
+    }
+
+    #[test]
+    fn duplicate_rule_id_diagnostic_omits_control_containing_id() {
+        let unsafe_id = "line-one\nline-two";
+        let error = ConfigCompileError::duplicate_rule_id(0, 1, unsafe_id);
+
+        let duplicate = error
+            .duplicate_rule_id_diagnostic()
+            .expect("duplicate metadata");
+        assert_eq!(duplicate.first_cursor(), 0);
+        assert_eq!(duplicate.duplicate_cursor(), 1);
+        assert_eq!(duplicate.safe_rule_id(), None);
+        assert!(!error.message().contains(unsafe_id));
+        assert!(!error.to_string().contains(unsafe_id));
+    }
+
+    #[test]
+    fn rule_local_validation_retains_global_cursor_and_relative_field() {
+        let input = format!(
+            r#"{MINIMAL}
+[[policy.rules]]
+id = "first"
+decision = "allow"
+methods = ["GET"]
+
+[[policy.rules]]
+id = "second"
+decision = "deny"
+urls = ["https://example.test/path//segment"]
+"#
+        );
+        let error = compile(&input).expect_err("second rule URL must fail");
+
+        assert_eq!(
+            error.category(),
+            ConfigCompileDiagnosticCategory::InvalidValue
+        );
+        assert_eq!(error.path().rule_cursor(), Some(1));
+        assert_eq!(error.path().field(), "urls[0]");
+        assert_eq!(
+            error.to_string(),
+            "invalid configuration at policy.rules[1].urls[0]: path must not contain an empty segment"
+        );
+        assert_eq!(error.duplicate_rule_id_diagnostic(), None);
+    }
+
     fn header_predicate_config(kind: &str, values: Vec<String>) -> String {
         format!(
             r#"{MINIMAL}
@@ -9632,9 +10057,12 @@ values = {values:?}
         let error = compile(&policy_rule_with_id("bad\tid"))
             .expect_err("a control-containing rule stable ID must fail structural compilation");
         assert!(
-            error.to_string().contains("invalid compiled ACL"),
+            error
+                .to_string()
+                .contains("must be a valid stable identifier"),
             "{error}"
         );
+        assert_eq!(error.path().rule_cursor(), Some(0));
     }
 
     #[test]
@@ -9665,9 +10093,10 @@ values = {values:?}
             .collect();
         let error = compile(&policy_rule_with_methods(oversized_methods, true))
             .expect_err("combined semantic predicates above the shared bound must fail");
-        assert!(
-            error.to_string().contains("invalid compiled ACL"),
-            "{error}"
+        assert!(error.to_string().contains("semantic predicates"), "{error}");
+        assert_eq!(
+            error.category(),
+            ConfigCompileDiagnosticCategory::LimitExceeded
         );
     }
 
@@ -9756,10 +10185,7 @@ rules = [{{ literals = ["{literal}"] }}]
         let error = compile(&input)
             .expect_err("the literal exceeds the scratch-derived single-literal ceiling");
         let rendered = format!("{error:?} {error}");
-        assert_eq!(
-            error.path,
-            "redaction.profiles.secrets.rules[0].literals[0]"
-        );
+        assert_main_path(&error, "redaction.profiles.secrets.rules[0].literals[0]");
         assert_eq!(error.message, "invalid redaction literal");
         assert!(!rendered.contains(&literal));
     }
@@ -9775,9 +10201,9 @@ rules = [{{ literal_environment_variables = ["TEST_REDACTION_SECRET"] }}]
 "#
         );
         let error = compile(&input).expect_err("the configured source horizon exceeds scratch");
-        assert_eq!(
-            error.path,
-            "redaction.profiles.secrets.max_environment_literal_bytes"
+        assert_main_path(
+            &error,
+            "redaction.profiles.secrets.max_environment_literal_bytes",
         );
         assert_eq!(error.message, "must be between 1 and 65536");
     }
@@ -9785,7 +10211,7 @@ rules = [{{ literal_environment_variables = ["TEST_REDACTION_SECRET"] }}]
     fn resource_config(service: &str, definitions: &str, rules: &str) -> String {
         format!(
             r#"
-schema_version = 3
+schema_version = 4
 
 [service]
 request_timeout = "1s"
@@ -10463,7 +10889,7 @@ methods = ["POST"]
     fn webhook_config(max_request_bytes: usize, max_response_bytes: usize) -> String {
         format!(
             r#"
-schema_version = 3
+schema_version = 4
 
 [control]
 bind = "127.0.0.1:8898"
@@ -10834,7 +11260,13 @@ authorization_provider = "local"
             ),
         ] {
             let error = compile(&input).expect_err(name);
-            assert_eq!(error.path, path, "{name}: {error}");
+            assert_eq!(
+                error.path(),
+                &ConfigCompileDiagnosticPath::Main {
+                    field: path.to_owned(),
+                },
+                "{name}: {error}"
+            );
         }
 
         compile(
@@ -10855,7 +11287,7 @@ authorization_provider = "local"
         let error =
             compile(&baseline.replace("/run/acl-proxy/authorization.sock", &oversized_path))
                 .expect_err("Unix socket paths are target bounded");
-        assert_eq!(error.path, "authorization.providers.local.socket_path");
+        assert_main_path(&error, "authorization.providers.local.socket_path");
 
         let inbound = baseline.replace(
             "[policy]",
@@ -10867,9 +11299,9 @@ process_providers = ["local"]
         );
         let error = compile(&inbound)
             .expect_err("Unix providers do not acquire process-only inbound credentials");
-        assert_eq!(
-            error.path,
-            "credentials.inbound.provider_input.process_providers"
+        assert_main_path(
+            &error,
+            "credentials.inbound.provider_input.process_providers",
         );
         assert!(error.message.contains("must name a process provider"));
     }
@@ -10982,13 +11414,13 @@ process_providers = ["local"]
             ),
         ))
         .expect_err("callback control limit cannot be one byte below the envelope floor");
-        assert_eq!(control_error.path, "control.max_request_body_bytes");
+        assert_main_path(&control_error, "control.max_request_body_bytes");
 
         let provider_error = compile(&webhook_config(4_097, MIN_CALLBACK_RESPONSE_BYTES - 1))
             .expect_err("provider response limit cannot be one byte below the envelope floor");
-        assert_eq!(
-            provider_error.path,
-            "authorization.providers.approval.max_response_bytes"
+        assert_main_path(
+            &provider_error,
+            "authorization.providers.approval.max_response_bytes",
         );
     }
 
@@ -11004,7 +11436,7 @@ max_webhook_transport_bytes = 262143
 [policy]"#,
         );
         let error = compile(&input).expect_err("two buffers per delivery must fit the pool");
-        assert_eq!(error.path, "service.max_webhook_transport_bytes");
+        assert_main_path(&error, "service.max_webhook_transport_bytes");
 
         let exact = compile(&input.replace("262143", "262144")).unwrap();
         assert_eq!(
@@ -11023,7 +11455,7 @@ max_webhook_transport_bytes = 262143
             );
         let error = compile(&input)
             .expect_err("canonical callback authority and control subtree must be reserved");
-        assert_eq!(error.path, "authorization.providers.approval.url");
+        assert_main_path(&error, "authorization.providers.approval.url");
         assert!(error.to_string().contains("control subtree"));
     }
 
@@ -11038,7 +11470,7 @@ max_webhook_transport_bytes = 262143
             &oversized_provider,
         ))
         .expect_err("the complete canonical provider URL must fit its fixed ceiling");
-        assert_eq!(provider_error.path, "authorization.providers.approval.url");
+        assert_main_path(&provider_error, "authorization.providers.approval.url");
         assert!(provider_error.to_string().contains("canonical URL"));
 
         let maximum_base_path = format!(
@@ -11059,13 +11491,13 @@ max_webhook_transport_bytes = 262143
         let oversized_base = format!("{maximum_base_path}a");
         let target_error = compile(&control_config(&oversized_base))
             .expect_err("one byte beyond the generated callback target ceiling must fail");
-        assert_eq!(target_error.path, "control.base_path");
+        assert_main_path(&target_error, "control.base_path");
         assert!(target_error.to_string().contains("encoded callback target"));
 
         for noncanonical in ["/_acl proxy", "/_acl-proxy/é"] {
             let error = compile(&control_config(noncanonical))
                 .expect_err("base paths that require percent encoding must fail");
-            assert_eq!(error.path, "control.base_path");
+            assert_main_path(&error, "control.base_path");
             assert!(error.to_string().contains("unsafe path component"));
         }
     }
@@ -11554,9 +11986,9 @@ authorization_provider = "decision"
         let config: super::super::authoring::AuthoringConfig = toml::from_str(&input).unwrap();
         let error = compile_http_rule_schedule(&config, &config.policy.rules[0]).unwrap_err();
 
-        assert_eq!(
-            error.path,
-            "authorization.providers.decision.max_stdout_line_bytes"
+        assert_main_path(
+            &error,
+            "authorization.providers.decision.max_stdout_line_bytes",
         );
         assert_eq!(
             error.message,
@@ -11872,7 +12304,7 @@ redaction_profile = "terminal"
         );
         let error = compile(&one_byte_body_provider_config(&insufficient_service))
             .expect_err("one byte below the projected product must fail");
-        assert_eq!(error.path, "service.min_wire_body_concurrency");
+        assert_main_path(&error, "service.min_wire_body_concurrency");
 
         let pool = WireBodyPool::new(5 * request_peak, request_peak);
         let small_charge = guarded(1);
@@ -12081,7 +12513,7 @@ max_total_bytes = {stored_bytes}
             128 * MIB
         );
         let error = compile(&input).expect_err("the HTTP-only pool projection underfits WebSocket");
-        assert_eq!(error.path, "observation.capture.max_inflight_body_bytes");
+        assert_main_path(&error, "observation.capture.max_inflight_body_bytes");
         assert_eq!(
             error.message,
             format!(
@@ -12103,7 +12535,7 @@ max_total_bytes = {stored_bytes}
     fn capture_working_set_overflow_is_a_config_error() {
         let error = capture_working_set_plan(usize::MAX, 1, 1, false, 0, false, 1).unwrap_err();
 
-        assert_eq!(error.path, "observation.capture.max_inflight_body_bytes");
+        assert_main_path(&error, "observation.capture.max_inflight_body_bytes");
         assert_eq!(error.message, "capture working-set arithmetic overflow");
     }
 
@@ -12144,7 +12576,7 @@ max_total_bytes = 1
         .unwrap();
         let error = compile(&one_byte_capture_config(1))
             .expect_err("the old stored-body-only capacity check was underprovisioned");
-        assert_eq!(error.path, "observation.capture.max_inflight_body_bytes");
+        assert_main_path(&error, "observation.capture.max_inflight_body_bytes");
         assert_eq!(
             error.message,
             format!(
@@ -12425,7 +12857,7 @@ max_total_bytes = 16384
 
         for value in [0, MAX_CAPTURE_PENDING_RECORDS + 1] {
             let error = compile(&capture_config(Some(value))).unwrap_err();
-            assert_eq!(error.path, "observation.capture.max_pending_records");
+            assert_main_path(&error, "observation.capture.max_pending_records");
             assert_eq!(
                 error.message,
                 format!("must be between 1 and {MAX_CAPTURE_PENDING_RECORDS}")
@@ -12471,7 +12903,7 @@ max_total_bytes = 16384
             let input = capture_config(None).replace("{requestId}-{suffix}.json", filename);
             let error = compile(&input).expect_err("invalid capture filename must not compile");
 
-            assert_eq!(error.path, "observation.capture.filename");
+            assert_main_path(&error, "observation.capture.filename");
             assert_eq!(error.message, expected.to_string());
         }
     }
@@ -12556,9 +12988,9 @@ max_total_bytes = 16384
                 "{MINIMAL}\n[observation.logging.policy_decisions]\n{field} = \"{invalid}\"\n"
             ))
             .unwrap_err();
-            assert_eq!(
-                error.path,
-                format!("observation.logging.policy_decisions.{field}")
+            assert_main_path(
+                &error,
+                &format!("observation.logging.policy_decisions.{field}"),
             );
             assert_eq!(error.message, "must be info or warn");
         }
@@ -12634,7 +13066,7 @@ console = false
     #[test]
     fn static_and_reloadable_ownership_matrix_covers_every_field_family() {
         let baseline = r#"
-schema_version = 3
+schema_version = 4
 
 [service]
 request_timeout = "30s"
@@ -12841,9 +13273,10 @@ urls = [{pattern:?}]
 "#
             );
             let error = compile(&input).expect_err("an empty path segment must be rejected");
-            assert_eq!(error.path, "policy.rules[0].urls[0]");
+            assert_eq!(error.path().rule_cursor(), Some(0));
+            assert_eq!(error.path().field(), "urls[0]");
             assert!(
-                error.message.contains("empty segment"),
+                error.message().contains("empty segment"),
                 "unexpected error for {pattern}: {error}"
             );
         }
@@ -13656,9 +14089,13 @@ client_cidrs = ["127.0.0.0/8"]
 
     #[cfg(unix)]
     #[test]
-    fn shipped_unix_host_example_compiles_strictly() {
-        compile(include_str!("../../examples/acl-proxy-access-flow.toml"))
-            .expect("shipped Unix host example should remain a strict valid config");
+    fn shipped_unix_host_example_loads_through_the_exact_facade() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/acl-proxy-access-flow.toml");
+        let loaded = super::super::facade::load_and_compile_exact_config(&path)
+            .expect("shipped Unix host example should pass the exact configuration facade");
+        assert_eq!(loaded.metadata.path, path);
+        assert_eq!(loaded.compiled.static_config.schema_version, 4);
     }
 
     #[test]
@@ -13816,7 +14253,7 @@ bind = "[::ffff:0.0.0.0]:8898"
 "#
         );
         let error = compile(&input).expect_err("mapped unspecified control bind must be rejected");
-        assert_eq!(error.path, "control.bind");
+        assert_main_path(&error, "control.bind");
         assert!(error.to_string().contains("unspecified"));
     }
 

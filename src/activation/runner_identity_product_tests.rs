@@ -74,7 +74,7 @@ mode = "{mode}"
         )
     });
     format!(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [service]
 request_timeout = "2s"
@@ -218,7 +218,7 @@ async fn optional_explicit_http_admits_anonymous_requests() {
     fs::write(
         &config_path,
         format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 request_timeout = "2s"
@@ -349,7 +349,7 @@ async fn file_token_rotation_cancels_authenticated_streams_and_websockets() {
     fs::write(
         &config_path,
         format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -663,7 +663,7 @@ mode = "0600"
         fs::write(
             &config_path,
             format!(
-                r#"schema_version = 3
+                r#"schema_version = 4
 
 [service]
 request_timeout = "2s"

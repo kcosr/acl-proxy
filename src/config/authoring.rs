@@ -12,7 +12,7 @@ use super::duration::{seconds, DrainTimeout, PositiveDuration};
 pub(super) struct SchemaVersion;
 
 impl SchemaVersion {
-    pub(super) const NUMBER: u32 = 3;
+    pub(super) const NUMBER: u32 = 4;
 
     pub(super) fn number(self) -> u32 {
         Self::NUMBER
@@ -73,6 +73,13 @@ pub(super) struct AuthoringConfig {
 
     #[serde(default)]
     pub safety: SafetyConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RulesFragmentConfig {
+    pub schema_version: SchemaVersion,
+    pub rules: Vec<PolicyRuleConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1491,7 +1498,7 @@ mod tests {
     use super::*;
 
     const MINIMAL: &str = r#"
-schema_version = 3
+schema_version = 4
 
 [service]
 request_timeout = "30s"
@@ -1712,11 +1719,12 @@ max_trailer_bytes = 11
     }
 
     #[test]
-    fn schema_version_is_integer_three_only() {
+    fn schema_version_is_integer_four_only() {
         for invalid in [
-            MINIMAL.replacen("schema_version = 3", "schema_version = 2", 1),
-            MINIMAL.replacen("schema_version = 3", "schema_version = 4", 1),
-            MINIMAL.replacen("schema_version = 3", "schema_version = \"3\"", 1),
+            MINIMAL.replacen("schema_version = 4", "schema_version = 2", 1),
+            MINIMAL.replacen("schema_version = 4", "schema_version = 3", 1),
+            MINIMAL.replacen("schema_version = 4", "schema_version = 5", 1),
+            MINIMAL.replacen("schema_version = 4", "schema_version = \"4\"", 1),
         ] {
             assert!(toml::from_str::<AuthoringConfig>(&invalid).is_err());
         }

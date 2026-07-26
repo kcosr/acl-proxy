@@ -9,6 +9,7 @@ use super::compiler::{
     HeaderValuePredicatePlan, PolicyPlan, ProviderOutputPlan,
 };
 use super::facade::CompiledConfig;
+use super::provenance::{PolicyProvenance, PolicySourceKind};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct PolicyDump {
@@ -39,6 +40,7 @@ impl PolicyDumpDefaultDecision {
 pub(crate) struct PolicyDumpRule {
     pub(crate) index: usize,
     pub(crate) id: String,
+    pub(crate) source: PolicyDumpSource,
     pub(crate) description: Option<String>,
     pub(crate) decision: PolicyDumpRuleDecision,
     pub(crate) urls: Vec<String>,
@@ -54,6 +56,27 @@ pub(crate) struct PolicyDumpRule {
     pub(crate) request_header_mutations: Vec<PolicyDumpHeaderMutation>,
     pub(crate) response_header_mutations: Vec<PolicyDumpHeaderMutation>,
     pub(crate) credential_mutations: Vec<PolicyDumpCredentialMutation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum PolicyDumpSource {
+    Main {
+        source_rule_index: usize,
+    },
+    Fragment {
+        file: String,
+        source_rule_index: usize,
+    },
+}
+
+impl PolicyDumpSource {
+    fn display_name(&self) -> String {
+        match self {
+            Self::Main { .. } => "main".to_owned(),
+            Self::Fragment { file, .. } => format!("rules.d/{file}"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -178,6 +201,8 @@ pub(crate) enum PolicyDumpProviderCredentialOutput {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PolicyDumpTableRow {
     pub(crate) index: usize,
+    pub(crate) rule_id: String,
+    pub(crate) source: String,
     pub(crate) decision: &'static str,
     pub(crate) urls: String,
     pub(crate) methods: String,
@@ -192,7 +217,10 @@ pub(crate) struct PolicyDumpTableRow {
 
 impl PolicyDump {
     pub(crate) fn from_compiled(compiled: &CompiledConfig) -> Self {
-        let mut dump = Self::from_plan(&compiled.reloadable_plan.policy);
+        let mut dump = Self::from_plan(
+            &compiled.reloadable_plan.policy,
+            &compiled.policy_provenance,
+        );
         dump.global_credential_mutations = compiled
             .reloadable_plan
             .egress
@@ -225,7 +253,12 @@ impl PolicyDump {
         dump
     }
 
-    fn from_plan(plan: &PolicyPlan) -> Self {
+    fn from_plan(plan: &PolicyPlan, provenance: &PolicyProvenance) -> Self {
+        assert_eq!(
+            plan.rules.len(),
+            provenance.rules().len(),
+            "compiled policy and provenance must remain exactly aligned"
+        );
         Self {
             default: match plan.default {
                 CompiledDefaultDecision::Allow => PolicyDumpDefaultDecision::Allow,
@@ -236,92 +269,112 @@ impl PolicyDump {
             rules: plan
                 .rules
                 .iter()
+                .zip(provenance.rules())
                 .enumerate()
-                .map(|(index, rule)| PolicyDumpRule {
-                    index,
-                    id: rule.id.clone(),
-                    description: rule.description.clone(),
-                    decision: match rule.decision {
-                        CompiledRuleDecision::Allow => PolicyDumpRuleDecision::Allow,
-                        CompiledRuleDecision::Deny => PolicyDumpRuleDecision::Deny,
-                        CompiledRuleDecision::Delegate => PolicyDumpRuleDecision::Delegate,
-                    },
-                    urls: rule
-                        .urls
-                        .iter()
-                        .map(|pattern| pattern.authored().to_string())
-                        .collect(),
-                    methods: rule.methods.iter().map(ToString::to_string).collect(),
-                    client_cidrs: rule.client_cidrs.iter().map(ToString::to_string).collect(),
-                    identity_states: rule
-                        .identity
-                        .as_ref()
-                        .map_or(&[][..], |identity| identity.states.as_slice())
-                        .iter()
-                        .map(|state| match state {
-                            IdentityState::Disabled => PolicyDumpIdentityState::Disabled,
-                            IdentityState::Anonymous => PolicyDumpIdentityState::Anonymous,
-                            IdentityState::Authenticated => PolicyDumpIdentityState::Authenticated,
-                        })
-                        .collect(),
-                    identity_subjects: rule
-                        .identity
-                        .as_ref()
-                        .map_or(&[][..], |identity| identity.subjects.as_slice())
-                        .iter()
-                        .map(|subject| match subject {
-                            IdentitySubject::Principal { authority, id } => {
-                                PolicyDumpIdentitySubject::Principal {
-                                    authority: authority.as_str().to_owned(),
-                                    id: id.as_str().to_owned(),
-                                }
-                            }
-                            IdentitySubject::Group { authority, id } => {
-                                PolicyDumpIdentitySubject::Group {
-                                    authority: authority.as_str().to_owned(),
-                                    id: id.as_str().to_owned(),
-                                }
-                            }
-                        })
-                        .collect(),
-                    headers: PolicyDumpHeaderPredicates {
-                        absent_any: rule
-                            .headers
-                            .absent_any
+                .map(|(index, (rule, rule_source))| {
+                    assert_eq!(
+                        rule_source.global_cursor(),
+                        index,
+                        "compiled policy provenance cursor must remain aligned"
+                    );
+                    let source = provenance.source(*rule_source);
+                    PolicyDumpRule {
+                        index,
+                        id: rule.id.clone(),
+                        source: match source {
+                            PolicySourceKind::Main => PolicyDumpSource::Main {
+                                source_rule_index: (*rule_source).source_rule_index(),
+                            },
+                            PolicySourceKind::Fragment { file } => PolicyDumpSource::Fragment {
+                                file: file.clone(),
+                                source_rule_index: (*rule_source).source_rule_index(),
+                            },
+                        },
+                        description: rule.description.clone(),
+                        decision: match rule.decision {
+                            CompiledRuleDecision::Allow => PolicyDumpRuleDecision::Allow,
+                            CompiledRuleDecision::Deny => PolicyDumpRuleDecision::Deny,
+                            CompiledRuleDecision::Delegate => PolicyDumpRuleDecision::Delegate,
+                        },
+                        urls: rule
+                            .urls
                             .iter()
-                            .map(ToString::to_string)
+                            .map(|pattern| pattern.authored().to_string())
                             .collect(),
-                        present_all: rule
-                            .headers
-                            .present_all
+                        methods: rule.methods.iter().map(ToString::to_string).collect(),
+                        client_cidrs: rule.client_cidrs.iter().map(ToString::to_string).collect(),
+                        identity_states: rule
+                            .identity
+                            .as_ref()
+                            .map_or(&[][..], |identity| identity.states.as_slice())
                             .iter()
-                            .map(ToString::to_string)
+                            .map(|state| match state {
+                                IdentityState::Disabled => PolicyDumpIdentityState::Disabled,
+                                IdentityState::Anonymous => PolicyDumpIdentityState::Anonymous,
+                                IdentityState::Authenticated => {
+                                    PolicyDumpIdentityState::Authenticated
+                                }
+                            })
                             .collect(),
-                        all: project_header_predicates(&rule.headers.all),
-                        none: project_header_predicates(&rule.headers.none),
-                    },
-                    request_timeout_ms: rule.request_timeout.map(|timeout| {
-                        u64::try_from(timeout.as_millis())
-                            .expect("validated request timeout must fit in u64 milliseconds")
-                    }),
-                    allow_upgrades: rule.allow_upgrades,
-                    authorization_provider: rule.authorization_provider.clone(),
-                    redaction_profile: rule.redaction_profile.clone(),
-                    request_header_mutations: rule
-                        .request_headers
-                        .iter()
-                        .map(project_header_mutation)
-                        .collect(),
-                    response_header_mutations: rule
-                        .response_headers
-                        .iter()
-                        .map(project_header_mutation)
-                        .collect(),
-                    credential_mutations: rule
-                        .credential_actions
-                        .iter()
-                        .map(project_credential_mutation)
-                        .collect(),
+                        identity_subjects: rule
+                            .identity
+                            .as_ref()
+                            .map_or(&[][..], |identity| identity.subjects.as_slice())
+                            .iter()
+                            .map(|subject| match subject {
+                                IdentitySubject::Principal { authority, id } => {
+                                    PolicyDumpIdentitySubject::Principal {
+                                        authority: authority.as_str().to_owned(),
+                                        id: id.as_str().to_owned(),
+                                    }
+                                }
+                                IdentitySubject::Group { authority, id } => {
+                                    PolicyDumpIdentitySubject::Group {
+                                        authority: authority.as_str().to_owned(),
+                                        id: id.as_str().to_owned(),
+                                    }
+                                }
+                            })
+                            .collect(),
+                        headers: PolicyDumpHeaderPredicates {
+                            absent_any: rule
+                                .headers
+                                .absent_any
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect(),
+                            present_all: rule
+                                .headers
+                                .present_all
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect(),
+                            all: project_header_predicates(&rule.headers.all),
+                            none: project_header_predicates(&rule.headers.none),
+                        },
+                        request_timeout_ms: rule.request_timeout.map(|timeout| {
+                            u64::try_from(timeout.as_millis())
+                                .expect("validated request timeout must fit in u64 milliseconds")
+                        }),
+                        allow_upgrades: rule.allow_upgrades,
+                        authorization_provider: rule.authorization_provider.clone(),
+                        redaction_profile: rule.redaction_profile.clone(),
+                        request_header_mutations: rule
+                            .request_headers
+                            .iter()
+                            .map(project_header_mutation)
+                            .collect(),
+                        response_header_mutations: rule
+                            .response_headers
+                            .iter()
+                            .map(project_header_mutation)
+                            .collect(),
+                        credential_mutations: rule
+                            .credential_actions
+                            .iter()
+                            .map(project_credential_mutation)
+                            .collect(),
+                    }
                 })
                 .collect(),
         }
@@ -332,6 +385,8 @@ impl PolicyDump {
             .iter()
             .map(|rule| PolicyDumpTableRow {
                 index: rule.index,
+                rule_id: rule.id.clone(),
+                source: rule.source.display_name(),
                 decision: rule.decision.as_str(),
                 urls: rule.urls.join(","),
                 methods: rule.methods.join(","),
@@ -555,7 +610,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let marker = directory.path().join("provider-spawned");
         let input = format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [listeners.explicit_http]
 endpoint.kind = "tcp"
@@ -663,6 +718,13 @@ credential = "file_source"
             );
         }
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["rules"][0]["source"],
+            serde_json::json!({
+                "kind": "main",
+                "source_rule_index": 0
+            })
+        );
         let mutations = value["rules"][0]["credential_mutations"]
             .as_array()
             .unwrap();
@@ -684,6 +746,8 @@ credential = "file_source"
         let rows = dump.table_rows();
         assert_eq!(dump.default.as_str(), "deny");
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].rule_id, "delegated");
+        assert_eq!(rows[0].source, "main");
         assert_eq!(rows[0].decision, "delegate");
         assert_eq!(rows[0].urls, "https://example.test/**");
         assert_eq!(rows[0].methods, "GET");
@@ -697,7 +761,7 @@ credential = "file_source"
 
     #[test]
     fn unix_provider_dump_projects_outputs_without_disclosing_socket_path() {
-        let input = r#"schema_version = 3
+        let input = r#"schema_version = 4
 
 [listeners.explicit_http]
 endpoint.kind = "tcp"
@@ -751,7 +815,7 @@ default = "deny"
     #[test]
     fn match_all_pattern_has_a_stable_dump_representation() {
         let compiled = compile_config_text(ConfigTextInput {
-            text: r#"schema_version = 3
+            text: r#"schema_version = 4
 
 [listeners.explicit_http]
 endpoint.kind = "tcp"
@@ -775,5 +839,36 @@ urls = ["**"]
         .unwrap();
 
         assert_eq!(PolicyDump::from_compiled(&compiled).rules[0].urls, ["**"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "compiled policy and provenance must remain exactly aligned")]
+    fn projection_refuses_misaligned_policy_provenance() {
+        let mut compiled = compile_config_text(ConfigTextInput {
+            text: r#"schema_version = 4
+
+[listeners.explicit_http]
+endpoint.kind = "tcp"
+endpoint.address = "127.0.0.1:8881"
+http_versions = ["http1"]
+
+[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "one"
+decision = "deny"
+methods = ["GET"]
+"#,
+            source_path: Path::new("/tmp/acl-proxy.toml"),
+            config_root: Path::new("/tmp"),
+        })
+        .unwrap();
+        compiled.policy_provenance = PolicyProvenance::main_only(0).unwrap();
+
+        let _ = PolicyDump::from_compiled(&compiled);
     }
 }

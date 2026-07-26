@@ -91,7 +91,7 @@ async fn access_flow_and_acl_proxy_binary_round_trip_http_across_the_unix_artifa
     // A local policy response exercises the artifact boundary without disabling
     // ACL Proxy's production guard against dialing a fake loopback origin.
     let config = format!(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [service]
 request_timeout = "5s"

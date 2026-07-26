@@ -1162,7 +1162,7 @@ mod tests {
         let [explicit_http, transparent_http, explicit_https, transparent_https, control] =
             addresses;
         let text = format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [service]
 request_timeout = "30s"

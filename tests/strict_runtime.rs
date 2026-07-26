@@ -473,7 +473,7 @@ fn strict_config(
 ) -> String {
     let provider = directory.join("provider.py");
     format!(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -855,7 +855,7 @@ fn unix_authorization_config(
     missing_error_socket: &Path,
 ) -> String {
     format!(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [service]
 request_timeout = "5s"

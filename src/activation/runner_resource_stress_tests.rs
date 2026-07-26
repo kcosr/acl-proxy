@@ -50,7 +50,7 @@ const EXTERNAL_TOKIO_WORKER_THREADS: &str = "4";
 
 #[derive(Clone, Copy, Debug)]
 struct ProcessSample {
-    file_descriptors: usize,
+    file_descriptors: Option<usize>,
     rss_bytes: u64,
     active_origin_sockets: usize,
     data_address: SocketAddr,
@@ -485,6 +485,8 @@ async fn serve_h2_origin_connection_with_hook(
         .expect("H2 origin connection failed")
         .expect("H2 origin closed before its request");
     let cancelled = request.uri().path().contains("/cancel/");
+    // Release the fixture's receive handle before passively awaiting peer shutdown.
+    drop(request);
     let driver = tokio::spawn(async move {
         if let Some(Ok(_)) = connection.accept().await {
             panic!("H2 origin connection received more than one request");
@@ -672,7 +674,7 @@ fn deterministic_bytes(length: usize, salt: u8) -> Vec<u8> {
 
 fn stress_config(bind: SocketAddr, origins: &StressOrigins) -> String {
     format!(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [service]
 request_timeout = "25s"
@@ -843,7 +845,9 @@ async fn h2_clients(proxy: SocketAddr, origin: SocketAddr, batch: usize) {
         let (response, _) = sender.send_request(request, true).unwrap();
         let response_heads = Arc::clone(&response_heads);
         responses.push(tokio::spawn(async move {
-            let response = response.await.unwrap_or_else(|error| {
+            let response = response.await;
+            response_heads.wait().await;
+            let response = response.unwrap_or_else(|error| {
                 panic!("H2 stress response head failed for batch {batch} stream {index} ({mode}): {error}")
             });
             assert_eq!(
@@ -851,7 +855,6 @@ async fn h2_clients(proxy: SocketAddr, origin: SocketAddr, batch: usize) {
                 StatusCode::OK,
                 "H2 stress response failed for batch {batch} stream {index} ({mode})"
             );
-            response_heads.wait().await;
             let mut body = response.into_body();
             let expected_prefix = if cancelled {
                 H2_INITIAL_WINDOW_BYTES
@@ -889,9 +892,17 @@ async fn h2_clients(proxy: SocketAddr, origin: SocketAddr, batch: usize) {
         }));
     }
     response_heads.wait().await;
+    let mut failures = Vec::new();
     for response in responses {
-        response.await.unwrap();
+        if let Err(error) = response.await {
+            failures.push(error.to_string());
+        }
     }
+    assert!(
+        failures.is_empty(),
+        "H2 stress stream tasks failed: {}",
+        failures.join("; ")
+    );
     drop(sender);
     connection.abort();
     let result = tokio::time::timeout(Duration::from_secs(3), connection)
@@ -1015,10 +1026,12 @@ fn prebound_listener() -> (SocketAddr, StdTcpListener) {
 }
 
 #[cfg(target_os = "linux")]
-fn process_fd_count(pid: u32) -> usize {
-    std::fs::read_dir(format!("/proc/{pid}/fd"))
-        .unwrap_or_else(|error| panic!("could not sample child file descriptors: {error}"))
-        .count()
+fn process_fd_count(pid: u32) -> Option<usize> {
+    match std::fs::read_dir(format!("/proc/{pid}/fd")) {
+        Ok(entries) => Some(entries.count()),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => None,
+        Err(error) => panic!("could not sample child file descriptors: {error}"),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1063,7 +1076,7 @@ fn ordinary_least_squares_slope(samples: &[ProcessSample]) -> f64 {
 }
 
 fn assert_process_envelope(
-    baseline_fds: usize,
+    baseline_fds: Option<usize>,
     data_address: SocketAddr,
     samples: &[ProcessSample],
 ) {
@@ -1078,13 +1091,29 @@ fn assert_process_envelope(
     assert!(samples.iter().all(|sample| sample.child_live));
     let first_rss = samples[0].rss_bytes;
     let final_sample = samples.last().unwrap();
-    assert!(
-        final_sample.file_descriptors <= baseline_fds + FINAL_FD_ALLOWANCE,
-        "final FD count {} exceeded baseline {} plus {}",
-        final_sample.file_descriptors,
-        baseline_fds,
-        FINAL_FD_ALLOWANCE
-    );
+    match baseline_fds {
+        Some(baseline_fds) => {
+            assert!(
+                samples
+                    .iter()
+                    .all(|sample| sample.file_descriptors.is_some()),
+                "FD observability changed during the stress run"
+            );
+            let final_fds = final_sample
+                .file_descriptors
+                .expect("observable baseline requires observable sample FD counts");
+            assert!(
+                final_fds <= baseline_fds + FINAL_FD_ALLOWANCE,
+                "final FD count {final_fds} exceeded baseline {baseline_fds} plus {FINAL_FD_ALLOWANCE}"
+            );
+        }
+        None => assert!(
+            samples
+                .iter()
+                .all(|sample| sample.file_descriptors.is_none()),
+            "/proc FD observation must remain unavailable after a PermissionDenied baseline"
+        ),
+    }
     assert!(
         final_sample.rss_bytes <= first_rss + FINAL_RSS_ALLOWANCE_BYTES,
         "final RSS {} exceeded first measured RSS {} plus {}",
@@ -1204,7 +1233,7 @@ async fn wait_for_listener(child: &mut Child, address: SocketAddr) {
         );
         if let Ok(stream) = tokio::net::TcpStream::connect(address).await {
             drop(stream);
-            if child_owns_listener(child.id(), address) {
+            if listener_is_visible_in_child_network_namespace(child.id(), address) {
                 return;
             }
         }
@@ -1217,7 +1246,7 @@ async fn wait_for_listener(child: &mut Child, address: SocketAddr) {
 }
 
 #[cfg(target_os = "linux")]
-fn child_owns_listener(pid: u32, address: SocketAddr) -> bool {
+fn listener_is_visible_in_child_network_namespace(pid: u32, address: SocketAddr) -> bool {
     let SocketAddr::V4(address) = address else {
         return false;
     };
@@ -1226,27 +1255,16 @@ fn child_owns_listener(pid: u32, address: SocketAddr) -> bool {
         u32::from_le_bytes(address.ip().octets()),
         address.port()
     );
-    let table = match std::fs::read_to_string(format!("/proc/{pid}/net/tcp")) {
-        Ok(table) => table,
-        Err(_) => return false,
-    };
-    let inode = table.lines().skip(1).find_map(|line| {
-        let fields: Vec<_> = line.split_whitespace().collect();
-        (fields.get(1) == Some(&local.as_str()) && fields.get(3) == Some(&"0A"))
-            .then(|| fields.get(9)?.parse::<u64>().ok())
-            .flatten()
-    });
-    let Some(inode) = inode else {
-        return false;
-    };
-    let expected = std::ffi::OsString::from(format!("socket:[{inode}]"));
-    std::fs::read_dir(format!("/proc/{pid}/fd"))
+    std::fs::read_to_string(format!("/proc/{pid}/net/tcp"))
         .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter_map(|entry| std::fs::read_link(entry.path()).ok())
-        .any(|target| target.as_os_str() == expected)
+        .is_some_and(|table| {
+            table.lines().skip(1).any(|line| {
+                let mut fields = line.split_whitespace();
+                fields.nth(1) == Some(local.as_str())
+                    && fields.next().is_some()
+                    && fields.next() == Some("0A")
+            })
+        })
 }
 
 #[cfg(target_os = "linux")]
@@ -1255,8 +1273,13 @@ async fn probe_listener_and_wait_for_fd_quiescence(pid: u32, address: SocketAddr
     let stream = tokio::net::TcpStream::connect(address)
         .await
         .expect("stress listener probe failed");
+    let Some(before) = before else {
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        return;
+    };
     tokio::time::timeout(QUIESCENCE_TIMEOUT, async {
-        while process_fd_count(pid) <= before {
+        while process_fd_count(pid).is_some_and(|count| count <= before) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
@@ -1264,7 +1287,7 @@ async fn probe_listener_and_wait_for_fd_quiescence(pid: u32, address: SocketAddr
     .expect("stress child did not accept its listener probe");
     drop(stream);
     tokio::time::timeout(QUIESCENCE_TIMEOUT, async {
-        while process_fd_count(pid) > before {
+        while process_fd_count(pid).is_some_and(|count| count > before) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
@@ -1276,21 +1299,21 @@ async fn probe_listener_and_wait_for_fd_quiescence(pid: u32, address: SocketAddr
 fn process_resource_thresholds_are_exact_and_non_vacuous() {
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, 1));
     let samples: [ProcessSample; MEASURED_BATCHES] = std::array::from_fn(|index| ProcessSample {
-        file_descriptors: 10 + usize::from(index == MEASURED_BATCHES - 1),
+        file_descriptors: Some(10 + usize::from(index == MEASURED_BATCHES - 1)),
         rss_bytes: 64 * 1024 * 1024 + index as u64 * 512 * 1024,
         active_origin_sockets: 0,
         data_address: address,
         listener_probe_succeeded: true,
         child_live: true,
     });
-    assert_process_envelope(10, address, &samples);
+    assert_process_envelope(Some(10), address, &samples);
     assert!(ordinary_least_squares_slope(&samples) > 0.0);
 
     let rejects = |mutated: [ProcessSample; MEASURED_BATCHES]| {
-        std::panic::catch_unwind(|| assert_process_envelope(10, address, &mutated)).is_err()
+        std::panic::catch_unwind(|| assert_process_envelope(Some(10), address, &mutated)).is_err()
     };
     let mut fd = samples;
-    fd[MEASURED_BATCHES - 1].file_descriptors = 13;
+    fd[MEASURED_BATCHES - 1].file_descriptors = Some(13);
     assert!(rejects(fd));
     let mut rss = samples;
     rss[MEASURED_BATCHES - 1].rss_bytes = rss[0].rss_bytes + FINAL_RSS_ALLOWANCE_BYTES + 1;
@@ -1303,6 +1326,17 @@ fn process_resource_thresholds_are_exact_and_non_vacuous() {
     let mut origin = samples;
     origin[3].active_origin_sockets = 1;
     assert!(rejects(origin));
+
+    let hidden = samples.map(|mut sample| {
+        sample.file_descriptors = None;
+        sample
+    });
+    assert_process_envelope(None, address, &hidden);
+    let mut mixed = hidden;
+    mixed[3].file_descriptors = Some(10);
+    assert!(
+        std::panic::catch_unwind(|| assert_process_envelope(None, address, &mixed)).is_err()
+    );
 }
 
 #[tokio::test]
@@ -1422,7 +1456,7 @@ async fn external_release_candidate_resource_stress_obeys_linux_envelope() {
     let baseline_fds =
         process_sample(pid, origins.active_count(), proxy, false, true).file_descriptors;
     eprintln!(
-        "resource stress child pid={pid} data_address={proxy} tokio_worker_threads={EXTERNAL_TOKIO_WORKER_THREADS} baseline_fds={baseline_fds}"
+        "resource stress child pid={pid} data_address={proxy} tokio_worker_threads={EXTERNAL_TOKIO_WORKER_THREADS} baseline_fds={baseline_fds:?}"
     );
     let mut samples = Vec::with_capacity(MEASURED_BATCHES);
     for measured in 0..MEASURED_BATCHES {
@@ -1433,7 +1467,7 @@ async fn external_release_candidate_resource_stress_obeys_linux_envelope() {
         assert!(child_live, "stress proxy exited during sampling");
         let sample = process_sample(pid, origins.active_count(), proxy, true, child_live);
         eprintln!(
-            "resource stress sample measured={measured} data_address={} listener_probe_succeeded={} child_live={} fds={} rss_bytes={} active_origin_sockets={}",
+            "resource stress sample measured={measured} data_address={} listener_probe_succeeded={} child_live={} fds={:?} rss_bytes={} active_origin_sockets={}",
             sample.data_address,
             sample.listener_probe_succeeded,
             sample.child_live,

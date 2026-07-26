@@ -9,6 +9,7 @@ use http::header::HeaderMap;
 
 use tokio::sync::Notify;
 
+use crate::config::PolicySourceSummary;
 use crate::standalone::StandaloneGenerationPlan;
 
 use super::activation::{BoxFuture, RuntimeError};
@@ -281,6 +282,7 @@ pub(crate) struct ActivatedGeneration {
 
 pub(crate) struct Generation {
     id: GenerationId,
+    policy_source_summary: PolicySourceSummary,
     standalone: StandaloneGenerationPlan,
     request_timeout: Duration,
     max_content_decoding_expansion_ratio: usize,
@@ -310,9 +312,14 @@ impl fmt::Debug for Generation {
 }
 
 impl Generation {
-    pub(super) fn from_activated(id: GenerationId, value: ActivatedGeneration) -> Self {
+    pub(super) fn from_activated_with_source_summary(
+        id: GenerationId,
+        policy_source_summary: PolicySourceSummary,
+        value: ActivatedGeneration,
+    ) -> Self {
         Self {
             id,
+            policy_source_summary,
             standalone: value.standalone,
             request_timeout: value.request_timeout,
             max_content_decoding_expansion_ratio: value.max_content_decoding_expansion_ratio,
@@ -330,6 +337,10 @@ impl Generation {
 
     pub(crate) fn id(&self) -> GenerationId {
         self.id
+    }
+
+    pub(super) fn policy_source_summary(&self) -> &PolicySourceSummary {
+        &self.policy_source_summary
     }
 
     #[cfg(test)]

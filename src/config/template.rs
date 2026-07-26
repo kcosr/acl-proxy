@@ -2,7 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 
-pub(super) const DEFAULT_CONFIG: &str = r#"schema_version = 3
+pub(super) const DEFAULT_CONFIG: &str = r#"schema_version = 4
 
 [service]
 request_timeout = "30s"

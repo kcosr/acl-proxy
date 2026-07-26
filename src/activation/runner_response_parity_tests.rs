@@ -19,7 +19,7 @@ fn response_prebound_listener() -> (SocketAddr, StdTcpListener) {
 
 fn response_base_config(bind: SocketAddr, extra: &str) -> String {
     format!(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [service]
 request_timeout = "5s"

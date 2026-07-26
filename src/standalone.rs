@@ -1661,7 +1661,7 @@ mod tests {
     use crate::egress::EgressActivation;
     use crate::test_certificates::TestTlsIdentity;
 
-    const PLAN: &str = r#"schema_version = 3
+    const PLAN: &str = r#"schema_version = 4
 
 [service]
 request_timeout = "30s"

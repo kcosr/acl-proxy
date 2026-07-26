@@ -83,7 +83,7 @@ fn command() -> Command {
 
 #[test]
 fn policy_dump_defaults_to_stable_secret_free_json_off_tty() {
-    let (_directory, path) = fixture(3);
+    let (_directory, path) = fixture(4);
     let output = command()
         .args(["policy", "dump", "--config"])
         .arg(path)
@@ -108,6 +108,13 @@ fn policy_dump_defaults_to_stable_secret_free_json_off_tty() {
     let rule = &value["rules"][0];
     assert_eq!(rule["index"], 0);
     assert_eq!(rule["id"], "delegated-api");
+    assert_eq!(
+        rule["source"],
+        serde_json::json!({
+            "kind": "main",
+            "source_rule_index": 0
+        })
+    );
     assert_eq!(rule["decision"], "delegate");
     assert_eq!(rule["urls"][0], "https://example.test/api/**");
     assert_eq!(rule["urls"][1], "https://example.test/status");
@@ -131,14 +138,17 @@ fn policy_dump_defaults_to_stable_secret_free_json_off_tty() {
 
 #[test]
 fn policy_dump_table_uses_the_same_compiled_projection() {
-    let (_directory, path) = fixture(3);
+    let (_directory, path) = fixture(4);
     command()
         .args(["policy", "dump", "--format", "table", "--config"])
         .arg(path)
         .assert()
         .success()
-        .stdout(contains("Default action: deny"))
-        .stdout(contains("INDEX\tDECISION\tURLS"))
+        .stdout(contains("Default action: deny (source: main)"))
+        .stdout(contains(
+            "INDEX\tRULE_ID\tSOURCE\tDECISION\tURLS\tMETHODS\tCLIENT_CIDRS\tIDENTITY_PREDICATES\tHEADER_PREDICATES\tDESCRIPTION\tAUTHORIZATION_PROVIDER\tREDACTION_PROFILE\tMUTATIONS",
+        ))
+        .stdout(contains("0\tdelegated-api\tmain\tdelegate"))
         .stdout(contains(
             "https://example.test/api/**,https://example.test/status",
         ))
@@ -154,8 +164,93 @@ fn policy_dump_table_uses_the_same_compiled_projection() {
 }
 
 #[test]
+fn fragment_policy_dump_uses_basename_provenance_in_json_and_table_order() {
+    let (directory, path) = fixture(4);
+    let rules = directory.path().join("rules.d");
+    fs::create_dir(&rules).unwrap();
+    fs::write(
+        rules.join("10-fragment.toml"),
+        r#"schema_version = 4
+
+[[rules]]
+id = "fragment-first"
+decision = "deny"
+urls = ["https://fragment.test/first"]
+
+[[rules]]
+id = "fragment-second"
+decision = "allow"
+urls = ["https://fragment.test/second"]
+"#,
+    )
+    .unwrap();
+
+    let output = command()
+        .args(["policy", "dump", "--format", "json", "--config"])
+        .arg(&path)
+        .output()
+        .expect("run fragment policy dump");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !stdout.contains(directory.path().to_str().unwrap()),
+        "dump disclosed its absolute configuration root: {stdout}"
+    );
+    let value: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["default"], "deny");
+    assert_eq!(value["rules"].as_array().unwrap().len(), 3);
+    assert_eq!(value["rules"][0]["id"], "fragment-first");
+    assert_eq!(
+        value["rules"][0]["source"],
+        serde_json::json!({
+            "kind": "fragment",
+            "file": "10-fragment.toml",
+            "source_rule_index": 0
+        })
+    );
+    assert_eq!(value["rules"][1]["id"], "fragment-second");
+    assert_eq!(
+        value["rules"][1]["source"],
+        serde_json::json!({
+            "kind": "fragment",
+            "file": "10-fragment.toml",
+            "source_rule_index": 1
+        })
+    );
+    assert_eq!(value["rules"][2]["id"], "delegated-api");
+    assert_eq!(
+        value["rules"][2]["source"],
+        serde_json::json!({
+            "kind": "main",
+            "source_rule_index": 0
+        })
+    );
+    assert!(
+        value.get("source").is_none(),
+        "the default must not become a pseudo-rule with provenance"
+    );
+
+    command()
+        .args(["policy", "dump", "--format", "table", "--config"])
+        .arg(path)
+        .assert()
+        .success()
+        .stdout(contains(
+            "0\tfragment-first\trules.d/10-fragment.toml\tdeny",
+        ))
+        .stdout(contains(
+            "1\tfragment-second\trules.d/10-fragment.toml\tallow",
+        ))
+        .stdout(contains("2\tdelegated-api\tmain\tdelegate"));
+}
+
+#[test]
 fn explicit_json_format_is_machine_readable() {
-    let (_directory, path) = fixture(3);
+    let (_directory, path) = fixture(4);
     let output = command()
         .args(["policy", "dump", "--format", "json", "--config"])
         .arg(path)
@@ -167,13 +262,13 @@ fn explicit_json_format_is_machine_readable() {
 }
 
 #[test]
-fn policy_dump_rejects_non_schema_three_without_fallback() {
+fn policy_dump_rejects_non_schema_four_without_fallback() {
     let (_directory, path) = fixture(2);
     command()
         .args(["policy", "dump", "--config"])
         .arg(path)
         .assert()
         .failure()
-        .stderr(contains("strict schema v3 TOML"))
+        .stderr(contains("strict schema v4 TOML"))
         .stderr(contains("invalid value"));
 }

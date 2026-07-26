@@ -210,7 +210,7 @@ fn parent_config(
     origin_certificate: &Path,
 ) -> String {
     format!(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -290,7 +290,7 @@ rules = [{ literals = ["password"], payloads = "both" }]
         ""
     };
     format!(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [service]
 request_timeout = "5s"
@@ -636,7 +636,7 @@ async fn production_compressed_telemetry_body_compatibility() {
     let (proxy, listener) = prebound_listener();
     let config_path = product_directory.join("acl-proxy.toml");
     let config = format!(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [service]
 request_timeout = "5s"

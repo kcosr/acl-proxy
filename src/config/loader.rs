@@ -1,17 +1,21 @@
 use std::env;
 use std::ffi::OsStr;
 use std::fmt;
-use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
 
-use super::authoring::AuthoringConfig;
+use super::authoring::{AuthoringConfig, RulesFragmentConfig};
+use super::provenance::{
+    PolicyProvenance, PolicyProvenanceBuilder, PolicySourceSummary, ProvenanceError,
+};
+use super::source_snapshot::{self, LoadSourcesError, SourceRef};
 
 const CONFIG_PATH_ENV: &str = "ACL_PROXY_CONFIG";
 const DEFAULT_CONFIG_PATH: &str = "config/acl-proxy.toml";
-const MAX_CONFIG_BYTES: usize = 10 * 1024 * 1024;
+const MAX_CONFIG_BYTES: usize = source_snapshot::MAX_MAIN_BYTES;
+const MAX_COMPOSED_POLICY_RULES: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfigPathSource {
@@ -29,6 +33,8 @@ pub(super) struct SelectedConfigPath {
 #[derive(Debug)]
 pub(super) struct LoadedConfig {
     pub authored: AuthoringConfig,
+    pub provenance: PolicyProvenance,
+    pub source_summary: PolicySourceSummary,
     pub path: PathBuf,
     pub config_root: PathBuf,
     pub path_source: ConfigPathSource,
@@ -95,45 +101,55 @@ pub(super) enum ConfigLoadError {
         source: io::Error,
     },
 
-    #[error("configuration path {path} does not name a file with a parent directory")]
-    InvalidPath { path: PathBuf },
+    #[error("selected configuration path does not name a main file with a parent directory")]
+    InvalidPath,
 
-    #[error("failed to open configuration file {path}: {source}")]
-    Open {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
+    #[error("main exceeds the {max_bytes}-byte limit")]
+    TooLarge { max_bytes: usize },
 
-    #[error("failed to read configuration file {path}: {source}")]
-    Read {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
+    #[error("main is not valid UTF-8 at byte {valid_up_to}")]
+    InvalidUtf8 { valid_up_to: usize },
 
-    #[error("configuration file {path} exceeds the {max_bytes}-byte limit")]
-    TooLarge { path: PathBuf, max_bytes: usize },
+    #[error("main is not valid strict schema v4 TOML: {diagnostic}")]
+    ParseToml { diagnostic: SanitizedTomlDiagnostic },
 
-    #[error("configuration file {path} is not valid UTF-8 at byte {valid_up_to}")]
-    InvalidUtf8 { path: PathBuf, valid_up_to: usize },
-
-    #[error("configuration file {path} is not valid strict schema v3 TOML: {diagnostic}")]
-    ParseToml {
-        path: PathBuf,
+    #[error("{source_name} is not valid strict schema v4 TOML: {diagnostic}")]
+    ParseFragmentToml {
+        source_name: String,
         diagnostic: SanitizedTomlDiagnostic,
     },
 
-    #[error(
-        "configuration file {path} uses the removed data-listener field `bind`; use `endpoint = {{ kind = \"tcp\", address = \"127.0.0.1:8881\" }}` instead"
-    )]
-    LegacyListenerBind { path: PathBuf },
+    #[error("{source_name} is not valid UTF-8 at byte {valid_up_to}")]
+    InvalidFragmentUtf8 {
+        source_name: String,
+        valid_up_to: usize,
+    },
+
+    #[error("{source_name} must contain at least one rule")]
+    EmptyFragment { source_name: String },
+
+    #[error("failed to obtain a stable configuration source snapshot: {source}")]
+    Snapshot {
+        #[source]
+        source: source_snapshot::SourceSnapshotError,
+    },
+
+    #[error("failed to compose policy source provenance: {source}")]
+    Provenance {
+        #[source]
+        source: ProvenanceError,
+    },
+
+    #[error("composed policy exceeds the {max_rules}-rule limit")]
+    TooManyPolicyRules { max_rules: usize },
 
     #[error(
-        "configuration file {path} uses removed configuration surface `{surface}`; {replacement}"
+        "main uses the removed data-listener field `bind`; use `endpoint = {{ kind = \"tcp\", address = \"127.0.0.1:8881\" }}` instead"
     )]
+    LegacyListenerBind,
+
+    #[error("main uses removed configuration surface `{surface}`; {replacement}")]
     RemovedConfigSurface {
-        path: PathBuf,
         surface: String,
         replacement: &'static str,
     },
@@ -156,9 +172,7 @@ pub(super) fn load_config(explicit_path: Option<&Path>) -> Result<LoadedConfig, 
 
 pub(super) fn load_exact_config(path: &Path) -> Result<LoadedConfig, ConfigLoadError> {
     if !path.is_absolute() {
-        return Err(ConfigLoadError::InvalidPath {
-            path: path.to_path_buf(),
-        });
+        return Err(ConfigLoadError::InvalidPath);
     }
     load_selected_config(
         SelectedConfigPath {
@@ -198,48 +212,154 @@ fn load_selected_config(
     let path = absolute_normalized_path(&selected.path, current_dir);
     let config_root = path
         .parent()
-        .ok_or_else(|| ConfigLoadError::InvalidPath { path: path.clone() })?
+        .ok_or(ConfigLoadError::InvalidPath)?
         .to_path_buf();
 
-    let bytes = read_bounded(&path)?;
-    let text = std::str::from_utf8(&bytes).map_err(|source| ConfigLoadError::InvalidUtf8 {
-        path: path.clone(),
-        valid_up_to: source.valid_up_to(),
+    let mut authored = None;
+    let mut fragment_rules = Vec::new();
+    let mut provenance =
+        PolicyProvenanceBuilder::new().map_err(|source| ConfigLoadError::Provenance { source })?;
+    let source_summary = source_snapshot::load_sources(&path, |source, bytes| match source {
+        SourceRef::Main => {
+            let text =
+                std::str::from_utf8(bytes).map_err(|source| ConfigLoadError::InvalidUtf8 {
+                    valid_up_to: source.valid_up_to(),
+                })?;
+            authored = Some(parse_config_text(text, &path)?);
+            Ok(())
+        }
+        SourceRef::Fragment(name) => {
+            let source_name = format!("rules.d/{}", name.as_str());
+            let text = std::str::from_utf8(bytes).map_err(|source| {
+                ConfigLoadError::InvalidFragmentUtf8 {
+                    source_name: source_name.clone(),
+                    valid_up_to: source.valid_up_to(),
+                }
+            })?;
+            let mut fragment = parse_fragment_text(text, &source_name)?;
+            let main_rule_count = authored
+                .as_ref()
+                .map_or(0, |main: &AuthoringConfig| main.policy.rules.len());
+            ensure_incremental_policy_rule_limit(
+                fragment_rules.len(),
+                fragment.rules.len(),
+                main_rule_count,
+            )?;
+            fragment_rules
+                .try_reserve(fragment.rules.len())
+                .map_err(|_| ConfigLoadError::Provenance {
+                    source: ProvenanceError::Allocation,
+                })?;
+            let source_id = provenance
+                .add_fragment(name.as_str())
+                .map_err(|source| ConfigLoadError::Provenance { source })?;
+            provenance
+                .append_fragment_rules(source_id, fragment.rules.len())
+                .map_err(|source| ConfigLoadError::Provenance { source })?;
+            fragment_rules.append(&mut fragment.rules);
+            Ok(())
+        }
+    })
+    .map_err(|source| match source {
+        LoadSourcesError::Snapshot(source) => ConfigLoadError::Snapshot { source },
+        LoadSourcesError::Consumer(source) => source,
     })?;
-    let authored = parse_config_text(text, &path)?;
+    let mut authored = authored.ok_or(ConfigLoadError::Snapshot {
+        source: source_snapshot::SourceSnapshotError::MissingMain,
+    })?;
+    let main_rule_count = authored.policy.rules.len();
+    let total_rule_count = ensure_final_policy_rule_limit(fragment_rules.len(), main_rule_count)?;
+    fragment_rules
+        .try_reserve(main_rule_count)
+        .map_err(|_| ConfigLoadError::Provenance {
+            source: ProvenanceError::Allocation,
+        })?;
+    provenance
+        .append_main_rules(main_rule_count)
+        .map_err(|source| ConfigLoadError::Provenance { source })?;
+    fragment_rules.append(&mut authored.policy.rules);
+    authored.policy.rules = fragment_rules;
+    let fragment_rule_count = total_rule_count - main_rule_count;
+    let source_summary =
+        PolicySourceSummary::new(source_summary, fragment_rule_count, main_rule_count)
+            .map_err(|source| ConfigLoadError::Provenance { source })?;
+    let provenance = provenance
+        .finish(total_rule_count)
+        .map_err(|source| ConfigLoadError::Provenance { source })?;
 
     Ok(LoadedConfig {
         authored,
+        provenance,
+        source_summary,
         path,
         config_root,
         path_source: selected.source,
     })
 }
 
+fn ensure_incremental_policy_rule_limit(
+    existing_fragment_rules: usize,
+    incoming_fragment_rules: usize,
+    main_rules: usize,
+) -> Result<usize, ConfigLoadError> {
+    let fragment_rules = existing_fragment_rules.checked_add(incoming_fragment_rules);
+    ensure_policy_rule_limit(fragment_rules.and_then(|count| count.checked_add(main_rules)))
+}
+
+fn ensure_final_policy_rule_limit(
+    fragment_rules: usize,
+    main_rules: usize,
+) -> Result<usize, ConfigLoadError> {
+    ensure_policy_rule_limit(fragment_rules.checked_add(main_rules))
+}
+
+fn ensure_policy_rule_limit(count: Option<usize>) -> Result<usize, ConfigLoadError> {
+    match count {
+        Some(count) if count <= MAX_COMPOSED_POLICY_RULES => Ok(count),
+        Some(_) | None => Err(ConfigLoadError::TooManyPolicyRules {
+            max_rules: MAX_COMPOSED_POLICY_RULES,
+        }),
+    }
+}
+
+fn parse_fragment_text(
+    text: &str,
+    source_name: &str,
+) -> Result<RulesFragmentConfig, ConfigLoadError> {
+    let fragment = toml::from_str::<RulesFragmentConfig>(text).map_err(|source| {
+        ConfigLoadError::ParseFragmentToml {
+            source_name: source_name.to_owned(),
+            diagnostic: sanitize_toml_error(text, &source),
+        }
+    })?;
+    let _ = fragment.schema_version.number();
+    if fragment.rules.is_empty() {
+        return Err(ConfigLoadError::EmptyFragment {
+            source_name: source_name.to_owned(),
+        });
+    }
+    Ok(fragment)
+}
+
 pub(super) fn parse_config_text(
     text: &str,
-    path: &Path,
+    _path: &Path,
 ) -> Result<AuthoringConfig, ConfigLoadError> {
     if text.len() > MAX_CONFIG_BYTES {
         return Err(ConfigLoadError::TooLarge {
-            path: path.to_path_buf(),
             max_bytes: MAX_CONFIG_BYTES,
         });
     }
     toml::from_str(text).map_err(|source| {
         if let Some((surface, replacement)) = removed_config_surface(text) {
             ConfigLoadError::RemovedConfigSurface {
-                path: path.to_path_buf(),
                 surface,
                 replacement,
             }
         } else if contains_legacy_listener_bind(text) {
-            ConfigLoadError::LegacyListenerBind {
-                path: path.to_path_buf(),
-            }
+            ConfigLoadError::LegacyListenerBind
         } else {
             ConfigLoadError::ParseToml {
-                path: path.to_path_buf(),
                 diagnostic: sanitize_toml_error(text, &source),
             }
         }
@@ -372,27 +492,6 @@ fn toml_location(text: &str, byte_offset: usize) -> TomlLocation {
     TomlLocation { line, column }
 }
 
-fn read_bounded(path: &Path) -> Result<Vec<u8>, ConfigLoadError> {
-    let file = File::open(path).map_err(|source| ConfigLoadError::Open {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let mut bytes = Vec::new();
-    file.take((MAX_CONFIG_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|source| ConfigLoadError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    if bytes.len() > MAX_CONFIG_BYTES {
-        return Err(ConfigLoadError::TooLarge {
-            path: path.to_path_buf(),
-            max_bytes: MAX_CONFIG_BYTES,
-        });
-    }
-    Ok(bytes)
-}
-
 fn absolute_normalized_path(path: &Path, current_dir: &Path) -> PathBuf {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -422,14 +521,18 @@ fn absolute_normalized_path(path: &Path, current_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::fs::File;
     use std::io::{Seek, SeekFrom, Write};
+    #[cfg(unix)]
+    use std::os::unix::fs::{symlink, MetadataExt};
 
     use tempfile::tempdir;
 
     use super::*;
+    use crate::config::source_snapshot::RulesDirectoryState;
 
     const MINIMAL_CONFIG: &str = r#"
-schema_version = 3
+schema_version = 4
 
 [listeners.explicit_http]
 endpoint.kind = "tcp"
@@ -549,9 +652,11 @@ literal_environment_variables = ["MISSING_CONFIG_LOADER_REDACTION_SECRET"]
         let error = load_path(&config_path).unwrap_err();
         assert!(matches!(
             error,
-            ConfigLoadError::TooLarge {
-                max_bytes: MAX_CONFIG_BYTES,
-                ..
+            ConfigLoadError::Snapshot {
+                source: source_snapshot::SourceSnapshotError::TooLarge {
+                    max_bytes: MAX_CONFIG_BYTES,
+                    ..
+                }
             }
         ));
     }
@@ -580,12 +685,12 @@ literal_environment_variables = ["MISSING_CONFIG_LOADER_REDACTION_SECRET"]
     }
 
     #[test]
-    fn strict_deserialization_rejects_non_v3_and_unknown_fields() {
+    fn strict_deserialization_rejects_non_v4_and_unknown_fields() {
         let directory = tempdir().unwrap();
         let config_path = directory.path().join("invalid.toml");
         fs::write(
             &config_path,
-            MINIMAL_CONFIG.replace("schema_version = 3", "schema_version = 2"),
+            MINIMAL_CONFIG.replace("schema_version = 4", "schema_version = 2"),
         )
         .unwrap();
         let wrong_version = load_path(&config_path).unwrap_err();
@@ -606,10 +711,7 @@ literal_environment_variables = ["MISSING_CONFIG_LOADER_REDACTION_SECRET"]
         )
         .unwrap();
         let legacy_bind = load_path(&config_path).unwrap_err();
-        assert!(matches!(
-            legacy_bind,
-            ConfigLoadError::LegacyListenerBind { .. }
-        ));
+        assert!(matches!(legacy_bind, ConfigLoadError::LegacyListenerBind));
         assert!(legacy_bind
             .to_string()
             .contains("endpoint = { kind = \"tcp\""));
@@ -678,6 +780,39 @@ identity_state = "authenticated"
     }
 
     #[test]
+    fn rejected_main_diagnostics_never_disclose_the_selected_absolute_path() {
+        let directory = tempdir().unwrap();
+        let config_path = directory.path().join("private-config-root/acl-proxy.toml");
+        fs::create_dir(config_path.parent().unwrap()).unwrap();
+        let cases = vec![
+            vec![0xff],
+            b"schema_version = \"unterminated".to_vec(),
+            MINIMAL_CONFIG
+                .replace(
+                    "endpoint.kind = \"tcp\"\nendpoint.address = \"127.0.0.1:8881\"",
+                    "bind = \"127.0.0.1:8881\"",
+                )
+                .into_bytes(),
+            MINIMAL_CONFIG
+                .replace(
+                    "endpoint.kind = \"tcp\"",
+                    "endpoint.kind = \"unix_proxy_v2\"",
+                )
+                .into_bytes(),
+        ];
+
+        for contents in cases {
+            fs::write(&config_path, &contents).unwrap();
+            let rendered = load_path(&config_path).unwrap_err().to_string();
+            assert!(rendered.contains("main"), "{rendered}");
+            assert!(
+                !rendered.contains(directory.path().to_str().unwrap()),
+                "{rendered}"
+            );
+        }
+    }
+
+    #[test]
     fn syntax_diagnostic_does_not_disclose_credential_locator_text() {
         const SECRET_MARKER: &str = "credential-locator-secret-9f1b7c";
 
@@ -723,13 +858,234 @@ rules = [{{ literals = "{SECRET_MARKER}" }}]
     }
 
     #[test]
-    fn io_errors_include_the_selected_absolute_path() {
+    fn io_errors_identify_the_main_source_without_disclosing_host_paths() {
         let directory = tempdir().unwrap();
         let config_path = directory.path().join("missing.toml");
 
         let error = load_path(&config_path).unwrap_err();
-        assert!(matches!(error, ConfigLoadError::Open { .. }));
-        assert!(error.to_string().contains(config_path.to_str().unwrap()));
+        assert!(matches!(error, ConfigLoadError::Snapshot { .. }));
+        assert!(error.to_string().contains("main"));
+        assert!(!error.to_string().contains(config_path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn fragments_are_strict_and_precede_main_rules_in_ascii_order() {
+        let directory = tempdir().unwrap();
+        let config_path = directory.path().join("acl-proxy.toml");
+        let rules_path = directory.path().join("rules.d");
+        fs::create_dir(&rules_path).unwrap();
+        fs::write(
+            &config_path,
+            MINIMAL_CONFIG.replace(
+                "[policy]",
+                "[[policy.rules]]\nid = \"main\"\ndecision = \"deny\"\n\n[policy]",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            rules_path.join("10-second.toml"),
+            "schema_version = 4\n[[rules]]\nid = \"second\"\ndecision = \"deny\"\n",
+        )
+        .unwrap();
+        fs::write(
+            rules_path.join("02-first.toml"),
+            "schema_version = 4\n[[rules]]\nid = \"first\"\ndecision = \"deny\"\n",
+        )
+        .unwrap();
+
+        let loaded = load_path(&config_path).unwrap();
+        let ids = loaded
+            .authored
+            .policy
+            .rules
+            .iter()
+            .map(|rule| rule.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["first", "second", "main"]);
+        assert_eq!(loaded.provenance.rules().len(), 3);
+        assert_eq!(loaded.provenance.source_count(), 3);
+        assert_eq!(
+            loaded
+                .provenance
+                .resolve_cursor(0)
+                .unwrap()
+                .0
+                .display_name(),
+            "rules.d/02-first.toml"
+        );
+        assert_eq!(
+            loaded
+                .provenance
+                .resolve_cursor(2)
+                .unwrap()
+                .0
+                .display_name(),
+            "main"
+        );
+        assert_eq!(loaded.source_summary.fragment_count, 2);
+        assert_eq!(loaded.source_summary.fragment_rule_count, 2);
+        assert_eq!(loaded.source_summary.main_rule_count, 1);
+        assert_eq!(loaded.source_summary.total_rule_count, 3);
+        assert_eq!(
+            loaded.source_summary.rules_directory,
+            RulesDirectoryState::Populated
+        );
+    }
+
+    #[test]
+    fn missing_and_empty_rules_directories_are_distinguished() {
+        let directory = tempdir().unwrap();
+        let config_path = directory.path().join("acl-proxy.toml");
+        fs::write(&config_path, MINIMAL_CONFIG).unwrap();
+        let missing = load_path(&config_path).unwrap();
+        assert_eq!(
+            missing.source_summary.rules_directory,
+            RulesDirectoryState::Missing
+        );
+
+        fs::create_dir(directory.path().join("rules.d")).unwrap();
+        let empty = load_path(&config_path).unwrap();
+        assert_eq!(
+            empty.source_summary.rules_directory,
+            RulesDirectoryState::Empty
+        );
+    }
+
+    #[test]
+    fn fragments_reject_unknown_fields_wrong_schema_and_empty_rules() {
+        let directory = tempdir().unwrap();
+        let config_path = directory.path().join("acl-proxy.toml");
+        let rules_path = directory.path().join("rules.d");
+        fs::create_dir(&rules_path).unwrap();
+        fs::write(&config_path, MINIMAL_CONFIG).unwrap();
+        let fragment_path = rules_path.join("10-policy.toml");
+
+        fs::write(&fragment_path, "schema_version = 3\nrules = []\n").unwrap();
+        assert!(matches!(
+            load_path(&config_path).unwrap_err(),
+            ConfigLoadError::ParseFragmentToml { .. }
+        ));
+
+        fs::write(&fragment_path, "schema_version = 4\nrules = []\n").unwrap();
+        assert!(matches!(
+            load_path(&config_path).unwrap_err(),
+            ConfigLoadError::EmptyFragment { .. }
+        ));
+
+        fs::write(
+            &fragment_path,
+            "schema_version = 4\nextra = true\n[[rules]]\nid = \"x\"\ndecision = \"deny\"\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            load_path(&config_path).unwrap_err(),
+            ConfigLoadError::ParseFragmentToml { .. }
+        ));
+    }
+
+    #[test]
+    fn unexpected_names_and_ascii_case_collisions_fail_the_snapshot() {
+        let directory = tempdir().unwrap();
+        let config_path = directory.path().join("acl-proxy.toml");
+        let rules_path = directory.path().join("rules.d");
+        fs::create_dir(&rules_path).unwrap();
+        fs::write(&config_path, MINIMAL_CONFIG).unwrap();
+        fs::write(rules_path.join(".editor.tmp"), "").unwrap();
+        let error = load_path(&config_path).unwrap_err();
+        assert!(matches!(error, ConfigLoadError::Snapshot { .. }));
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains(".editor.tmp"), "{diagnostic}");
+        assert!(
+            !diagnostic.contains(directory.path().to_str().unwrap()),
+            "{diagnostic}"
+        );
+        fs::remove_file(rules_path.join(".editor.tmp")).unwrap();
+        for name in ["10-Users.toml", "10-users.toml"] {
+            fs::write(
+                rules_path.join(name),
+                "schema_version = 4\n[[rules]]\nid = \"x\"\ndecision = \"deny\"\n",
+            )
+            .unwrap();
+        }
+        let error = load_path(&config_path).unwrap_err();
+        assert!(error.to_string().contains("ASCII case folding"), "{error}");
+    }
+
+    #[test]
+    fn incremental_fragment_rule_limit_checks_boundary_and_overflow() {
+        assert_eq!(
+            ensure_incremental_policy_rule_limit(MAX_COMPOSED_POLICY_RULES - 2, 1, 1).unwrap(),
+            MAX_COMPOSED_POLICY_RULES
+        );
+        assert!(matches!(
+            ensure_incremental_policy_rule_limit(MAX_COMPOSED_POLICY_RULES - 2, 2, 1),
+            Err(ConfigLoadError::TooManyPolicyRules {
+                max_rules: MAX_COMPOSED_POLICY_RULES
+            })
+        ));
+        assert!(matches!(
+            ensure_incremental_policy_rule_limit(usize::MAX, 1, 0),
+            Err(ConfigLoadError::TooManyPolicyRules {
+                max_rules: MAX_COMPOSED_POLICY_RULES
+            })
+        ));
+    }
+
+    #[test]
+    fn final_rule_limit_checks_main_only_boundary_and_overflow() {
+        assert_eq!(
+            ensure_final_policy_rule_limit(0, MAX_COMPOSED_POLICY_RULES).unwrap(),
+            MAX_COMPOSED_POLICY_RULES
+        );
+        assert!(matches!(
+            ensure_final_policy_rule_limit(0, MAX_COMPOSED_POLICY_RULES + 1),
+            Err(ConfigLoadError::TooManyPolicyRules {
+                max_rules: MAX_COMPOSED_POLICY_RULES
+            })
+        ));
+        assert!(matches!(
+            ensure_final_policy_rule_limit(1, usize::MAX),
+            Err(ConfigLoadError::TooManyPolicyRules {
+                max_rules: MAX_COMPOSED_POLICY_RULES
+            })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_directory_fifo_and_hard_link_entries_are_rejected_without_blocking() {
+        let directory = tempdir().unwrap();
+        let config_path = directory.path().join("acl-proxy.toml");
+        let rules_path = directory.path().join("rules.d");
+        fs::create_dir(&rules_path).unwrap();
+        fs::write(&config_path, MINIMAL_CONFIG).unwrap();
+        let target = directory.path().join("target.toml");
+        fs::write(
+            &target,
+            "schema_version = 4\n[[rules]]\nid = \"x\"\ndecision = \"deny\"\n",
+        )
+        .unwrap();
+
+        symlink(&target, rules_path.join("10-policy.toml")).unwrap();
+        assert!(load_path(&config_path).is_err());
+        fs::remove_file(rules_path.join("10-policy.toml")).unwrap();
+
+        fs::create_dir(rules_path.join("10-policy.toml")).unwrap();
+        assert!(load_path(&config_path).is_err());
+        fs::remove_dir(rules_path.join("10-policy.toml")).unwrap();
+
+        fs::hard_link(&target, rules_path.join("10-policy.toml")).unwrap();
+        assert!(fs::metadata(&target).unwrap().nlink() > 1);
+        assert!(load_path(&config_path).is_err());
+        fs::remove_file(rules_path.join("10-policy.toml")).unwrap();
+
+        let fifo = rules_path.join("10-policy.toml");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(load_path(&config_path).is_err());
     }
 
     fn load_path(path: &Path) -> Result<LoadedConfig, ConfigLoadError> {

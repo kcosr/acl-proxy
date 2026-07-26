@@ -1,4 +1,4 @@
-# Sanitized Production V1 To V3 Difference Record
+# Sanitized Production V1 To V4 Difference Record
 
 ## Scope And Handling
 
@@ -11,7 +11,7 @@ authorities and benchmark network ranges.
 The source files were inventoried read-only. Their byte identities establish
 traceability without retaining their contents:
 
-| Role | Source bytes | Source SHA256 | Sanitized v3 fixture |
+| Role | Source bytes | Source SHA256 | Sanitized v4 fixture |
 | --- | ---: | --- | --- |
 | host TCP | 15,597 | `401d5573e9ee82d1f042e66c15034644741ab297f3e45e88e844bad0943aed00` | `host-proxy-tcp.toml` |
 | host UDS workstation | new topology | not derived from a production source file | `host-proxy-uds.toml` |
@@ -28,7 +28,7 @@ negative tests. They are not production byte copies.
 
 ## Structural Inventory
 
-| Role | V3 rules | V3 patterns | Actions | Scheme intent |
+| Role | V4 rules | V4 patterns | Actions | Scheme intent |
 | --- | ---: | ---: | --- | --- |
 | host TCP | 44 | 133 | 37 allow, 6 deny, 1 delegate | 118 HTTPS, 13 HTTP, 2 catchall |
 | host UDS workstation | 1 | 1 | 1 allow | catchall under fixed workstation identity |
@@ -36,7 +36,7 @@ negative tests. They are not production byte copies.
 | internal container | 8 | 12 | 8 allow | 11 HTTPS, 1 HTTP |
 
 The host fixture has 22 method-constrained rules, no header-predicate rules, and
-4 wire-redaction rules. The v3 fixture preserves source-rule order,
+4 wire-redaction rules. The v4 fixture preserves source-rule order,
 HTTP-versus-HTTPS intent, method boundaries, and provider placement. The host
 adds one CONNECT-only bootstrap rule because parent CONNECT control requests
 intentionally carry no origin identity or context. It also applies mandatory
@@ -46,9 +46,9 @@ below.
 
 ## Authoring And Ownership Changes
 
-| V1 source shape | V3 fixture disposition |
+| V1 source shape | V4 fixture disposition |
 | --- | --- |
-| string schema version and mixed proxy table | integer schema 3 with explicit service, listener, control, MITM, egress, policy, observation, and safety owners |
+| string schema version and mixed proxy table | integer schema 4 with explicit service, listener, control, MITM, egress, policy, observation, and safety owners |
 | implicit listener defaults | explicit 8881 HTTP/CONNECT MITM and 8889 transparent HTTPS listeners |
 | readiness on proxy data plane | loopback control listener on 8898; proxy listeners have no control routes |
 | host-generated CA directory | explicit generated MITM mode |
@@ -102,7 +102,7 @@ private authorization data.
 Stable IDs retain the source role and zero-based source index. Private
 destinations and paths are replaced, but the stated counts apply to each row.
 
-| Source | V3 ID | Decision | Patterns | Preserved intent |
+| Source | V4 ID | Decision | Patterns | Preserved intent |
 | --- | --- | --- | ---: | --- |
 | bootstrap | `prod-host-parent-connect` | allow | 1 | credential-free parent CONNECT from the sanitized container network; inner requests remain fully authorized |
 | 01 | `prod-host-r01-ai-redaction-a` | allow | 4 | AI service group with wire redaction |
@@ -151,7 +151,7 @@ destinations and paths are replaced, but the stated counts apply to each row.
 
 ## Container Rule Map
 
-| Source | V3 ID | Decision | Patterns | Preserved intent |
+| Source | V4 ID | Decision | Patterns | Preserved intent |
 | --- | --- | --- | ---: | --- |
 | common 00 | `prod-common-r00-parent-all` | allow | 1 | all valid URLs forwarded to the acl-proxy parent |
 | internal 00 | `prod-internal-r00-internal-api` | allow | 1 | internal API |
@@ -176,7 +176,7 @@ destinations and paths are replaced, but the stated counts apply to each row.
 
 ## Required Integration Assertions
 
-1. Parse the four v3 fixtures through `AuthoringConfig` and compile them with temporary
+1. Parse the four v4 fixtures through `AuthoringConfig` and compile them with temporary
    CA files and five deterministic redaction environment values.
 2. Reject all three sanitized v1 shapes through the strict runtime and CLI.
 3. Assert the exact rule IDs, counts, pattern counts, method sets, wildcard

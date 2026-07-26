@@ -24,8 +24,8 @@ ALLOWED_LICENSES = {
 }
 REGISTRY = "https://github.com/rust-lang/crates.io-index"
 PRODUCT_VERSION = "0.3.0-rc.1"
-RUNTIME_COMMIT = "71bee2c6d3f3c70d7f4b79f77b99eafd8ef2b039"
-RUNTIME_TREE = "cbf64aae94422e526600fb8d8e309d535c01a72b"
+RUNTIME_COMMIT = "506cd67b6219b8f9fd7445e79dd2c820dae5f132"
+RUNTIME_TREE = "67543e2f85f345da29a6df1cd04d3f76e0cb34a1"
 PRODUCT_INITIAL_COMMIT = "a829f43552c7118d1f206b9e4112b3c747eecd50"
 PRIVATE_TRANSPORT_PACKAGES = {
     "h2",
@@ -869,11 +869,11 @@ def check_provenance(root: Path, shared_crates: set[str]) -> None:
 def check_shipped_docs(root: Path) -> None:
     demos = root / "demos"
     if demos.exists() and any(path.is_file() or path.is_symlink() for path in demos.rglob("*")):
-        fail("obsolete pre-schema-3 demos are present")
+        fail("obsolete pre-schema-4 demos are present")
     readme = read_text(root / "README.md")
     normalized = " ".join(readme.split())
-    if f"The `{PRODUCT_VERSION}` candidate requires `schema_version = 3`" not in normalized:
-        fail("README lacks the exact strict-v3 candidate version marker")
+    if f"The `{PRODUCT_VERSION}` candidate requires `schema_version = 4`" not in normalized:
+        fail("README lacks the exact strict-v4 candidate version marker")
     archive_inventory = (
         "Release archives contain `acl-proxy`, the capture-body extraction helper, "
         "this README, `LICENSE`, `THIRD_PARTY_NOTICES`, and "
@@ -916,6 +916,15 @@ def check_shipped_docs(root: Path) -> None:
     ):
         fail("README hardcodes a future release SHA prefix")
     sample = read_text(root / "acl-proxy.sample.toml")
+    for migration_marker in (
+        "Treat the binary and its complete configuration directory as one deployment",
+        "fixed-width ordering prefixes",
+        "Raw ASCII filename order remains the normative ordering rule",
+        "Deploy the new binary, main file, and complete `rules.d` set together",
+        "Rollback must likewise restore the prior binary, main file, and complete",
+    ):
+        if migration_marker not in readme:
+            fail("README lacks schema-v4 migration guidance: " + migration_marker)
     for path, text in (("README.md", readme), ("acl-proxy.sample.toml", sample)):
         for obsolete in (
             "policy.external_auth_profiles",
@@ -925,8 +934,36 @@ def check_shipped_docs(root: Path) -> None:
         ):
             if obsolete in text:
                 fail(f"{path} contains obsolete configuration surface: {obsolete}")
-    if "schema_version = 3" not in sample:
-        fail("sample configuration is not schema version 3")
+    sample_document = load_toml(root / "acl-proxy.sample.toml")
+    sample_schema_version = sample_document.get("schema_version")
+    if type(sample_schema_version) is not int or sample_schema_version != 4:
+        fail("sample configuration is not schema version 4")
+    for required_rules_directory_guidance in (
+        "implicit sibling rules.d",
+        "equal policy authority",
+        "stage outside rules.d",
+        "atomically rename",
+        "fixed-width names",
+        "raw ASCII order",
+        "binary, main file, and complete rules.d",
+    ):
+        if required_rules_directory_guidance not in sample:
+            fail(
+                "sample configuration lacks rules.d authority/publication guidance: "
+                + required_rules_directory_guidance
+            )
+    historical_notice = (
+        "Historical pre-schema-4 implementation record. It does not describe "
+        "the current configuration contract; use `README.md` for supported authoring."
+    )
+    for relative_path in (
+        "docs/implementation/global-egress-header-actions/schema-proposal.md",
+        "docs/implementation/global-egress-header-actions/phase-task-plan.md",
+        "docs/implementation/egress-destination-forwarding/schema-proposal.md",
+        "docs/implementation/egress-destination-forwarding/phase-task-plan.md",
+    ):
+        if historical_notice not in read_text(root / relative_path):
+            fail(f"{relative_path} lacks the historical pre-v4 notice")
     if "acl-proxy export-ca" not in sample:
         fail("sample configuration lacks generated public-CA export guidance")
     if "ca-cert.pem" in sample or "ca-key.pem" in sample:
