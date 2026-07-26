@@ -196,36 +196,67 @@ mod tests {
         std::path::PathBuf::from(OsStr::from_bytes(home))
     }
 
-    fn assert_trusted_test_root(path: &Path) {
+    fn validate_trusted_test_root(path: &Path) -> Result<(), String> {
         use std::os::unix::fs::MetadataExt;
 
         let euid = unsafe { libc::geteuid() };
         for ancestor in path.ancestors() {
-            let metadata = std::fs::symlink_metadata(ancestor).unwrap_or_else(|error| {
-                panic!(
+            let metadata = std::fs::symlink_metadata(ancestor).map_err(|error| {
+                format!(
                     "effective-UID home ancestor {} is unavailable: {error}",
                     ancestor.display()
                 )
             });
-            assert!(
-                metadata.file_type().is_dir()
-                    && trusted_owner(metadata.uid(), euid)
-                    && metadata.mode() & 0o022 == 0,
-                "effective-UID home ancestor {} is not trusted",
-                ancestor.display()
-            );
+            let metadata = metadata?;
+            if !metadata.file_type().is_dir()
+                || !trusted_owner(metadata.uid(), euid)
+                || metadata.mode() & 0o022 != 0
+            {
+                return Err(format!(
+                    "effective-UID home ancestor {} is not trusted",
+                    ancestor.display()
+                ));
+            }
         }
+        Ok(())
+    }
+
+    fn try_trusted_tempdir(root: &Path) -> Result<tempfile::TempDir, String> {
+        validate_trusted_test_root(root)?;
+        let directory = tempfile::Builder::new()
+            .prefix(".identity-file-test-")
+            .tempdir_in(root)
+            .map_err(|error| {
+                format!(
+                    "trusted identity test root {} is not writable: {error}",
+                    root.display()
+                )
+            })?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("identity test directory mode could not be set: {error}"))?;
+        Ok(directory)
     }
 
     fn trusted_tempdir() -> tempfile::TempDir {
-        let home = effective_uid_home();
-        assert_trusted_test_root(&home);
-        let directory = tempfile::Builder::new()
-            .prefix(".identity-file-test-")
-            .tempdir_in(home)
-            .unwrap();
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        directory
+        let mut failures = Vec::new();
+        if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+            match try_trusted_tempdir(&home) {
+                Ok(directory) => return directory,
+                Err(error) => failures.push(error),
+            }
+        }
+
+        let passwd_home = effective_uid_home();
+        match try_trusted_tempdir(&passwd_home) {
+            Ok(directory) => directory,
+            Err(error) => {
+                failures.push(error);
+                panic!(
+                    "no trusted writable root for identity-file tests: {}",
+                    failures.join("; ")
+                )
+            }
+        }
     }
 
     fn write_leaf(path: &Path, value: &[u8]) {
@@ -256,6 +287,8 @@ mod tests {
         assert!(directory_metadata_is_trusted(&metadata, 1000));
         assert!(!directory_metadata_is_trusted(&metadata, 1001));
 
+        metadata.st_mode = libc::S_IFREG | 0o700;
+        assert!(!directory_metadata_is_trusted(&metadata, 1000));
         metadata.st_mode = file_type | 0o770;
         assert!(!directory_metadata_is_trusted(&metadata, 1000));
         metadata.st_mode = file_type | 0o707;
