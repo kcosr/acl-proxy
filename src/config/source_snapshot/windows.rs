@@ -22,7 +22,7 @@ use windows_sys::Win32::{
     Foundation::{
         GetLastError, RtlNtStatusToDosError, HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE,
         OBJ_DONT_REPARSE, STATUS_NO_SUCH_FILE, STATUS_OBJECT_NAME_NOT_FOUND,
-        STATUS_OBJECT_PATH_NOT_FOUND,
+        STATUS_OBJECT_PATH_NOT_FOUND, STATUS_REPARSE_POINT_ENCOUNTERED,
     },
     Storage::FileSystem::{
         CreateFileW, FileBasicInfo, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo,
@@ -97,6 +97,7 @@ pub(super) fn probe_at(
     ) {
         Ok(handle) => metadata_by_handle(handle.as_raw_handle() as HANDLE).map(Some),
         Err(RelativeOpenError::NotFound) => Ok(None),
+        Err(RelativeOpenError::ReparsePoint) => Ok(Some(reparse_point_metadata())),
         Err(RelativeOpenError::Io(error)) => Err(error),
     }
 }
@@ -315,6 +316,9 @@ fn open_relative(
         )
     };
     if status < 0 {
+        if status == STATUS_REPARSE_POINT_ENCOUNTERED {
+            return Err(RelativeOpenError::ReparsePoint);
+        }
         if matches!(
             status,
             STATUS_NO_SUCH_FILE | STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND
@@ -333,6 +337,25 @@ fn open_relative(
     }
 
     Ok(unsafe { OwnedHandle::from_raw_handle(raw as RawHandle) })
+}
+
+fn reparse_point_metadata() -> ObjectMetadata {
+    ObjectMetadata {
+        kind: ObjectKind::Other,
+        identity: ObjectIdentity {
+            volume: 0,
+            file_id: [0; 16],
+        },
+        links: 0,
+        size: 0,
+        mutation: MutationMetadata {
+            modified_seconds: 0,
+            modified_nanos: 0,
+            changed_seconds: 0,
+            changed_nanos: 0,
+            attributes: u64::from(FILE_ATTRIBUTE_REPARSE_POINT),
+        },
+    }
 }
 
 fn metadata_by_handle(handle: HANDLE) -> io::Result<ObjectMetadata> {
@@ -437,6 +460,7 @@ fn invalid_directory_record() -> io::Error {
 
 enum RelativeOpenError {
     NotFound,
+    ReparsePoint,
     Io(io::Error),
 }
 
@@ -444,6 +468,9 @@ impl RelativeOpenError {
     fn into_io(self) -> io::Error {
         match self {
             Self::NotFound => io::Error::new(io::ErrorKind::NotFound, "source leaf not found"),
+            Self::ReparsePoint => {
+                io::Error::new(io::ErrorKind::InvalidData, "source leaf is a reparse point")
+            }
             Self::Io(error) => error,
         }
     }

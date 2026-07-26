@@ -650,6 +650,28 @@ mod tests {
         ));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_fragment_reparse_point_is_rejected() {
+        use std::os::windows::fs::symlink_file;
+
+        let directory = tempdir().unwrap();
+        let main = directory.path().join("acl-proxy.toml");
+        let rules = directory.path().join("rules.d");
+        let target = directory.path().join("target.toml");
+        fs::write(&main, MAIN).unwrap();
+        fs::create_dir(&rules).unwrap();
+        fs::write(&target, FRAGMENT).unwrap();
+        symlink_file(&target, rules.join("10-policy.toml")).unwrap();
+
+        assert!(matches!(
+            load_sources(&main, |_, _| Ok::<_, ()>(())),
+            Err(LoadSourcesError::Snapshot(
+                SourceSnapshotError::InvalidType { .. }
+            ))
+        ));
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn same_name_main_replacement_between_probe_and_open_is_rejected() {
