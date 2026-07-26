@@ -845,7 +845,9 @@ async fn h2_clients(proxy: SocketAddr, origin: SocketAddr, batch: usize) {
         let (response, _) = sender.send_request(request, true).unwrap();
         let response_heads = Arc::clone(&response_heads);
         responses.push(tokio::spawn(async move {
-            let response = response.await.unwrap_or_else(|error| {
+            let response = response.await;
+            response_heads.wait().await;
+            let response = response.unwrap_or_else(|error| {
                 panic!("H2 stress response head failed for batch {batch} stream {index} ({mode}): {error}")
             });
             assert_eq!(
@@ -853,7 +855,6 @@ async fn h2_clients(proxy: SocketAddr, origin: SocketAddr, batch: usize) {
                 StatusCode::OK,
                 "H2 stress response failed for batch {batch} stream {index} ({mode})"
             );
-            response_heads.wait().await;
             let mut body = response.into_body();
             let expected_prefix = if cancelled {
                 H2_INITIAL_WINDOW_BYTES
@@ -891,9 +892,17 @@ async fn h2_clients(proxy: SocketAddr, origin: SocketAddr, batch: usize) {
         }));
     }
     response_heads.wait().await;
+    let mut failures = Vec::new();
     for response in responses {
-        response.await.unwrap();
+        if let Err(error) = response.await {
+            failures.push(error.to_string());
+        }
     }
+    assert!(
+        failures.is_empty(),
+        "H2 stress stream tasks failed: {}",
+        failures.join("; ")
+    );
     drop(sender);
     connection.abort();
     let result = tokio::time::timeout(Duration::from_secs(3), connection)
