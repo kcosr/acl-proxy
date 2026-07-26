@@ -1,8 +1,13 @@
 {
-  "schema": "synthetic-fixture-v1",
-  "identities": {
-    "fixture-runner-identity": [
-      "https://runner.example.test/jobs/*"
-    ]
+  "schema": "synthetic-fixture-v2",
+  "authority": "aw-workstation",
+  "rules": {
+    "fixture-agent-runner-delegate": {
+      "principals": {
+        "fixture-container": [
+          "https://runner.example.test/jobs/*"
+        ]
+      }
+    }
   }
 }

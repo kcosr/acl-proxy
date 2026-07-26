@@ -4,10 +4,15 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use access_rpc_framing::{
+    receive_sensitive_request, FrameBodyLimit, FrameProtocol, SensitiveFrameBody,
+};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -262,7 +267,11 @@ fn proxy_request(proxy: SocketAddr, method: &str, url: &str, body: &[u8]) -> Htt
         method,
         url,
         host,
-        &[("Content-Type", "text/plain"), ("X-Test-Input", "included")],
+        &[
+            ("Content-Type", "text/plain"),
+            ("X-Test-Input", "included"),
+            ("X-Aw-Identity-Token", "abcdefghijklmnopqrstuvwxyzABCDEF"),
+        ],
         body,
         true,
     )
@@ -366,7 +375,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with open(event_file, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(request, sort_keys=True, separators=(",", ":")) + "\n")
             path = urllib.parse.urlsplit(request["url"]).path
-            decision = {
+            identity = request.get("identity", {})
+            principal = identity.get("principal", {})
+            groups = identity.get("groups", [])
+            valid_identity = (
+                request.get("ruleId") == "webhook"
+                and identity.get("state") == "authenticated"
+                and principal.get("authority") == "strict-runtime"
+                and principal.get("id") == "fixture-agent"
+                and principal.get("kind") == "service_account"
+                and groups == [
+                    {"authority": "strict-runtime", "id": "auditors"},
+                    {"authority": "strict-runtime", "id": "operators"},
+                ]
+            )
+            decision = "deny" if not valid_identity else {
                 "/webhook-deny": "deny",
                 "/webhook-pass": "pass",
             }.get(path, "allow")
@@ -409,7 +432,21 @@ import urllib.parse
 for line in sys.stdin:
     request = json.loads(line)
     path = urllib.parse.urlsplit(request["url"]).path
-    decision = {
+    identity = request.get("identity", {})
+    principal = identity.get("principal", {})
+    groups = identity.get("groups", [])
+    valid_identity = (
+        request.get("ruleId") == "process"
+        and identity.get("state") == "authenticated"
+        and principal.get("authority") == "strict-runtime"
+        and principal.get("id") == "fixture-agent"
+        and principal.get("kind") == "service_account"
+        and groups == [
+            {"authority": "strict-runtime", "id": "auditors"},
+            {"authority": "strict-runtime", "id": "operators"},
+        ]
+    )
+    decision = "deny" if not valid_identity else {
         "/provider-deny": "deny",
         "/provider-pass": "pass",
     }.get(path, "allow")
@@ -459,8 +496,37 @@ request_header_timeout = "2s"
 max_connections = 32
 max_concurrent_streams = 32
 
+[listeners.explicit_http.identity]
+mode = "optional"
+
 [listeners.explicit_http.connect]
 http1 = "deny"
+
+[identity]
+max_pending_authentications = 16
+max_pending_authentications_per_connection = 4
+
+[identity.resolver]
+kind = "static"
+authority = "strict-runtime"
+
+[[identity.resolver.principals]]
+id = "fixture-agent"
+kind = "service_account"
+
+[[identity.resolver.groups]]
+id = "operators"
+members = ["fixture-agent"]
+
+[[identity.resolver.groups]]
+id = "auditors"
+members = ["fixture-agent"]
+
+[[identity.resolver.tokens]]
+id = "fixture-token"
+principal = "fixture-agent"
+source = "environment"
+variable = "AW_TEST_IDENTITY_TOKEN"
 
 [authorization.callback]
 public_url = "http://{control}/_acl-proxy/external-auth/callback"
@@ -474,6 +540,7 @@ args = ["{}"]
 timeout = "2s"
 inherit_environment = false
 include_headers = ["x-test-input"]
+include_identity = true
 include_request_body = true
 allow_request_body_replacement = true
 max_request_body_bytes = 65536
@@ -494,6 +561,7 @@ kind = "webhook"
 url = "http://{origin}/authorize"
 timeout = "3s"
 on_failure = "error"
+include_identity = true
 max_request_bytes = 65536
 max_response_bytes = 65536
 
@@ -547,6 +615,10 @@ urls = [
 ]
 authorization_provider = "local"
 redaction_profile = "wire"
+identity_states = ["authenticated"]
+identity_subjects = [
+  {{ kind = "group", authority = "strict-runtime", id = "operators" }},
+]
 
 [[policy.rules.response_headers]]
 operation = "set"
@@ -575,6 +647,10 @@ urls = [
   "http://{origin}/webhook-pass",
 ]
 authorization_provider = "approval"
+identity_states = ["authenticated"]
+identity_subjects = [
+  {{ kind = "group", authority = "strict-runtime", id = "operators" }},
+]
 
 [[policy.rules.response_headers]]
 operation = "set"
@@ -655,12 +731,292 @@ fn start_proxy(config: &Path) -> ChildGuard {
     let child = Command::new(assert_cmd::cargo::cargo_bin!("acl-proxy"))
         .args(["run", "--config"])
         .arg(config)
+        .env("AW_TEST_IDENTITY_TOKEN", "abcdefghijklmnopqrstuvwxyzABCDEF")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .expect("start acl-proxy");
     ChildGuard::new(child, libc::SIGTERM)
+}
+
+fn start_unix_authorization_provider(
+    socket_path: &Path,
+    expected_requests: usize,
+) -> JoinHandle<()> {
+    let listener = StdUnixListener::bind(socket_path).expect("bind Unix authorization provider");
+    listener.set_nonblocking(true).unwrap();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+            let protocol = FrameProtocol::new(
+                *b"AWAP",
+                1,
+                FrameBodyLimit::new(65_536).unwrap(),
+                FrameBodyLimit::new(65_536).unwrap(),
+            );
+            for _ in 0..expected_requests {
+                let (stream, _) = listener.accept().await.unwrap();
+                let cancellation = http_access_runtime::ForwardingCancellation::new();
+                let received = receive_sensitive_request(
+                    stream,
+                    protocol,
+                    Instant::now() + PROCESS_TIMEOUT,
+                    &cancellation,
+                )
+                .await
+                .unwrap();
+                let request: Value = received
+                    .body()
+                    .expose(|bytes| serde_json::from_slice(bytes))
+                    .unwrap();
+                assert_eq!(request["type"], "request");
+                assert_eq!(request["ruleId"], "unix-live");
+                assert_eq!(request["invocation"], "effects_allowed");
+                assert_eq!(request["client"], "127.0.0.1:0");
+                assert_eq!(request["headers"], json!({}));
+                assert_eq!(
+                    request["identity"],
+                    json!({
+                        "state": "authenticated",
+                        "principal": {
+                            "authority": "unix-runtime",
+                            "id": "unix-agent",
+                            "kind": "service_account",
+                        },
+                        "groups": [
+                            {"authority": "unix-runtime", "id": "auditors"},
+                            {"authority": "unix-runtime", "id": "operators"},
+                        ],
+                    })
+                );
+                assert!(request.get("body").is_none());
+                let encoded_request = serde_json::to_vec(&request).unwrap();
+                assert!(
+                    !encoded_request
+                        .windows(b"abcdefghijklmnopqrstuvwxyzABCDEF".len())
+                        .any(|window| window == b"abcdefghijklmnopqrstuvwxyzABCDEF"),
+                    "AWAP request exposed the raw identity bearer"
+                );
+                assert!(
+                    !encoded_request
+                        .windows(b"unix-request-body-secret".len())
+                        .any(|window| window == b"unix-request-body-secret"),
+                    "AWAP request exposed the request body"
+                );
+
+                let path = request["url"]
+                    .as_str()
+                    .and_then(|url| url.split_once("://"))
+                    .and_then(|(_, rest)| rest.find('/').map(|offset| &rest[offset..]))
+                    .expect("AWAP request has a canonical URL path");
+                assert_eq!(
+                    request["method"],
+                    if path == "/unix-body" { "POST" } else { "GET" }
+                );
+                let decision = match path {
+                    "/unix-pass" => json!({
+                        "id": request["id"],
+                        "type": "response",
+                        "decision": "pass",
+                    }),
+                    "/unix-allow" => json!({
+                        "id": request["id"],
+                        "type": "response",
+                        "decision": "allow",
+                        "values": {"api_token": "unix-typed-secret"},
+                    }),
+                    "/unix-body" => json!({
+                        "id": request["id"],
+                        "type": "response",
+                        "decision": "allow",
+                        "values": {"api_token": "unix-typed-secret"},
+                    }),
+                    _ => panic!("unexpected Unix provider request URL: {}", request["url"]),
+                };
+                let response =
+                    SensitiveFrameBody::new(serde_json::to_vec(&decision).unwrap()).unwrap();
+                received.respond_sensitive(&response).await.unwrap();
+            }
+        });
+    })
+}
+
+fn unix_authorization_config(
+    data: SocketAddr,
+    control: SocketAddr,
+    origin: SocketAddr,
+    live_socket: &Path,
+    missing_deny_socket: &Path,
+    missing_error_socket: &Path,
+) -> String {
+    format!(
+        r#"schema_version = 3
+
+[service]
+request_timeout = "5s"
+shutdown_drain_timeout = "2s"
+max_retiring_generations = 2
+
+[control]
+bind = "{control}"
+base_path = "/_acl-proxy"
+request_header_timeout = "1s"
+request_body_timeout = "2s"
+max_connections = 8
+max_request_body_bytes = 65536
+
+[listeners.explicit_http]
+endpoint.kind = "tcp"
+endpoint.address = "{data}"
+http_versions = ["http1"]
+request_header_timeout = "2s"
+max_connections = 16
+max_concurrent_streams = 16
+
+[listeners.explicit_http.identity]
+mode = "required"
+
+[listeners.explicit_http.connect]
+http1 = "deny"
+
+[identity]
+max_pending_authentications = 8
+max_pending_authentications_per_connection = 4
+
+[identity.resolver]
+kind = "static"
+authority = "unix-runtime"
+
+[[identity.resolver.principals]]
+id = "unix-agent"
+kind = "service_account"
+
+[[identity.resolver.groups]]
+id = "operators"
+members = ["unix-agent"]
+
+[[identity.resolver.groups]]
+id = "auditors"
+members = ["unix-agent"]
+
+[[identity.resolver.tokens]]
+id = "unix-token"
+principal = "unix-agent"
+source = "environment"
+variable = "AW_TEST_IDENTITY_TOKEN"
+
+[authorization.providers.unix_live]
+kind = "unix_socket"
+socket_path = "{}"
+timeout = "2s"
+on_failure = "deny"
+include_headers = []
+include_identity = true
+max_request_bytes = 65536
+max_response_bytes = 65536
+max_pending_requests = 4
+
+[authorization.providers.unix_live.outputs.api_token]
+kind = "custom_header"
+transport_security = "cleartext_allowed"
+header = "x-provider-token"
+required = true
+
+[authorization.providers.missing_deny]
+kind = "unix_socket"
+socket_path = "{}"
+timeout = "250ms"
+on_failure = "deny"
+include_headers = []
+max_request_bytes = 65536
+max_response_bytes = 65536
+max_pending_requests = 1
+
+[authorization.providers.missing_error]
+kind = "unix_socket"
+socket_path = "{}"
+timeout = "250ms"
+on_failure = "error"
+include_headers = []
+max_request_bytes = 65536
+max_response_bytes = 65536
+max_pending_requests = 1
+
+[credentials]
+allowed_custom_headers = ["x-provider-token"]
+
+[egress]
+route = "direct"
+
+[egress.origin_tls]
+trust = "system"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "unix-live"
+decision = "delegate"
+urls = ["http://{origin}/unix-pass", "http://{origin}/unix-allow", "http://{origin}/unix-body"]
+methods = ["GET", "POST"]
+authorization_provider = "unix_live"
+identity_states = ["authenticated"]
+identity_subjects = [
+  {{ kind = "group", authority = "unix-runtime", id = "operators" }},
+]
+
+[[policy.rules.response_headers]]
+operation = "set"
+when = "always"
+name = "x-unix-delegate-effect"
+value = "applied"
+
+[[policy.rules]]
+id = "after-unix-pass"
+decision = "allow"
+urls = ["http://{origin}/unix-pass"]
+
+[[policy.rules.response_headers]]
+operation = "set"
+when = "always"
+name = "x-unix-pass-successor"
+value = "applied"
+
+[[policy.rules]]
+id = "missing-deny"
+decision = "delegate"
+urls = ["http://{origin}/missing-deny"]
+authorization_provider = "missing_deny"
+
+[[policy.rules]]
+id = "missing-error"
+decision = "delegate"
+urls = ["http://{origin}/missing-error"]
+authorization_provider = "missing_error"
+
+[[policy.rules]]
+id = "unrelated"
+decision = "allow"
+urls = ["http://{origin}/unrelated"]
+
+[observation.logging]
+level = "info"
+directory = "logs"
+console = false
+
+[safety.loop_detection]
+inject = true
+header = "x-unix-provider-request-id"
+"#,
+        live_socket.display(),
+        missing_deny_socket.display(),
+        missing_error_socket.display(),
+    )
 }
 
 fn records_for_url(capture_dir: &Path, url: &str) -> Vec<Value> {
@@ -720,6 +1076,112 @@ fn assert_all_log_files_omit_secrets(log_dir: &Path, secrets: &[&str]) {
         }
     }
     assert!(file_count > 0, "runtime produced no log files");
+}
+
+#[test]
+fn unix_authorization_provider_isolated_product_paths_are_live() {
+    let directory = TempDir::new().expect("create Unix provider fixture");
+    let python = python3_path();
+    let (_origin_process, origin) = start_origin(directory.path(), &python);
+    let data = unused_address();
+    let control = unused_address();
+    assert_ne!(data, control);
+
+    let live_socket = directory.path().join("live-authorization.sock");
+    let missing_deny_socket = directory.path().join("missing-deny.sock");
+    let missing_error_socket = directory.path().join("missing-error.sock");
+    let provider = start_unix_authorization_provider(&live_socket, 3);
+    let config_path = directory.path().join("unix-authorization.toml");
+    write_file(
+        &config_path,
+        &unix_authorization_config(
+            data,
+            control,
+            origin,
+            &live_socket,
+            &missing_deny_socket,
+            &missing_error_socket,
+        ),
+    );
+
+    let validation = Command::new(assert_cmd::cargo::cargo_bin!("acl-proxy"))
+        .args(["config", "validate", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("validate Unix provider fixture");
+    assert!(
+        validation.status.success(),
+        "Unix provider fixture must validate: {}",
+        String::from_utf8_lossy(&validation.stderr)
+    );
+
+    let mut proxy = start_proxy(&config_path);
+    wait_for_ready(&mut proxy, control);
+
+    let pass_url = format!("http://{origin}/unix-pass");
+    let pass = proxy_request(data, "GET", &pass_url, &[]);
+    assert_eq!(
+        pass.status,
+        200,
+        "unexpected pass response: {pass:?}; logs: {}",
+        fs::read_to_string(directory.path().join("logs/acl-proxy.log")).unwrap_or_default()
+    );
+    assert_eq!(pass.header("x-seen-provider-token"), Some("missing"));
+    assert_eq!(pass.header("x-unix-delegate-effect"), None);
+    assert_eq!(pass.header("x-unix-pass-successor"), Some("applied"));
+
+    let allow_url = format!("http://{origin}/unix-allow");
+    let allow = proxy_request(data, "GET", &allow_url, &[]);
+    assert_eq!(allow.status, 200);
+    assert_eq!(
+        allow.header("x-seen-provider-token"),
+        Some("unix-typed-secret")
+    );
+    assert_eq!(allow.header("x-unix-delegate-effect"), Some("applied"));
+    assert_eq!(allow.header("x-unix-pass-successor"), None);
+
+    let body_marker = b"unix-request-body-secret";
+    let body_url = format!("http://{origin}/unix-body");
+    let body = proxy_request(data, "POST", &body_url, body_marker);
+    assert_eq!(body.status, 200);
+    assert_eq!(body.body, body_marker);
+    assert_eq!(
+        body.header("x-seen-provider-token"),
+        Some("unix-typed-secret")
+    );
+
+    let missing_deny_url = format!("http://{origin}/missing-deny");
+    assert_eq!(
+        proxy_request(data, "GET", &missing_deny_url, &[]).status,
+        403
+    );
+    let unrelated_url = format!("http://{origin}/unrelated");
+    assert_eq!(proxy_request(data, "GET", &unrelated_url, &[]).status, 200);
+
+    let missing_error_url = format!("http://{origin}/missing-error");
+    assert_eq!(
+        proxy_request(data, "GET", &missing_error_url, &[]).status,
+        500
+    );
+    assert_eq!(proxy_request(data, "GET", &unrelated_url, &[]).status, 200);
+
+    provider.join().expect("Unix provider server completed");
+    let status = proxy.terminate();
+    assert!(status.success(), "acl-proxy shutdown failed: {status}");
+    let live_socket = live_socket.to_string_lossy();
+    let missing_deny_socket = missing_deny_socket.to_string_lossy();
+    let missing_error_socket = missing_error_socket.to_string_lossy();
+    assert_all_log_files_omit_secrets(
+        &directory.path().join("logs"),
+        &[
+            "unix-typed-secret",
+            "unix-request-body-secret",
+            "abcdefghijklmnopqrstuvwxyzABCDEF",
+            live_socket.as_ref(),
+            missing_deny_socket.as_ref(),
+            missing_error_socket.as_ref(),
+        ],
+    );
 }
 
 #[test]
@@ -834,7 +1296,10 @@ fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
         "GET",
         &allow_url,
         &origin.to_string(),
-        &[("X-Provider-Token", DECISION_LOG_SECRET)],
+        &[
+            ("X-Provider-Token", DECISION_LOG_SECRET),
+            ("X-Aw-Identity-Token", "abcdefghijklmnopqrstuvwxyzABCDEF"),
+        ],
         &[],
         true,
     );
@@ -949,6 +1414,22 @@ fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
         ]
     );
     assert!(events.iter().all(|event| event["type"] == "request"));
+    assert!(events.iter().all(|event| event["ruleId"] == "webhook"));
+    assert!(events.iter().all(|event| {
+        event["identity"]["state"] == "authenticated"
+            && event["identity"]["principal"]["authority"] == "strict-runtime"
+            && event["identity"]["principal"]["id"] == "fixture-agent"
+            && event["identity"]["principal"]["kind"] == "service_account"
+            && event["identity"]["groups"]
+                .as_array()
+                .is_some_and(|groups| {
+                    groups
+                        == &[
+                            json!({"authority": "strict-runtime", "id": "auditors"}),
+                            json!({"authority": "strict-runtime", "id": "operators"}),
+                        ]
+                })
+    }));
     assert!(events
         .iter()
         .all(|event| event.get("body").is_none() && event.get("requestBody").is_none()));
@@ -994,7 +1475,7 @@ fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
         "GET",
         &reload_url,
         &origin.to_string(),
-        &[],
+        &[("X-Aw-Identity-Token", "abcdefghijklmnopqrstuvwxyzABCDEF")],
         &[],
         false,
     );
@@ -1021,7 +1502,7 @@ fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
         "GET",
         &reload_url,
         &origin.to_string(),
-        &[],
+        &[("X-Aw-Identity-Token", "abcdefghijklmnopqrstuvwxyzABCDEF")],
         &[],
         false,
     );

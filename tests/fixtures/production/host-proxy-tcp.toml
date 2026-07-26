@@ -18,8 +18,11 @@ request_body_timeout = "10s"
 
 [listeners.explicit_http]
 endpoint.kind = "tcp"
-endpoint.address = "0.0.0.0:8881"
+endpoint.address = "127.0.0.1:8881"
 http_versions = ["http1"]
+
+[listeners.explicit_http.identity]
+mode = "required"
 
 [listeners.explicit_http.connect]
 http1 = "mitm"
@@ -32,6 +35,32 @@ http_versions = ["http1", "http2"]
 [mitm]
 mode = "generated"
 directory = "runtime/certs"
+
+[identity]
+max_pending_authentications = 256
+max_pending_authentications_per_connection = 16
+
+[identity.resolver]
+kind = "static"
+authority = "aw-workstation"
+
+[[identity.resolver.principals]]
+id = "fixture-container"
+kind = "service_account"
+
+[[identity.resolver.groups]]
+id = "fixture-developers"
+members = ["fixture-container"]
+
+[[identity.resolver.groups]]
+id = "fixture-agent-runners"
+members = ["fixture-container"]
+
+[[identity.resolver.tokens]]
+id = "fixture-container-primary"
+principal = "fixture-container"
+source = "environment"
+variable = "AW_IDENTITY_TOKEN"
 
 [egress]
 route = "direct"
@@ -55,15 +84,6 @@ decision = "allow"
 urls = ["**"]
 methods = ["CONNECT"]
 client_cidrs = ["198.18.0.0/15"]
-
-[[policy.rules]]
-id = "prod-host-r00-require-identity"
-description = "Sanitized source rule 00: deny when workload identity is absent"
-decision = "deny"
-urls = ["**"]
-
-[policy.rules.headers]
-absent_any = ["x-aw-identity-token"]
 
 [[policy.rules]]
 id = "prod-host-r01-ai-redaction-a"
@@ -479,6 +499,10 @@ description = "Sanitized source rule 42: Git provider validates identity/context
 decision = "delegate"
 urls = ["https://gitlab.example.test/**"]
 client_cidrs = ["198.18.0.0/15"]
+identity_states = ["authenticated"]
+identity_subjects = [
+  { kind = "group", authority = "aw-workstation", id = "fixture-developers" },
+]
 authorization_provider = "gitlab_acl"
 
 [[policy.rules]]
@@ -501,7 +525,8 @@ timeout = "1s"
 on_failure = "deny"
 inherit_environment = false
 environment = { PATH = "/usr/bin:/bin" }
-include_headers = ["x-aw-identity-token", "x-aw-policy-context"]
+include_headers = ["x-aw-policy-context"]
+include_identity = true
 include_request_body = false
 allow_request_body_replacement = false
 max_pending_requests = 256
@@ -516,16 +541,13 @@ timeout = "1s"
 on_failure = "deny"
 inherit_environment = false
 environment = { PATH = "/usr/bin:/bin" }
-include_headers = ["x-aw-identity-token"]
+include_headers = []
+include_identity = true
 include_request_body = false
 allow_request_body_replacement = false
 max_pending_requests = 256
 restart_backoff = "1s"
 retire_timeout = "2h"
-
-[credentials.inbound.aw_identity]
-header = "x-aw-identity-token"
-process_providers = ["gitlab_acl", "agent_runner_acl"]
 
 [redaction.profiles.sensitive_strings]
 replacement = "[REDACTED]"

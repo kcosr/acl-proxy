@@ -7,6 +7,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use access_identity::ProviderIdentityProjection;
 use allocator_api2::boxed::Box as FallibleBox;
 use std::task::{Context, Poll};
 
@@ -27,7 +28,7 @@ use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
 use crate::config::compiler::{ProviderOutputPlan, MAX_PROVIDER_CREDENTIAL_BYTES};
-use crate::safety::wire_body::{GuardedAllocationCharge, GuardedScratch};
+use crate::safety::wire_body::{GuardedAllocationCharge, GuardedExactBytes, GuardedScratch};
 use crate::safety::{GuardedBody, HttpWireBodyGuard};
 
 #[cfg(test)]
@@ -355,11 +356,44 @@ impl ProcessProviderCredentials {
     }
 }
 
+pub(crate) struct UnixProviderCredentials {
+    registry_id: u64,
+    values: FallibleBox<[Option<ProcessEffectRange>]>,
+    storage: GuardedExactBytes,
+    _range_charge: GuardedAllocationCharge,
+}
+
+impl UnixProviderCredentials {
+    pub(super) fn new(
+        registry_id: u64,
+        values: FallibleBox<[Option<ProcessEffectRange>]>,
+        storage: GuardedExactBytes,
+        range_charge: GuardedAllocationCharge,
+    ) -> Self {
+        Self {
+            registry_id,
+            values,
+            storage,
+            _range_charge: range_charge,
+        }
+    }
+
+    fn get(&self, index: ProviderOutputIndex) -> Option<&[u8]> {
+        let range = self
+            .values
+            .get(index.get())
+            .filter(|_| self.registry_id == index.registry_id())
+            .and_then(|range| *range)?;
+        self.storage.as_slice().get(range.start..range.end)
+    }
+}
+
 pub(crate) enum ProviderCredentialSet {
     #[cfg(test)]
     Contiguous(ContiguousProviderCredentials),
     Segmented(crate::authorization::callback::CallbackCredentialSet),
     ProcessSegmented(ProcessProviderCredentials),
+    Unix(UnixProviderCredentials),
 }
 
 impl ProviderCredentialSet {
@@ -369,6 +403,7 @@ impl ProviderCredentialSet {
             Self::Contiguous(credentials) => credentials.registry_id,
             Self::Segmented(credentials) => credentials.registry_id(),
             Self::ProcessSegmented(credentials) => credentials.registry_id,
+            Self::Unix(credentials) => credentials.registry_id,
         }
     }
 
@@ -400,7 +435,16 @@ impl ProviderCredentialSet {
             #[cfg(test)]
             Self::Contiguous(_) => None,
             Self::ProcessSegmented(_) => None,
+            Self::Unix(_) => None,
             Self::Segmented(credentials) => credentials.get(index),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unix_contiguous(&self, index: ProviderOutputIndex) -> Option<&[u8]> {
+        match self {
+            Self::Unix(credentials) => credentials.get(index),
+            _ => None,
         }
     }
 
@@ -412,6 +456,10 @@ impl ProviderCredentialSet {
 
     pub(super) fn from_process_segmented(credentials: ProcessProviderCredentials) -> Self {
         Self::ProcessSegmented(credentials)
+    }
+
+    pub(super) fn from_unix(credentials: UnixProviderCredentials) -> Self {
+        Self::Unix(credentials)
     }
 
     #[cfg(test)]
@@ -443,6 +491,9 @@ impl ProviderCredentialSet {
             Self::ProcessSegmented(credentials) => credentials
                 .get(index)
                 .map(ProviderCredentialSegments::Process),
+            Self::Unix(credentials) => credentials
+                .get(index)
+                .map(|value| ProviderCredentialSegments::Unix(Some(value))),
         }
     }
 }
@@ -452,6 +503,7 @@ enum ProviderCredentialSegments<'a> {
     Contiguous(Option<&'a [u8]>),
     Callback(crate::authorization::callback::CallbackCredentialSegments<'a>),
     Process(ProcessEffectSegments<'a>),
+    Unix(Option<&'a [u8]>),
 }
 
 impl<'a> Iterator for ProviderCredentialSegments<'a> {
@@ -463,6 +515,7 @@ impl<'a> Iterator for ProviderCredentialSegments<'a> {
             Self::Contiguous(value) => value.take(),
             Self::Callback(segments) => segments.next(),
             Self::Process(segments) => segments.next(),
+            Self::Unix(value) => value.take(),
         }
     }
 }
@@ -502,6 +555,20 @@ impl fmt::Debug for ProviderCredentialSet {
                         .count(),
                 )
                 .field("charged_bytes", &credentials.storage.charged_bytes())
+                .finish(),
+            Self::Unix(credentials) => formatter
+                .debug_struct("ProviderCredentialSet")
+                .field("representation", &"unix")
+                .field("count", &credentials.values.len())
+                .field(
+                    "present_count",
+                    &credentials
+                        .values
+                        .iter()
+                        .filter(|value| value.is_some())
+                        .count(),
+                )
+                .field("material_bytes", &credentials.storage.as_slice().len())
                 .finish(),
         }
     }
@@ -850,7 +917,7 @@ pub(crate) struct ProviderRequestHeaders<'a> {
 
 const MAX_INCLUDED_HEADER_VALUE_BYTES: usize = 64 * 1024;
 const MAX_INCLUDED_HEADERS_BYTES: usize = 1024 * 1024;
-const MAX_PROVIDER_REQUEST_ID_BYTES: usize = 4096;
+pub(super) const MAX_PROVIDER_REQUEST_ID_BYTES: usize = 4096;
 
 impl<'a> ProviderRequestHeaders<'a> {
     pub(crate) fn new(fields: &'a [IncludedHeader<'a>]) -> Result<Self, RequestShapeError> {
@@ -927,10 +994,12 @@ pub(crate) struct GuardedProviderBody<'a> {
 
 pub(crate) struct ProviderRequest<'a> {
     pub(crate) request_id: &'a str,
+    pub(crate) rule_id: &'a str,
     pub(crate) url: &'a str,
     pub(crate) method: &'a str,
     pub(crate) client_ip: &'a str,
     pub(crate) headers: Option<&'a ProviderRequestHeaders<'a>>,
+    pub(crate) identity: Option<&'a ProviderIdentityProjection>,
     pub(crate) body: Option<GuardedProviderBody<'a>>,
 }
 
@@ -949,6 +1018,8 @@ impl ProviderRequest<'_> {
         write_json_string(&mut writer, correlation_id)?;
         writer.write_all(b",\"requestId\":")?;
         write_json_string(&mut writer, self.request_id)?;
+        writer.write_all(b",\"ruleId\":")?;
+        write_json_string(&mut writer, self.rule_id)?;
         writer.write_all(b",\"type\":\"request\",\"url\":")?;
         write_json_string(&mut writer, self.url)?;
         writer.write_all(b",\"method\":")?;
@@ -959,6 +1030,10 @@ impl ProviderRequest<'_> {
             writer.write_all(b",\"headers\":")?;
             serde_json::to_writer(&mut writer, headers)
                 .map_err(|_| RequestShapeError::Serialization)?;
+        }
+        if let Some(identity) = self.identity {
+            writer.write_all(b",\"identity\":")?;
+            write_provider_identity(&mut writer, identity)?;
         }
         if let Some(body) = &self.body {
             writer.write_all(b",\"body\":{\"encoding\":\"base64\"")?;
@@ -995,6 +1070,8 @@ impl ProviderRequest<'_> {
         write_json_string_async(&mut writer, correlation_id).await?;
         writer.write_all(b",\"requestId\":").await?;
         write_json_string_async(&mut writer, self.request_id).await?;
+        writer.write_all(b",\"ruleId\":").await?;
+        write_json_string_async(&mut writer, self.rule_id).await?;
         writer.write_all(b",\"type\":\"request\",\"url\":").await?;
         write_json_string_async(&mut writer, self.url).await?;
         writer.write_all(b",\"method\":").await?;
@@ -1022,6 +1099,10 @@ impl ProviderRequest<'_> {
             }
             writer.write_all(b"}").await?;
         }
+        if let Some(identity) = self.identity {
+            writer.write_all(b",\"identity\":").await?;
+            write_provider_identity_async(&mut writer, identity).await?;
+        }
         if let Some(body) = &self.body {
             writer
                 .write_all(b",\"body\":{\"encoding\":\"base64\"")
@@ -1044,7 +1125,11 @@ impl ProviderRequest<'_> {
     }
 
     fn prevalidate(&self, correlation_id: &str) -> Result<(), RequestShapeError> {
-        if self.request_id.is_empty() || self.request_id.len() > MAX_PROVIDER_REQUEST_ID_BYTES {
+        if self.request_id.is_empty()
+            || self.request_id.len() > MAX_PROVIDER_REQUEST_ID_BYTES
+            || self.rule_id.is_empty()
+            || self.rule_id.len() > super::MAX_PROVIDER_RULE_ID_BYTES
+        {
             return Err(RequestShapeError::RequestId);
         }
         if correlation_id.len() != PROCESS_PROVIDER_CORRELATION_ID_BYTES
@@ -1063,6 +1148,78 @@ impl ProviderRequest<'_> {
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+fn write_provider_identity(
+    mut writer: impl Write,
+    identity: &ProviderIdentityProjection,
+) -> Result<(), RequestShapeError> {
+    match identity {
+        ProviderIdentityProjection::Disabled => writer.write_all(b"{\"state\":\"disabled\"}")?,
+        ProviderIdentityProjection::Anonymous => writer.write_all(b"{\"state\":\"anonymous\"}")?,
+        ProviderIdentityProjection::Authenticated { principal, groups } => {
+            writer.write_all(b"{\"state\":\"authenticated\",\"principal\":{\"authority\":")?;
+            write_json_string(&mut writer, principal.authority.as_str())?;
+            writer.write_all(b",\"id\":")?;
+            write_json_string(&mut writer, principal.id.as_str())?;
+            writer.write_all(b",\"kind\":")?;
+            write_json_string(&mut writer, principal.kind.as_str())?;
+            writer.write_all(b"},\"groups\":[")?;
+            for (index, group) in groups.iter().enumerate() {
+                if index != 0 {
+                    writer.write_all(b",")?;
+                }
+                writer.write_all(b"{\"authority\":")?;
+                write_json_string(&mut writer, group.authority().as_str())?;
+                writer.write_all(b",\"id\":")?;
+                write_json_string(&mut writer, group.id().as_str())?;
+                writer.write_all(b"}")?;
+            }
+            writer.write_all(b"]}")?;
+        }
+    }
+    Ok(())
+}
+
+async fn write_provider_identity_async<W>(
+    writer: &mut ScratchAsyncWriter<'_, W>,
+    identity: &ProviderIdentityProjection,
+) -> Result<(), RequestStreamError>
+where
+    W: AsyncWrite + Unpin,
+{
+    match identity {
+        ProviderIdentityProjection::Disabled => {
+            writer.write_all(b"{\"state\":\"disabled\"}").await?;
+        }
+        ProviderIdentityProjection::Anonymous => {
+            writer.write_all(b"{\"state\":\"anonymous\"}").await?;
+        }
+        ProviderIdentityProjection::Authenticated { principal, groups } => {
+            writer
+                .write_all(b"{\"state\":\"authenticated\",\"principal\":{\"authority\":")
+                .await?;
+            write_json_string_async(writer, principal.authority.as_str()).await?;
+            writer.write_all(b",\"id\":").await?;
+            write_json_string_async(writer, principal.id.as_str()).await?;
+            writer.write_all(b",\"kind\":").await?;
+            write_json_string_async(writer, principal.kind.as_str()).await?;
+            writer.write_all(b"},\"groups\":[").await?;
+            for (index, group) in groups.iter().enumerate() {
+                if index != 0 {
+                    writer.write_all(b",").await?;
+                }
+                writer.write_all(b"{\"authority\":").await?;
+                write_json_string_async(writer, group.authority().as_str()).await?;
+                writer.write_all(b",\"id\":").await?;
+                write_json_string_async(writer, group.id().as_str()).await?;
+                writer.write_all(b"}").await?;
+            }
+            writer.write_all(b"]}").await?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) struct ProviderRequestCommit {
@@ -2194,6 +2351,9 @@ impl Drop for SecretBytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use access_identity::{
+        AuthorityId, GroupId, GroupRef, PrincipalId, PrincipalKind, ProviderPrincipalProjection,
+    };
     use http::header::CONTENT_TYPE;
     use std::net::{IpAddr, Ipv4Addr};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2312,9 +2472,11 @@ mod tests {
         let decoded = decoded.finish();
         let request = ProviderRequest {
             request_id: "request-1",
+            rule_id: "rule-1",
             url: "https://example.test/path",
             method: "GET",
             client_ip: "127.0.0.1",
+            identity: None,
             headers: Some(&headers),
             body: Some(GuardedProviderBody {
                 content_type: Some("application/json"),
@@ -2329,7 +2491,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(serialized).unwrap(),
             format!(
-                "{{\"id\":\"{TEST_CORRELATION_ID}\",\"requestId\":\"request-1\",\"type\":\"request\",\"url\":\"https://example.test/path\",\"method\":\"GET\",\"clientIp\":\"127.0.0.1\",\"headers\":{{\"content-type\":[\"first\",\"second\"]}},\"body\":{{\"encoding\":\"base64\",\"contentType\":\"application/json\",\"contentEncoding\":\"identity\",\"data\":\"e30=\"}}}}\n"
+                "{{\"id\":\"{TEST_CORRELATION_ID}\",\"requestId\":\"request-1\",\"ruleId\":\"rule-1\",\"type\":\"request\",\"url\":\"https://example.test/path\",\"method\":\"GET\",\"clientIp\":\"127.0.0.1\",\"headers\":{{\"content-type\":[\"first\",\"second\"]}},\"body\":{{\"encoding\":\"base64\",\"contentType\":\"application/json\",\"contentEncoding\":\"identity\",\"data\":\"e30=\"}}}}\n"
             )
         );
     }
@@ -2354,9 +2516,11 @@ mod tests {
 
         let request = ProviderRequest {
             request_id: "request-1",
+            rule_id: "rule-1",
             url: "https://example.test/path",
             method: "POST",
             client_ip: "127.0.0.1",
+            identity: None,
             headers: None,
             body: Some(GuardedProviderBody {
                 content_type: None,
@@ -2380,9 +2544,11 @@ mod tests {
         let url = format!("https://example.test/{}", "x".repeat(2 * 64 * 1024 + 7));
         let request = ProviderRequest {
             request_id: "request-1",
+            rule_id: "rule-1",
             url: &url,
             method: "GET",
             client_ip: "127.0.0.1",
+            identity: None,
             headers: None,
             body: None,
         };
@@ -2430,9 +2596,11 @@ mod tests {
         let body = body.finish();
         let request = ProviderRequest {
             request_id: "request-1",
+            rule_id: "rule-1",
             url: "https://example.test/",
             method: "POST",
             client_ip: "127.0.0.1",
+            identity: None,
             headers: None,
             body: Some(GuardedProviderBody {
                 content_type: None,
@@ -2490,9 +2658,11 @@ mod tests {
             let headers = ProviderRequestHeaders::new(&header_fields).unwrap();
             let request = ProviderRequest {
                 request_id: "id-\"-\\-\u{8}-\u{c}-\n-\r-\t-\u{1}-é-雪",
+                rule_id: "rule-1",
                 url: "https://example.test/\"/\\/\u{8}/\u{c}/\n/\r/\t/\u{1}/é/雪",
                 method: "MÉTHOD",
                 client_ip: "雪",
+                identity: None,
                 headers: Some(&headers),
                 body: Some(GuardedProviderBody {
                     content_type: Some("application/octet-stream"),
@@ -2521,6 +2691,82 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn async_process_request_exactly_matches_sync_for_every_identity_state() {
+        let authority = AuthorityId::new("parity-authority").unwrap();
+        let identities = [
+            ProviderIdentityProjection::Disabled,
+            ProviderIdentityProjection::Anonymous,
+            ProviderIdentityProjection::Authenticated {
+                principal: ProviderPrincipalProjection {
+                    authority: authority.clone(),
+                    id: PrincipalId::new("parity-principal").unwrap(),
+                    kind: PrincipalKind::System,
+                },
+                groups: vec![
+                    GroupRef::new(authority.clone(), GroupId::new("auditors").unwrap()),
+                    GroupRef::new(authority, GroupId::new("operators").unwrap()),
+                ]
+                .into_boxed_slice(),
+            },
+        ];
+        let expected = [
+            serde_json::json!({"state": "disabled"}),
+            serde_json::json!({"state": "anonymous"}),
+            serde_json::json!({
+                "state": "authenticated",
+                "principal": {
+                    "authority": "parity-authority",
+                    "id": "parity-principal",
+                    "kind": "system"
+                },
+                "groups": [
+                    {"authority": "parity-authority", "id": "auditors"},
+                    {"authority": "parity-authority", "id": "operators"}
+                ]
+            }),
+        ];
+
+        for (identity, expected_identity) in identities.iter().zip(expected) {
+            let request = ProviderRequest {
+                request_id: "request-1",
+                rule_id: "rule-1",
+                url: "https://example.test/identity",
+                method: "GET",
+                client_ip: "127.0.0.1",
+                identity: Some(identity),
+                headers: None,
+                body: None,
+            };
+            let mut synchronous = Vec::new();
+            request
+                .write_compact(TEST_CORRELATION_ID, &mut synchronous)
+                .unwrap();
+
+            let allocation =
+                crate::safety::wire_body::guarded_body_allocation_bytes(64 * 1024).unwrap();
+            let pool = WireBodyPool::new(allocation, allocation);
+            let guard = pool.begin_for_test(
+                allocation,
+                WireBodyQuotaKey::from_peer(IpAddr::V4(Ipv4Addr::LOCALHOST), |_| false),
+            );
+            let mut scratch = guard.stream_scratch().unwrap();
+            let mut asynchronous = Vec::new();
+            let commit = request
+                .stream_before_commit(TEST_CORRELATION_ID, &mut asynchronous, &mut scratch)
+                .await
+                .unwrap();
+            drop(scratch);
+            commit.commit(&mut asynchronous).await.unwrap();
+
+            assert_eq!(asynchronous, synchronous);
+            let encoded: serde_json::Value = serde_json::from_slice(&asynchronous).unwrap();
+            assert_eq!(encoded["identity"], expected_identity);
+            assert_eq!(guard.live_bytes(), 0);
+            assert_eq!(pool.global_charge(), 0);
+        }
+    }
+
     #[test]
     fn invalid_body_metadata_fails_before_any_writer_byte() {
         let peak = crate::safety::wire_body::guarded_body_allocation_bytes(1).unwrap();
@@ -2540,9 +2786,11 @@ mod tests {
         ] {
             let request = ProviderRequest {
                 request_id: "request-1",
+                rule_id: "rule-1",
                 url: "https://example.test/",
                 method: "POST",
                 client_ip: "127.0.0.1",
+                identity: None,
                 headers: None,
                 body: Some(GuardedProviderBody {
                     content_type,
@@ -2565,9 +2813,11 @@ mod tests {
         for request_id in ["", oversized.as_str()] {
             let request = ProviderRequest {
                 request_id,
+                rule_id: "rule-1",
                 url: "https://example.test/",
                 method: "GET",
                 client_ip: "127.0.0.1",
+                identity: None,
                 headers: None,
                 body: None,
             };
@@ -2581,9 +2831,11 @@ mod tests {
 
         let request = ProviderRequest {
             request_id: "request-1",
+            rule_id: "rule-1",
             url: "https://example.test/",
             method: "GET",
             client_ip: "127.0.0.1",
+            identity: None,
             headers: None,
             body: None,
         };
@@ -2607,9 +2859,11 @@ mod tests {
         let headers = ProviderRequestHeaders { fields: &fields };
         let request = ProviderRequest {
             request_id: "request-1",
+            rule_id: "rule-1",
             url: "https://example.test/",
             method: "GET",
             client_ip: "127.0.0.1",
+            identity: None,
             headers: Some(&headers),
             body: None,
         };
@@ -2680,9 +2934,11 @@ mod tests {
         };
         let request = ProviderRequest {
             request_id: "request-1",
+            rule_id: "rule-1",
             url: "https://example.test/",
             method: "GET",
             client_ip: "127.0.0.1",
+            identity: None,
             headers: Some(&headers),
             body: None,
         };
@@ -3114,6 +3370,15 @@ mod tests {
             ),
             Err(AssignedResponseError::MissingRequiredOutput)
         ));
+        for response in [
+            r#"{"id":"request-1","type":"response","decision":"allow","identity":{"state":"anonymous"},"values":{"token":"a"}}"#,
+            r#"{"id":"request-1","type":"response","decision":"allow","x-aw-identity-token":"secret","values":{"token":"a"}}"#,
+        ] {
+            assert!(matches!(
+                assigned_result(response, &outputs, false),
+                Err(AssignedResponseError::InvalidShape)
+            ));
+        }
     }
 
     #[test]

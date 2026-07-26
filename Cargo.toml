@@ -8,8 +8,8 @@ authors = ["tsagent <tsagent@example.com>"]
 description = "Rust rewrite of acl-proxy with HTTP/2, streaming, and TOML configuration."
 
 [workspace]
-members = [".", "crates/transparent-uds-relay"]
-default-members = [".", "crates/transparent-uds-relay"]
+members = [".", "crates/access-flow-relay"]
+default-members = [".", "crates/access-flow-relay"]
 resolver = "2"
 
 [workspace.package]
@@ -56,6 +56,11 @@ rustls-webpki = { version = "=0.103.13", default-features = false, features = ["
 tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
 fs2 = "0.4"
 humantime = "2.1"
+access-async-contracts = { path = "../access-runtime/crates/access-async-contracts", version = "=0.1.0" }
+access-flow = { path = "../access-runtime/crates/access-flow", version = "=0.1.0" }
+access-flow-unix = { path = "../access-runtime/crates/access-flow-unix", version = "=0.1.0" }
+access-identity = { path = "../access-runtime/crates/access-identity", version = "=0.1.0" }
+access-rpc-framing = { path = "../access-runtime/crates/access-rpc-framing", version = "=0.1.0" }
 http-access-types = { path = "../access-runtime/crates/http-access-types", version = "=0.1.0" }
 http-access-url = { path = "../access-runtime/crates/http-access-url", version = "=0.1.0" }
 http-access-runtime = { path = "../access-runtime/crates/http-access-runtime", version = "=0.1.0" }
@@ -68,9 +73,6 @@ credential-core = { path = "../access-runtime/crates/credential-core", version =
 libc = "0.2"
 rustix = { version = "=1.1.4", default-features = false, features = ["std", "fs", "process"] }
 socket2 = { version = "0.6", features = ["all"] }
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-acl-proxy-transparent-uds-relay = { path = "crates/transparent-uds-relay", features = ["test-seam"] }
 
 [dev-dependencies]
 assert_cmd = "2.0"

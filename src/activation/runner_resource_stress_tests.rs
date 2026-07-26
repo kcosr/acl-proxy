@@ -1,14 +1,16 @@
 use std::future::poll_fn;
-use std::io;
+use std::io::{self, IoSlice};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 #[cfg(target_os = "linux")]
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 #[cfg(target_os = "linux")]
 use std::time::Instant;
@@ -80,6 +82,61 @@ impl Drop for OriginSocketGuard {
     fn drop(&mut self) {
         let previous = self.0 .0.fetch_sub(1, Ordering::AcqRel);
         assert!(previous > 0, "origin socket accounting underflowed");
+    }
+}
+
+struct TrackedOriginIo<T> {
+    // Rust drops fields in declaration order, so the transport precedes its accounting guard.
+    io: T,
+    _active: OriginSocketGuard,
+}
+
+impl<T> TrackedOriginIo<T> {
+    fn new(io: T, active: OriginSocketGuard) -> Self {
+        Self {
+            io,
+            _active: active,
+        }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for TrackedOriginIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_read(context, buffer)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for TrackedOriginIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().io).poll_write(context, buffer)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_flush(context)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_shutdown(context)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffers: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().io).poll_write_vectored(context, buffers)
     }
 }
 
@@ -159,7 +216,7 @@ impl StressOrigins {
                 let cancelled_body = cancelled_body.clone();
                 let success_body = success_body.clone();
                 connections.push(tokio::spawn(async move {
-                    let _active = activity.enter();
+                    let stream = TrackedOriginIo::new(stream, activity.enter());
                     serve_h2_origin_connection(stream, cancelled_body, success_body).await;
                 }));
             }
@@ -357,7 +414,10 @@ async fn h1_request_backpressure_origin(mut stream: tokio::net::TcpStream) {
         }
     })
     .await;
-    assert!(written > 0, "request-backpressure response made no progress");
+    assert!(
+        written > 0,
+        "request-backpressure response made no progress"
+    );
     assert!(
         written < H1_BODY_BYTES,
         "request-backpressure response was completely buffered"
@@ -400,9 +460,23 @@ async fn h1_response_backpressure_origin(mut stream: tokio::net::TcpStream) {
 }
 
 async fn serve_h2_origin_connection(
-    stream: tokio::net::TcpStream,
+    stream: TrackedOriginIo<tokio::net::TcpStream>,
     cancelled_body: Bytes,
     success_body: Bytes,
+) {
+    serve_h2_origin_connection_with_hook(stream, cancelled_body, success_body, None).await;
+}
+
+struct H2DriverCompletionHook {
+    completed: tokio::sync::oneshot::Sender<()>,
+    release_handler: tokio::sync::oneshot::Receiver<()>,
+}
+
+async fn serve_h2_origin_connection_with_hook(
+    stream: TrackedOriginIo<tokio::net::TcpStream>,
+    cancelled_body: Bytes,
+    success_body: Bytes,
+    completion_hook: Option<H2DriverCompletionHook>,
 ) {
     let mut connection = h2::server::handshake(stream).await.unwrap();
     let (request, respond) = tokio::time::timeout(BATCH_TIMEOUT, connection.accept())
@@ -417,6 +491,17 @@ async fn serve_h2_origin_connection(
         }
     });
     send_h2_response(respond, cancelled, cancelled_body, success_body).await;
+    if let Some(completion_hook) = completion_hook {
+        tokio::time::timeout(BATCH_TIMEOUT, async {
+            while !driver.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("H2 origin driver did not finish before its completion hook");
+        completion_hook.completed.send(()).unwrap();
+        completion_hook.release_handler.await.unwrap();
+    }
     tokio::time::timeout(BATCH_TIMEOUT, driver)
         .await
         .expect("H2 origin connection was not closed after its response")
@@ -1218,6 +1303,57 @@ fn process_resource_thresholds_are_exact_and_non_vacuous() {
     let mut origin = samples;
     origin[3].active_origin_sockets = 1;
     assert!(rejects(origin));
+}
+
+#[tokio::test]
+async fn origin_socket_accounting_ends_with_io_ownership_before_handler_completion() {
+    let activity = OriginActivity::new();
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let client_stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let (origin_stream, _) = listener.accept().await.unwrap();
+    let origin_stream = TrackedOriginIo::new(origin_stream, activity.enter());
+    let (driver_completed, driver_completed_receiver) = tokio::sync::oneshot::channel();
+    let (release_handler, handler_release) = tokio::sync::oneshot::channel();
+    let handler = tokio::spawn(async move {
+        serve_h2_origin_connection_with_hook(
+            origin_stream,
+            Bytes::from_static(b"cancelled"),
+            Bytes::from_static(b"success"),
+            Some(H2DriverCompletionHook {
+                completed: driver_completed,
+                release_handler: handler_release,
+            }),
+        )
+        .await;
+    });
+
+    let (mut sender, connection) = h2::client::handshake(client_stream).await.unwrap();
+    let connection = tokio::spawn(connection);
+    sender = sender.ready().await.unwrap();
+    let request = Request::builder()
+        .method("GET")
+        .version(Version::HTTP_2)
+        .uri(format!("http://{address}/h2/success"))
+        .body(())
+        .unwrap();
+    let (response, _) = sender.send_request(request, true).unwrap();
+    let mut body = response.await.unwrap().into_body();
+    while let Some(chunk) = body.data().await {
+        chunk.unwrap();
+    }
+    drop(body);
+    drop(sender);
+    connection.abort();
+    connection.await.unwrap_err();
+
+    driver_completed_receiver.await.unwrap();
+    assert_eq!(activity.count(), 0);
+    assert!(!handler.is_finished());
+    release_handler.send(()).unwrap();
+    handler.await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]

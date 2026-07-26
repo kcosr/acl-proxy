@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import tomllib
 from typing import Any
 
@@ -22,8 +24,34 @@ ALLOWED_LICENSES = {
 }
 REGISTRY = "https://github.com/rust-lang/crates.io-index"
 PRODUCT_VERSION = "0.3.0-rc.1"
-RUNTIME_COMMIT = "bca85d11787afe988dc63cad817f20434523cf66"
+RUNTIME_COMMIT = "71bee2c6d3f3c70d7f4b79f77b99eafd8ef2b039"
+RUNTIME_TREE = "cbf64aae94422e526600fb8d8e309d535c01a72b"
 PRODUCT_INITIAL_COMMIT = "a829f43552c7118d1f206b9e4112b3c747eecd50"
+PRIVATE_TRANSPORT_PACKAGES = {
+    "h2",
+    "http",
+    "http-body",
+    "http-body-util",
+    "hyper",
+    "hyper-util",
+}
+EXPECTED_RUNTIME_COVERAGE = {
+    "access-async-contracts": "independently authored Access Flow foundation",
+    "access-flow": "independently authored Access Flow foundation",
+    "access-flow-conformance": "independently authored Access Flow foundation",
+    "access-flow-relay": "independently authored Access Flow foundation",
+    "access-flow-unix": "independently authored Access Flow foundation",
+    "access-identity": "independently authored Access Flow foundation",
+    "access-rpc-framing": "independently authored Access Flow foundation",
+    "credential-core": "independently authored product-neutral contract",
+    "http-access-conformance": "moved and normalized conformance inputs",
+    "http-access-mitm": "moved and redesigned product behavior",
+    "http-access-policy-acl": "independently authored product-neutral contract",
+    "http-access-redaction": "moved and redesigned product behavior",
+    "http-access-runtime": "mixed moved behavior and independently authored contracts",
+    "http-access-types": "independently authored product-neutral contracts",
+    "http-access-url": "moved and redesigned product behavior",
+}
 TRANSPORT_PACKAGES = {
     "h2": ("0.4.15", True),
     "http": ("1.4.2", True),
@@ -173,12 +201,73 @@ def load_metadata(root: Path, supplied: Path | None) -> dict[str, Any]:
         fail(f"cannot load locked offline Cargo metadata: {error}")
 
 
+def resolved_product_package(root: Path, metadata: dict[str, Any]) -> dict[str, Any]:
+    packages = metadata.get("packages")
+    resolve = metadata.get("resolve")
+    if not isinstance(packages, list) or not isinstance(resolve, dict):
+        fail("locked metadata lacks packages or the resolve graph")
+    root_id = resolve.get("root")
+    if not isinstance(root_id, str):
+        fail("locked metadata lacks the product root resolution")
+    product = [
+        package
+        for package in packages
+        if package.get("id") == root_id
+        and package.get("name") == "acl-proxy"
+        and isinstance(package.get("manifest_path"), str)
+    ]
+    if len(product) != 1:
+        fail("locked metadata lacks one resolved acl-proxy root package")
+    metadata_root = Path(product[0]["manifest_path"]).resolve().parent
+    if metadata_root != root:
+        fail("locked metadata acl-proxy manifest root differs from the validated product root")
+    return product[0]
+
+
+def dependency_tables(manifest: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    tables: list[tuple[str, dict[str, Any]]] = []
+    for table_name in ("dependencies", "dev-dependencies", "build-dependencies"):
+        table = manifest.get(table_name)
+        if isinstance(table, dict):
+            tables.append((table_name, table))
+    targets = manifest.get("target")
+    if isinstance(targets, dict):
+        for target_name, target in targets.items():
+            if not isinstance(target, dict):
+                continue
+            for table_name in ("dependencies", "dev-dependencies", "build-dependencies"):
+                table = target.get(table_name)
+                if isinstance(table, dict):
+                    tables.append((f"target.{target_name}.{table_name}", table))
+    return tables
+
+
+def dependency_package_name(
+    name: str,
+    specification: Any,
+    workspace_dependencies: dict[str, Any],
+) -> str:
+    if not isinstance(specification, dict):
+        return name
+    package = specification.get("package")
+    if isinstance(package, str):
+        return package
+    if specification.get("workspace") is True:
+        inherited = workspace_dependencies.get(name)
+        if inherited is None:
+            fail(f"workspace dependency {name!r} has no workspace definition")
+        return dependency_package_name(name, inherited, {})
+    return name
+
+
 def check_manifest(root: Path) -> None:
+    if (root / "crates/transparent-uds-relay").exists():
+        fail("obsolete transparent UDS relay crate is present")
     manifest = load_toml(root / "Cargo.toml")
     workspace = manifest.get("workspace")
     if not isinstance(workspace, dict):
         fail("Cargo.toml lacks [workspace]")
-    expected_members = [".", "crates/transparent-uds-relay"]
+    expected_members = [".", "crates/access-flow-relay"]
     if workspace.get("members") != expected_members:
         fail("workspace members must include exactly the product and relay")
     if workspace.get("default-members") != expected_members:
@@ -198,7 +287,7 @@ def check_manifest(root: Path) -> None:
     lock_packages = lock.get("package")
     if not isinstance(lock_packages, list):
         fail("Cargo.lock lacks package records")
-    for package_name in ("acl-proxy", "acl-proxy-transparent-uds-relay"):
+    for package_name in ("acl-proxy", "acl-proxy-access-flow-relay"):
         locked_product = [
             package for package in lock_packages if package.get("name") == package_name
         ]
@@ -208,11 +297,31 @@ def check_manifest(root: Path) -> None:
                 f"{PRODUCT_VERSION} package"
             )
 
-    relay = load_toml(root / "crates/transparent-uds-relay/Cargo.toml").get("package")
-    if not isinstance(relay, dict) or relay.get("version") != {"workspace": True}:
-        fail("transparent UDS relay must inherit the workspace version")
+    relay_manifest = load_toml(root / "crates/access-flow-relay/Cargo.toml")
+    relay = relay_manifest.get("package")
+    if (
+        not isinstance(relay, dict)
+        or relay.get("name") != "acl-proxy-access-flow-relay"
+        or relay.get("version") != {"workspace": True}
+        or relay.get("publish") is not False
+    ):
+        fail("Access Flow relay must inherit the workspace version and remain non-publishable")
+    linux_dependencies = (
+        relay_manifest.get("target", {})
+        .get("cfg(target_os = \"linux\")", {})
+        .get("dependencies", {})
+    )
+    if not isinstance(linux_dependencies, dict):
+        fail("Access Flow relay lacks its Linux dependency table")
+    for dependency in ("access-flow-relay", "access-flow-unix"):
+        if dependency not in linux_dependencies:
+            fail(f"Access Flow relay lacks shared {dependency} ownership")
+    if "proxy-protocol-v2-codec" in linux_dependencies:
+        fail("obsolete PROXY-v2 codec remains in the Access Flow relay")
 
     release_script = read_text(root / "scripts/release.mjs")
+    if "acl-proxy-transparent-uds-relay" in release_script:
+        fail("release script retains the obsolete relay artifact")
     if 'const REPO = "kcosr/acl-proxy-access-runtime";' not in release_script:
         fail("release script must target the authoritative ACL Proxy repository")
     if 'const RELEASE_REMOTE = "access-runtime";' not in release_script:
@@ -234,24 +343,14 @@ def check_manifest(root: Path) -> None:
     if "replace" in manifest:
         fail("Cargo.toml must not contain [replace] source overrides")
 
-    dependency_tables: list[tuple[str, dict[str, Any]]] = []
-    for table_name in ("dependencies", "dev-dependencies", "build-dependencies"):
-        table = manifest.get(table_name)
-        if isinstance(table, dict):
-            dependency_tables.append((table_name, table))
-    targets = manifest.get("target")
-    if isinstance(targets, dict):
-        for target_name, target in targets.items():
-            if not isinstance(target, dict):
-                continue
-            for table_name in ("dependencies", "dev-dependencies", "build-dependencies"):
-                table = target.get(table_name)
-                if isinstance(table, dict):
-                    dependency_tables.append((f"target.{target_name}.{table_name}", table))
-    for table_name, table in dependency_tables:
+    workspace_dependencies = workspace.get("dependencies", {})
+    if not isinstance(workspace_dependencies, dict):
+        fail("workspace dependency table must be a table")
+    for table_name, table in dependency_tables(manifest):
         for name, specification in table.items():
-            package = specification.get("package") if isinstance(specification, dict) else None
-            resolved_name = package or name
+            resolved_name = dependency_package_name(
+                name, specification, workspace_dependencies
+            )
             if resolved_name in {"http-body", "http-body-util", "hyper", "hyper-util"}:
                 fail(
                     "acl-proxy must not directly depend on private transport package "
@@ -259,13 +358,29 @@ def check_manifest(root: Path) -> None:
                 )
             if resolved_name == "http" and (table_name != "dependencies" or name != "http"):
                 fail("http must remain the canonical root production dependency")
-            if (name == "h2" or package == "h2") and (
+            package = specification.get("package") if isinstance(specification, dict) else None
+            if resolved_name == "h2" and (
                 table_name != "dev-dependencies" or name != "h2" or package is not None
             ):
                 fail("h2 must remain the canonical root development-only dependency")
 
+    for table_name, table in dependency_tables(relay_manifest):
+        for name, specification in table.items():
+            resolved_name = dependency_package_name(
+                name, specification, workspace_dependencies
+            )
+            if resolved_name in PRIVATE_TRANSPORT_PACKAGES:
+                fail(
+                    "Access Flow relay must not directly depend on private transport package "
+                    f"{resolved_name} ({table_name}.{name})"
+                )
 
-def check_transport_resolution(root: Path, metadata: dict[str, Any]) -> None:
+
+def check_transport_resolution(
+    root: Path,
+    metadata: dict[str, Any],
+    product: dict[str, Any],
+) -> None:
     packages = metadata.get("packages")
     if not isinstance(packages, list):
         fail("locked metadata lacks package records")
@@ -283,19 +398,72 @@ def check_transport_resolution(root: Path, metadata: dict[str, Any]) -> None:
         elif source is not None:
             fail("locked Hyper 1.10.1 must be source-less and resolve from the runtime fork")
 
-    product = [package for package in packages if package.get("name") == "acl-proxy"]
-    if len(product) != 1 or not isinstance(product[0].get("manifest_path"), str):
-        fail("locked metadata lacks one canonical acl-proxy manifest path")
-    if product[0].get("version") != PRODUCT_VERSION:
+    if product.get("version") != PRODUCT_VERSION:
         fail(f"locked metadata must resolve acl-proxy {PRODUCT_VERSION}")
-    if product[0].get("publish") != []:
+    if product.get("publish") != []:
         fail("locked metadata must retain the acl-proxy publication guard")
+    relay_manifest_path = (root / "crates/access-flow-relay/Cargo.toml").resolve()
+    relay_packages = [
+        package
+        for package in packages
+        if package.get("name") == "acl-proxy-access-flow-relay"
+        and package.get("version") == PRODUCT_VERSION
+        and isinstance(package.get("manifest_path"), str)
+        and Path(package["manifest_path"]).resolve() == relay_manifest_path
+    ]
+    if len(relay_packages) != 1:
+        fail("locked metadata must resolve one exact Access Flow relay package")
+    relay = relay_packages[0]
+    if relay.get("publish") != []:
+        fail("locked metadata must retain the Access Flow relay publication guard")
+    relay_id = relay.get("id")
+    workspace_members = metadata.get("workspace_members")
+    default_members = metadata.get("workspace_default_members")
+    if (
+        not isinstance(relay_id, str)
+        or not isinstance(workspace_members, list)
+        or not isinstance(default_members, list)
+        or relay_id not in workspace_members
+        or relay_id not in default_members
+    ):
+        fail("locked metadata does not retain the relay as a default workspace member")
+    resolve = metadata.get("resolve")
+    nodes = resolve.get("nodes") if isinstance(resolve, dict) else None
+    if not isinstance(nodes, list):
+        fail("locked metadata lacks resolution nodes")
+    relay_nodes = [node for node in nodes if node.get("id") == relay_id]
+    if len(relay_nodes) != 1:
+        fail("locked metadata lacks one exact Access Flow relay resolution node")
+    package_by_id = {
+        package.get("id"): package
+        for package in packages
+        if isinstance(package.get("id"), str)
+    }
+    relay_dependencies = relay_nodes[0].get("dependencies")
+    relay_edges = relay_nodes[0].get("deps")
+    if not isinstance(relay_dependencies, list) or not isinstance(relay_edges, list):
+        fail("locked metadata relay resolution node is malformed")
+    edge_packages = []
+    for edge in relay_edges:
+        package_id = edge.get("pkg") if isinstance(edge, dict) else None
+        package = package_by_id.get(package_id)
+        if package is None:
+            fail("locked metadata relay dependency edge has no package")
+        edge_packages.append(package_id)
+        if package.get("name") in PRIVATE_TRANSPORT_PACKAGES:
+            fail(
+                "locked metadata gives the Access Flow relay a private transport dependency "
+                f"{package.get('name')}"
+            )
+    if sorted(relay_dependencies) != sorted(edge_packages):
+        fail("locked metadata relay dependency lists disagree")
     hyper = next(package for package in packages if package.get("name") == "hyper")
     manifest_path = hyper.get("manifest_path")
     if not isinstance(manifest_path, str):
         fail("locked Hyper 1.10.1 lacks its resolved manifest path")
-    product_root = Path(product[0]["manifest_path"]).parent
-    expected = (product_root.parent / "access-runtime" / "third_party" / "hyper" / "Cargo.toml").resolve()
+    expected = (
+        root.parent / "access-runtime" / "third_party" / "hyper" / "Cargo.toml"
+    ).resolve()
     if Path(manifest_path).resolve() != expected:
         fail("locked Hyper 1.10.1 does not resolve to the canonical sibling runtime fork")
 
@@ -312,6 +480,190 @@ def check_transport_resolution(root: Path, metadata: dict[str, Any]) -> None:
             fail(f"Cargo.lock {name} {version} must resolve from crates.io")
         if not registry and source is not None:
             fail("Cargo.lock Hyper 1.10.1 must be source-less")
+
+
+def source_tree_for_directory(root: Path) -> str:
+    with tempfile.TemporaryDirectory(prefix="acl-proxy-runtime-tree-") as temporary:
+        scratch = Path(temporary)
+        git_directory = scratch / "repository.git"
+        template_directory = scratch / "templates"
+        template_directory.mkdir()
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("GIT_")
+        }
+        environment.update(
+            {
+                "GIT_ATTR_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_TERMINAL_PROMPT": "0",
+                "HOME": str(scratch),
+                "LC_ALL": "C",
+                "XDG_CONFIG_HOME": str(scratch / "xdg"),
+            }
+        )
+
+        def git(*arguments: str) -> str:
+            try:
+                return subprocess.run(
+                    ["git", *arguments],
+                    check=True,
+                    capture_output=True,
+                    cwd=root,
+                    env=environment,
+                    text=True,
+                ).stdout.strip()
+            except (OSError, subprocess.CalledProcessError) as error:
+                fail(f"cannot reconstruct authenticated runtime source tree: {error}")
+
+        git(
+            "-c",
+            "init.defaultBranch=source-tree",
+            "init",
+            "--quiet",
+            "--bare",
+            f"--template={template_directory}",
+            str(git_directory),
+        )
+        source_arguments = (
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "core.filemode=true",
+            "-c",
+            "core.symlinks=true",
+            f"--git-dir={git_directory}",
+            f"--work-tree={root}",
+        )
+        git(*source_arguments, "add", "--force", "--all", "--", ".")
+        tree = git(*source_arguments, "write-tree")
+        if not re.fullmatch(r"[0-9a-f]{40}", tree):
+            fail("reconstructed authenticated runtime source tree is invalid")
+        return tree
+
+
+def reject_git_metadata(root: Path) -> None:
+    def walk_error(error: OSError) -> None:
+        fail(f"cannot inspect authenticated runtime source archive: {error}")
+
+    for _current, directories, files in os.walk(
+        root,
+        followlinks=False,
+        onerror=walk_error,
+    ):
+        if ".git" in directories or ".git" in files:
+            fail("authenticated runtime source archive contains Git metadata")
+
+
+def check_runtime_source(
+    root: Path,
+    metadata: dict[str, Any],
+    product: dict[str, Any],
+    runtime_source_tree: str | None,
+) -> set[str]:
+    packages = metadata.get("packages")
+    if not isinstance(packages, list):
+        fail("locked metadata lacks package records")
+    if Path(product["manifest_path"]).resolve().parent != root:
+        fail("validated acl-proxy metadata root changed before runtime verification")
+    runtime_root = (root.parent / "access-runtime").resolve()
+
+    local_manifests = []
+    runtime_crates = set()
+    for package in packages:
+        if package.get("source") is not None:
+            continue
+        manifest = package.get("manifest_path")
+        if not isinstance(manifest, str):
+            fail("locked metadata contains a source-less package without a manifest path")
+        manifest_path = Path(manifest).resolve()
+        if manifest_path.is_relative_to(root):
+            continue
+        if not manifest_path.is_relative_to(runtime_root):
+            fail("locked metadata resolves a local package outside the canonical sibling runtime")
+        local_manifests.append(manifest_path)
+        relative = manifest_path.relative_to(runtime_root)
+        if (
+            len(relative.parts) == 3
+            and relative.parts[0] == "crates"
+            and relative.parts[2] == "Cargo.toml"
+        ):
+            crate_name = relative.parts[1]
+            if package.get("name") != crate_name:
+                fail(
+                    "locked metadata runtime crate name differs from its canonical path"
+                )
+            if crate_name in runtime_crates:
+                fail("locked metadata resolves a duplicate canonical runtime crate")
+            runtime_crates.add(crate_name)
+        elif (
+            relative == Path("third_party/hyper/Cargo.toml")
+            and package.get("name") == "hyper"
+        ):
+            pass
+        else:
+            fail(
+                "locked metadata resolves an unapproved source-less runtime "
+                "package path"
+            )
+    if not local_manifests:
+        fail("locked metadata resolves no canonical sibling runtime packages")
+    if not runtime_crates:
+        fail("locked metadata resolves no canonical sibling runtime crates")
+
+    if runtime_source_tree is None:
+        try:
+            top_level = subprocess.run(
+                ["git", "-C", str(runtime_root), "rev-parse", "--show-toplevel"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            head = subprocess.run(
+                ["git", "-C", str(runtime_root), "rev-parse", "--verify", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            tree = subprocess.run(
+                ["git", "-C", str(runtime_root), "rev-parse", "--verify", "HEAD^{tree}"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            status = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(runtime_root),
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        except (OSError, subprocess.CalledProcessError) as error:
+            fail(f"cannot verify canonical sibling runtime source state: {error}")
+        if Path(top_level).resolve() != runtime_root:
+            fail("canonical sibling runtime is not one complete Git worktree")
+        if head != RUNTIME_COMMIT:
+            fail("canonical sibling runtime HEAD differs from the accepted runtime commit")
+        if tree != RUNTIME_TREE:
+            fail("canonical sibling runtime tree differs from the accepted runtime tree")
+        if status:
+            fail("canonical sibling runtime worktree or index is not clean")
+    else:
+        if runtime_source_tree != RUNTIME_TREE:
+            fail("authenticated runtime source tree argument differs from the accepted runtime tree")
+        reject_git_metadata(runtime_root)
+        if source_tree_for_directory(runtime_root) != runtime_source_tree:
+            fail("authenticated runtime source archive tree differs from the accepted runtime tree")
+    return runtime_crates
 
 
 def check_deny_policy(root: Path) -> None:
@@ -444,20 +796,74 @@ def check_notices(root: Path, metadata: dict[str, Any]) -> None:
         fail("compu-brotli-sys notice checksum differs from Cargo.lock")
 
 
-def check_provenance(root: Path) -> None:
+def markdown_section(text: str, level: int, title: str) -> str:
+    marker = f"{'#' * level} {title}"
+    matches = list(re.finditer(rf"(?m)^{re.escape(marker)}$", text))
+    if len(matches) != 1:
+        fail(f"expected one {marker!r} section")
+    start = matches[0].end()
+    following = re.search(rf"(?m)^#{{1,{level}}} ", text[start:])
+    end = start + following.start() if following else len(text)
+    return text[start:end]
+
+
+def check_provenance(root: Path, shared_crates: set[str]) -> None:
     provenance = read_text(root / "PROVENANCE.md")
     for marker in (
-        PRODUCT_INITIAL_COMMIT,
         RUNTIME_COMMIT,
         "access-runtime/PROVENANCE.md",
+        "The authoritative complete origin record is",
+        "`Shared Crate Origin Coverage` inventory is the exact per-crate",
         "compu-brotli-sys` 1.2.0",
         "Google Brotli C implementation it compiles is MIT",
         "Zstandard source under BSD-3-Clause",
     ):
         if marker not in provenance:
             fail(f"PROVENANCE.md lacks required marker: {marker}")
+    if provenance.count(PRODUCT_INITIAL_COMMIT) != 1:
+        fail("PROVENANCE.md must name the exact product initial commit once")
+    initial_product_commits = re.findall(
+        r"(?m)^- Initial source commit: `([0-9a-f]{40})`$",
+        provenance,
+    )
+    if initial_product_commits != [PRODUCT_INITIAL_COMMIT]:
+        fail("PROVENANCE.md must contain one exact product initial commit record")
     if provenance.count(RUNTIME_COMMIT) != 1:
         fail("PROVENANCE.md must name the exact accepted runtime commit once")
+    accepted_runtime_commits = re.findall(
+        r"(?m)^- Accepted runtime commit:\s*\n\s*`([0-9a-f]{40})`$",
+        provenance,
+    )
+    if accepted_runtime_commits != [RUNTIME_COMMIT]:
+        fail("PROVENANCE.md must contain one exact accepted runtime commit record")
+
+    runtime_provenance = read_text(root.parent / "access-runtime/PROVENANCE.md")
+    coverage_section = markdown_section(
+        runtime_provenance, 2, "Shared Crate Origin Coverage"
+    )
+    coverage_entries = re.findall(
+        r"(?m)^- `crates/([^`]+)`: (.+)$",
+        coverage_section,
+    )
+    all_coverage_entries = re.findall(
+        r"(?m)^- `crates/([^`]+)`: (.+)$",
+        runtime_provenance,
+    )
+    if all_coverage_entries != coverage_entries:
+        fail("access-runtime provenance has a crate coverage record outside its section")
+    coverage = dict(coverage_entries)
+    if len(coverage_entries) != len(coverage):
+        fail("access-runtime provenance crate coverage contains a duplicate entry")
+    if coverage != EXPECTED_RUNTIME_COVERAGE:
+        fail(
+            "access-runtime provenance crate coverage differs from the exact "
+            "accepted classification inventory"
+        )
+    if set(coverage) != shared_crates:
+        fail(
+            "access-runtime provenance crate coverage differs from the exact "
+            "resolved shared product dependency graph"
+        )
 
 
 def check_shipped_docs(root: Path) -> None:
@@ -472,7 +878,7 @@ def check_shipped_docs(root: Path) -> None:
         "Release archives contain `acl-proxy`, the capture-body extraction helper, "
         "this README, `LICENSE`, `THIRD_PARTY_NOTICES`, and "
         "`acl-proxy.sample.toml`. Linux archives also contain the Linux-only "
-        "transparent UDS relay."
+        "Access Flow relay."
     )
     if archive_inventory not in normalized:
         fail("README lacks the exact release archive inventory")
@@ -481,7 +887,7 @@ def check_shipped_docs(root: Path) -> None:
         archive_root,
         "  bin/acl-proxy",
         "  bin/acl-proxy-extract-capture-body",
-        "  bin/acl-proxy-transparent-uds-relay  # Linux archives only",
+        "  bin/acl-proxy-access-flow-relay  # Linux archives only",
         "  README.md",
         "  LICENSE",
         "  THIRD_PARTY_NOTICES",
@@ -489,9 +895,18 @@ def check_shipped_docs(root: Path) -> None:
     )
     if any(entry not in readme for entry in required_layout):
         fail("README lacks the exact versioned release layout")
+    archive_names = (
+        "The current local candidate contains only "
+        "`acl-proxy-<version>-<acl12>-linux-x86_64.tar.gz`. The planned filename "
+        "for a future native-host-validated macOS ARM64 archive is "
+        "`acl-proxy-<version>-<acl12>-macos-arm64.tar.gz`; no macOS archive is "
+        "built or included in this candidate."
+    )
+    if archive_names not in normalized:
+        fail("README lacks the exact platform archive filenames")
     platform_inventory = (
-        "Linux archives have the three shown `bin/` entries; non-Linux archives "
-        "omit the Linux-only relay and have the other two."
+        "The current Linux archive has the three shown `bin/` entries; the planned "
+        "macOS archive would omit the Linux-only relay and have the other two."
     )
     if platform_inventory not in normalized:
         fail("README lacks the platform-specific relay archive contract")
@@ -517,9 +932,14 @@ def check_shipped_docs(root: Path) -> None:
     if "ca-cert.pem" in sample or "ca-key.pem" in sample:
         fail("sample configuration names obsolete generated CA storage files")
     packaging_gate = read_text(root / "scripts/check-packaging-policy.sh")
+    packaging_command = (
+        'python3 scripts/check-packaging-policy.py "${runtime_source_arguments[@]}"'
+    )
     audit_command = "cargo audit --no-fetch --no-yanked --deny warnings"
     deny_command = "cargo deny --locked --offline check -D warnings licenses sources"
     gate_lines = packaging_gate.splitlines()
+    if gate_lines.count(packaging_command) != 1:
+        fail("packaging gate must run the exact argument-bounded policy command")
     if gate_lines.count(audit_command) != 1:
         fail("packaging gate must run the exact offline advisory scan")
     if gate_lines.count(deny_command) != 1:
@@ -532,15 +952,26 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--metadata", type=Path)
+    parser.add_argument(
+        "--runtime-source-tree",
+        type=str,
+    )
     args = parser.parse_args()
     root = args.root.resolve()
     try:
         check_manifest(root)
         check_deny_policy(root)
         metadata = load_metadata(root, args.metadata)
-        check_transport_resolution(root, metadata)
+        product = resolved_product_package(root, metadata)
+        check_transport_resolution(root, metadata, product)
+        shared_crates = check_runtime_source(
+            root,
+            metadata,
+            product,
+            args.runtime_source_tree,
+        )
         check_notices(root, metadata)
-        check_provenance(root)
+        check_provenance(root, shared_crates)
         check_shipped_docs(root)
     except ValueError as error:
         print(f"packaging policy check failed: {error}", file=sys.stderr)

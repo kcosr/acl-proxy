@@ -44,18 +44,19 @@ http_versions = ["http1"]
 
 [egress.parent_proxy]
 kind = "acl_proxy"
-url = "http://host-proxy.example.test:8881"
+url = "https://host-proxy.example.test:8443"
+
+[egress.parent_proxy.presentation]
+kind = "bearer_environment"
+variable = "AW_IDENTITY_TOKEN"
+
+[egress.parent_proxy.tls]
+trust = "system"
 
 [[egress.request_headers]]
 operation = "remove"
 when = "always"
 name = "x-aw-policy-context"
-
-[[egress.credential_actions]]
-kind = "custom_header"
-transport_security = "cleartext_allowed"
-header = "x-aw-identity-token"
-credential = "aw_identity"
 
 [policy]
 default = "deny"
@@ -68,13 +69,6 @@ urls = ["**"]
 
 [authorization]
 internal_context_headers = ["x-aw-policy-context"]
-
-[credentials]
-allowed_custom_headers = ["x-aw-identity-token"]
-
-[credentials.sources.aw_identity]
-source = "environment"
-variable = "AW_IDENTITY_TOKEN"
 
 [observation.logging]
 level = "error"

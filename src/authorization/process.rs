@@ -41,6 +41,7 @@ struct Inner {
     response_schema: ProcessResponseSchema,
     failure_mode: CompiledProviderFailureMode,
     include_headers: Box<[HeaderName]>,
+    include_identity: bool,
     include_request_body: bool,
     max_request_body_bytes: usize,
     max_decoded_request_body_bytes: usize,
@@ -224,7 +225,9 @@ impl ProcessProvider {
             inherit_environment,
             pass_environment,
             environment,
+            blocked_environment,
             include_headers,
+            include_identity,
             include_request_body,
             allow_request_body_replacement,
             max_request_body_bytes,
@@ -243,6 +246,7 @@ impl ProcessProvider {
             inherit_environment,
             &pass_environment,
             environment,
+            &blocked_environment,
             &mut is_cancelled,
         );
         check_cancellation(&mut is_cancelled)?;
@@ -267,6 +271,7 @@ impl ProcessProvider {
             response_schema,
             failure_mode: on_failure,
             include_headers: include_headers.into_boxed_slice(),
+            include_identity,
             include_request_body,
             max_request_body_bytes,
             max_decoded_request_body_bytes,
@@ -317,6 +322,10 @@ impl ProcessProvider {
 
     pub(crate) fn include_headers(&self) -> &[HeaderName] {
         &self.inner.include_headers
+    }
+
+    pub(crate) fn include_identity(&self) -> bool {
+        self.inner.include_identity
     }
 
     pub(crate) fn failure_mode(&self) -> CompiledProviderFailureMode {
@@ -765,6 +774,7 @@ fn capture_environment(
     inherit_environment: bool,
     pass_environment: &[String],
     literal_environment: std::collections::BTreeMap<String, String>,
+    blocked_environment: &[String],
     is_cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<Box<[(OsString, OsString)]>, ProcessActivationError> {
     let mut captured = std::collections::BTreeMap::<OsString, OsString>::new();
@@ -788,6 +798,9 @@ fn capture_environment(
     }
     for (name, value) in literal_environment {
         captured.insert(OsString::from(name), OsString::from(value));
+    }
+    for name in blocked_environment {
+        captured.remove(std::ffi::OsStr::new(name));
     }
     Ok(captured.into_iter().collect::<Vec<_>>().into_boxed_slice())
 }
@@ -1532,7 +1545,9 @@ mod tests {
             inherit_environment: false,
             pass_environment: vec![],
             environment: Default::default(),
+            blocked_environment: vec![],
             include_headers: vec![],
+            include_identity: false,
             include_request_body: false,
             allow_request_body_replacement: false,
             max_request_body_bytes: 1024,
@@ -1548,9 +1563,11 @@ mod tests {
     fn request(id: &str) -> ProviderRequest<'_> {
         ProviderRequest {
             request_id: id,
+            rule_id: "rule-1",
             url: "https://example.test/resource",
             method: "GET",
             client_ip: "192.0.2.10",
+            identity: None,
             headers: None,
             body: None,
         }
@@ -1609,9 +1626,11 @@ mod tests {
             .decide_effects_allowed_for_test(
                 ProviderRequest {
                     request_id,
+                    rule_id: "rule-1",
                     url,
                     method: "GET",
                     client_ip: "198.18.1.10",
+                    identity: None,
                     headers: Some(&headers),
                     body: None,
                 },
@@ -1819,7 +1838,7 @@ for line in sys.stdin:
             &gitlab_plan,
             "providers/gitlab_acl.py",
             "providers/gitlab_acl.json",
-            &["x-aw-identity-token", "x-aw-policy-context"],
+            &["x-aw-policy-context"],
         );
         let gitlab_restart_plan = gitlab_plan.clone();
         let gitlab = ProcessProvider::activate(gitlab_plan, || false)
@@ -1841,20 +1860,17 @@ for line in sys.stdin:
                 &gitlab,
                 "git-allow",
                 "https://gitlab.example.test/group/internal.git",
-                &[
-                    ("x-aw-identity-token", "fixture-internal-identity"),
-                    ("x-aw-policy-context", "fixture-internal"),
-                ],
+                &[("x-aw-policy-context", "fixture-internal")],
             )
             .await,
-            ProcessDecision::Allow
+            ProcessDecision::Deny
         );
         assert_eq!(
             production_decision(
                 &gitlab,
                 "git-deny",
                 "https://gitlab.example.test/group/private.git",
-                &[("x-aw-identity-token", "fixture-internal-identity")],
+                &[],
             )
             .await,
             ProcessDecision::Deny
@@ -1874,10 +1890,7 @@ for line in sys.stdin:
                 &gitlab,
                 "git-unknown",
                 "https://gitlab.example.test/group/internal.git",
-                &[
-                    ("x-aw-identity-token", "fixture-unknown"),
-                    ("x-aw-policy-context", "fixture-internal"),
-                ],
+                &[("x-aw-policy-context", "fixture-internal")],
             )
             .await,
             ProcessDecision::Deny
@@ -1896,13 +1909,10 @@ for line in sys.stdin:
                 &gitlab,
                 "git-restart",
                 "https://gitlab.example.test/group/internal.git",
-                &[
-                    ("x-aw-identity-token", "fixture-internal-identity"),
-                    ("x-aw-policy-context", "fixture-internal"),
-                ],
+                &[("x-aw-policy-context", "fixture-internal")],
             )
             .await,
-            ProcessDecision::Allow
+            ProcessDecision::Deny
         );
         gitlab.retirement_started(CleanupReason::Retired);
         gitlab.cleanup(CleanupReason::Retired).await;
@@ -1920,7 +1930,7 @@ for line in sys.stdin:
             &runner_plan,
             "providers/agent_runner_acl.py",
             "providers/agent_runner_acl.json",
-            &["x-aw-identity-token"],
+            &[],
         );
         let runner_restart_plan = runner_plan.clone();
         let runner = ProcessProvider::activate(runner_plan, || false)
@@ -1932,17 +1942,17 @@ for line in sys.stdin:
                 &runner,
                 "runner-allow",
                 "https://runner.example.test/jobs/42",
-                &[("x-aw-identity-token", "fixture-runner-identity")],
+                &[],
             )
             .await,
-            ProcessDecision::Allow
+            ProcessDecision::Deny
         );
         assert_eq!(
             production_decision(
                 &runner,
                 "runner-deny",
                 "https://runner.example.test/admin",
-                &[("x-aw-identity-token", "fixture-runner-identity")],
+                &[],
             )
             .await,
             ProcessDecision::Deny
@@ -1962,7 +1972,7 @@ for line in sys.stdin:
                 &runner,
                 "runner-unknown",
                 "https://runner.example.test/jobs/42",
-                &[("x-aw-identity-token", "fixture-unknown")],
+                &[],
             )
             .await,
             ProcessDecision::Deny
@@ -1981,10 +1991,10 @@ for line in sys.stdin:
                 &runner,
                 "runner-restart",
                 "https://runner.example.test/jobs/42",
-                &[("x-aw-identity-token", "fixture-runner-identity")],
+                &[],
             )
             .await,
-            ProcessDecision::Allow
+            ProcessDecision::Deny
         );
         runner.retirement_started(CleanupReason::Retired);
         runner.cleanup(CleanupReason::Retired).await;

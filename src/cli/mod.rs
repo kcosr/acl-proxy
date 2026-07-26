@@ -152,6 +152,11 @@ fn run_inner() -> Result<ExitCode, CliError> {
         Command::Run => {
             let loaded = load_and_compile_config(config_path)
                 .map_err(|error| CliError::Config(error.to_string()))?;
+            let identity_sources = crate::identity::IdentitySourceRegistry::activate()
+                .map_err(|error| CliError::Process(error.to_string()))?;
+            identity_sources
+                .preload(&loaded.compiled.reloadable_plan)
+                .map_err(|error| CliError::Process(error.to_string()))?;
             let logging = LoggingSettings::from_config(
                 &loaded.compiled.static_config.logging,
                 loaded.compiled.reloadable_plan.observation.logging.level,
@@ -161,7 +166,7 @@ fn run_inner() -> Result<ExitCode, CliError> {
 
             let runtime = tokio::runtime::Runtime::new()
                 .map_err(|error| CliError::Runtime(error.to_string()))?;
-            runtime.block_on(run_product(loaded))?;
+            runtime.block_on(run_product(loaded, identity_sources))?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Config { command } => match command {
@@ -222,9 +227,12 @@ fn run_inner() -> Result<ExitCode, CliError> {
     }
 }
 
-async fn run_product(loaded: LoadedCompiledConfig) -> Result<(), CliError> {
+async fn run_product(
+    loaded: LoadedCompiledConfig,
+    identity_sources: Arc<crate::identity::IdentitySourceRegistry>,
+) -> Result<(), CliError> {
     let mut signals = ProcessSignals::install()?;
-    let product = ProductRuntime::prepare(loaded)
+    let product = ProductRuntime::prepare(loaded, identity_sources)
         .await
         .map_err(|error| CliError::Product(error.to_string()))?;
     let generation = product
@@ -476,17 +484,18 @@ impl ProcessSignals {
 fn print_policy_table(policy: &PolicyDump) {
     println!("Default action: {}", policy.default.as_str());
     println!(
-        "INDEX\tDECISION\tURLS\tMETHODS\tCLIENT_CIDRS\tHEADER_PREDICATES\tDESCRIPTION\tAUTHORIZATION_PROVIDER\tREDACTION_PROFILE\tMUTATIONS"
+        "INDEX\tDECISION\tURLS\tMETHODS\tCLIENT_CIDRS\tIDENTITY_PREDICATES\tHEADER_PREDICATES\tDESCRIPTION\tAUTHORIZATION_PROVIDER\tREDACTION_PROFILE\tMUTATIONS"
     );
 
     for row in policy.table_rows() {
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             row.index,
             row.decision,
             table_value(&row.urls),
             table_value(&row.methods),
             table_value(&row.client_cidrs),
+            table_value(&row.identity_predicates),
             table_value(&row.header_predicates),
             table_value(&row.description),
             table_value(&row.authorization_provider),

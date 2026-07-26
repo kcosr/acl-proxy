@@ -4,6 +4,7 @@ set -euo pipefail
 SOURCE_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 RUNTIME_SOURCE="$SOURCE_ROOT/../access-runtime"
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/shared-url-ownership-test.XXXXXX")
+export CARGO_TARGET_DIR="$TEST_ROOT/cargo-target"
 cleanup() {
     rm -rf -- "$TEST_ROOT"
 }
@@ -15,6 +16,27 @@ export REAL_CARGO
 cat >"$TEST_ROOT/fake-bin/cargo" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+
+if [[ ${FAKE_RUN_MODE:-} == target-contract && ${1:-} == run ]]; then
+    arguments=("$@")
+    manifest=
+    target=
+    for ((index = 0; index + 1 < ${#arguments[@]}; index++)); do
+        case "${arguments[index]}" in
+            --manifest-path) manifest=${arguments[index + 1]} ;;
+            --target-dir) target=${arguments[index + 1]} ;;
+        esac
+    done
+    [[ -n $manifest ]]
+    runtime_root=$(cd -- "$(dirname -- "$manifest")" && pwd)
+    if [[ -z $target ]]; then
+        target="$runtime_root/target"
+    fi
+    mkdir -p "$target"
+    printf 'runtime=%s\ntarget=%s\n' "$runtime_root" "$target" \
+        >"${FAKE_TARGET_CONTRACT_LOG:?}"
+    exit 0
+fi
 
 if [[ ${1:-} != metadata ]]; then
     exec "$REAL_CARGO" "$@"
@@ -75,6 +97,37 @@ runner="$SOURCE_ROOT/scripts/check-shared-url-ownership.sh"
 PATH="$TEST_ROOT/fake-bin:$PATH" "$runner" >"$TEST_ROOT/pass.log"
 grep -Fq 'shared URL and request-facts ownership/dependency gate passed' \
     "$TEST_ROOT/pass.log"
+
+fallback_workspace="$TEST_ROOT/no-ambient-target"
+fallback_runtime="$fallback_workspace/access-runtime"
+fallback_product="$fallback_workspace/acl-proxy"
+mkdir -p "$fallback_runtime" "$fallback_product/scripts"
+if git -C "$RUNTIME_SOURCE" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C "$RUNTIME_SOURCE" archive HEAD | tar -x -C "$fallback_runtime"
+else
+    cp -a "$RUNTIME_SOURCE/." "$fallback_runtime/"
+fi
+cp -R "$SOURCE_ROOT/src" "$fallback_product/"
+cp "$SOURCE_ROOT/scripts/check-shared-url-ownership.sh" "$fallback_product/scripts/"
+fallback_target_log="$TEST_ROOT/no-ambient-target.log"
+env -u CARGO_TARGET_DIR \
+    FAKE_RUN_MODE=target-contract \
+    FAKE_TARGET_CONTRACT_LOG="$fallback_target_log" \
+    PATH="$TEST_ROOT/fake-bin:$PATH" \
+    "$fallback_product/scripts/check-shared-url-ownership.sh" \
+    >"$TEST_ROOT/no-ambient-target.out"
+if [[ -e $fallback_runtime/target || -L $fallback_runtime/target ]]; then
+    printf 'ownership probe wrote a Runtime-local target directory\n' >&2
+    exit 1
+fi
+if ! fallback_target=$(sed -n 's/^target=//p' "$fallback_target_log"); then
+    printf 'ownership probe target log could not be read\n' >&2
+    exit 1
+fi
+if [[ -z $fallback_target || $fallback_target == "$fallback_runtime"/* ]]; then
+    printf 'ownership probe did not use an out-of-Runtime target directory\n' >&2
+    exit 1
+fi
 
 expect_failure() {
     local mode=$1

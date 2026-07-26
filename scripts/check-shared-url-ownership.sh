@@ -5,12 +5,19 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 RUNTIME_ROOT="$ROOT/../access-runtime"
 cd "$ROOT"
 
+ownership_target=${CARGO_TARGET_DIR:-}
+if [[ -z $ownership_target ]]; then
+    ownership_target=$(mktemp -d "${TMPDIR:-/tmp}/acl-proxy-url-ownership.XXXXXX")
+    trap 'rm -rf "$ownership_target"' EXIT
+fi
+
 if [[ -e src/url.rs ]]; then
     printf 'src/url.rs must remain deleted; URL semantics belong to http-access-url\n' >&2
     exit 1
 fi
 
 cargo run --quiet --locked \
+    --target-dir "$ownership_target" \
     --manifest-path "$RUNTIME_ROOT/Cargo.toml" \
     -p pipeline-ownership-check -- fact-product "$ROOT"
 

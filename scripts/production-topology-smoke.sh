@@ -273,13 +273,17 @@ TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/acl-proxy-production-smoke.XXXXXX")
 mkdir -p "$TMP_DIR/home"
 
 fixture_env=(
-    AW_IDENTITY_TOKEN=fixture-validation-identity
+    AW_IDENTITY_TOKEN=fixture-validation-identity-00000000
     FIXTURE_REDACT_A=fixture-secret-a-00000000000000000000
     FIXTURE_REDACT_B=fixture-secret-b-00000000000000000000
     FIXTURE_REDACT_C=fixture-secret-c-00000000000000000000
     FIXTURE_REDACT_D=fixture-secret-d-00000000000000000000
     FIXTURE_REDACT_E=fixture-secret-e-00000000000000000000
 )
+readonly TOPOLOGY_IDENTITY=fixture-topology-identity-000000000000
+readonly HOST_IDENTITY=$TOPOLOGY_IDENTITY
+readonly COMMON_IDENTITY=$TOPOLOGY_IDENTITY
+readonly INTERNAL_IDENTITY=$TOPOLOGY_IDENTITY
 
 validate_fixture() {
     local fixture=$1
@@ -473,6 +477,9 @@ endpoint = { kind = "tcp", address = "0.0.0.0:8443" }
 http_versions = ["http1"]
 handshake_timeout = "2s"
 
+[listeners.explicit_https.identity]
+mode = "required"
+
 [listeners.explicit_https.connect]
 http1 = "mitm"
 
@@ -493,7 +500,10 @@ text = text.replace('id = "prod-host-r04-context-a-allow"',
 text = text.replace('client_cidrs = ["198.18.1.0/24"]\n\n[[policy.rules]]\nid = "prod-host-r05',
                     'client_cidrs = ["198.18.1.0/24"]\nallow_upgrades = true\n'
                     'redaction_profile = "sensitive_strings"\n\n[[policy.rules]]\nid = "prod-host-r05')
-text = text.replace('[[policy.rules]]\nid = "prod-host-r00-require-identity"', '''[[policy.rules]]
+policy_anchor = '[[policy.rules]]\nid = "prod-host-parent-connect"'
+if text.count(policy_anchor) != 1:
+    raise SystemExit("unexpected host policy anchor fixture shape")
+text = text.replace('[[policy.rules]]\nid = "prod-host-parent-connect"', '''[[policy.rules]]
 id = "p11-ws-direct"
 decision = "allow"
 urls = ["http://ws.example.test:8080/**", "https://ws.example.test:8443/**"]
@@ -522,7 +532,7 @@ allow_upgrades = true
 redaction_profile = "sensitive_strings"
 
 [[policy.rules]]
-id = "prod-host-r00-require-identity"''')
+id = "prod-host-parent-connect"''')
 text += '''
 
 [[redaction.profiles.sensitive_strings.rules]]
@@ -761,6 +771,11 @@ KEY = "dGhlIHNhbXBsZSBub25jZQ=="
 EXPECTED_ACCEPT = base64.b64encode(hashlib.sha1(
     (KEY + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
 ).digest()).decode("ascii")
+IDENTITY = os.environ.get("TOPOLOGY_IDENTITY")
+
+
+def identity_headers():
+    return (("x-aw-identity-token", IDENTITY),) if IDENTITY else ()
 
 
 def exact(stream, length):
@@ -813,9 +828,21 @@ def connect_tcp(address):
     return stream
 
 
+def assert_listener_closed():
+    try:
+        stream = socket.create_connection(("127.0.0.1", 8881), timeout=1)
+    except ConnectionRefusedError:
+        return
+    stream.close()
+    raise AssertionError("data listener accepted after WebSocket streams stopped")
+
+
 def outer_connect(proxy, authority):
     stream = connect_tcp(proxy)
-    stream.sendall((f"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").encode("ascii"))
+    headers = "".join(f"{name}: {value}\r\n" for name, value in identity_headers())
+    stream.sendall((
+        f"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n{headers}\r\n"
+    ).encode("ascii"))
     response = head(stream)
     assert response.startswith("HTTP/1.1 200"), response
     return stream
@@ -872,7 +899,12 @@ def close_exact(stream, code=1000, reason=b"p11"):
 
 def direct_open(host="ws.example.test", path="/direct"):
     stream = connect_tcp(("127.0.0.1", 8881))
-    upgrade(stream, f"http://{host}:8080{path}", f"{host}:8080")
+    upgrade(
+        stream,
+        f"http://{host}:8080{path}",
+        f"{host}:8080",
+        identity_headers(),
+    )
     return stream
 
 
@@ -917,14 +949,13 @@ def parent_case(ca):
         host="gitlab.example.test",
         path="/group/public.git/parent-protected",
         extra_headers=(
-            ("x-aw-identity-token", "spoofed-client-identity"),
             ("x-aw-policy-context", "spoofed-client-context"),
         ),
     )
     message(stream, b"fixture-secret-a-00000000000000000000", b"[REDACTED]")
     close_exact(stream)
     success(ASSERT_PARENT_TLS=1, ASSERT_INJECTED_IDENTITY_AUTHORIZATION=1,
-            ASSERT_SPOOF_REPLACED_AND_STRIPPED=1, ASSERT_CREDENTIAL_ISOLATION=1)
+            ASSERT_CONTEXT_REPLACED_AND_STRIPPED=1, ASSERT_CREDENTIAL_ISOLATION=1)
 
 
 def origin_event_count(path, event):
@@ -934,10 +965,11 @@ def origin_event_count(path, event):
 
 def rejected_upgrade(path):
     stream = connect_tcp(("127.0.0.1", 8881))
+    headers = "".join(f"{name}: {value}\r\n" for name, value in identity_headers())
     stream.sendall((
         f"GET http://ws.example.test:8080{path} HTTP/1.1\r\n"
         "Host: ws.example.test:8080\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"
-        f"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {KEY}\r\n\r\n"
+        f"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {KEY}\r\n{headers}\r\n"
     ).encode("ascii"))
     response = head(stream)
     assert response.startswith("HTTP/1.1 503"), response
@@ -1051,9 +1083,11 @@ def shutdown_case(ca, ready, finished):
             stop_modes.append("tls-stop")
         stream.close()
     assert len(stop_modes) == 2
+    assert_listener_closed()
     with open(finished, "w", encoding="ascii") as stream:
         stream.write(f"{time.time_ns()} {' '.join(stop_modes)}\n")
-    success(ASSERT_BOUNDED_STOP=1, ASSERT_STREAMS_STOPPED=1)
+    success(ASSERT_BOUNDED_STOP=1, ASSERT_STREAMS_STOPPED=1,
+            ASSERT_LISTENER_CLOSED_FIRST=1)
 
 
 command = sys.argv[1]
@@ -1111,7 +1145,7 @@ wait_ready() {
     fail "$role control listener did not become ready"
 }
 
-run_proxy "$HOST_NS" host fixture-host-unused
+run_proxy "$HOST_NS" host "$HOST_IDENTITY"
 wait_ready "$HOST_NS" host
 
 origin_body=$(ip netns exec "$HOST_NS" curl --fail --silent --show-error \
@@ -1140,8 +1174,7 @@ if text.count(needle) != 1:
     raise SystemExit("unexpected child origin TLS fixture shape")
 text = text.replace(needle, replacement)
 text = text.replace(
-    'url = "http://host-proxy.example.test:8881"\n',
-    'url = "https://host-proxy.example.test:8443"\n\n'
+    '[egress.parent_proxy.tls]\ntrust = "system"\n',
     '[egress.parent_proxy.tls]\ntrust = "custom"\n'
     'ca_certificate = "tls/parent-ca.pem"\nserver_name = "host-proxy.example.test"\n',
 )
@@ -1165,8 +1198,8 @@ PY
     cp "$TMP_DIR/origin/ca-cert.pem" "$TMP_DIR/$role/tls/parent-ca.pem"
 done
 
-run_proxy "$COMMON_NS" common fixture-common-identity
-run_proxy "$INTERNAL_NS" internal fixture-internal-identity
+run_proxy "$COMMON_NS" common "$COMMON_IDENTITY"
+run_proxy "$INTERNAL_NS" internal "$INTERNAL_IDENTITY"
 wait_ready "$COMMON_NS" common
 wait_ready "$INTERNAL_NS" internal
 
@@ -1177,12 +1210,13 @@ for namespace in "$HOST_NS" "$COMMON_NS" "$INTERNAL_NS"; do
     [[ "$status" != 200 ]] || fail "data listener exposed readiness in $namespace"
 done
 
-spoofed_policy_context_is_replaced_before_provider_dispatch() {
+policy_context_is_replaced_before_provider_dispatch() {
     local common_body common_status internal_body internal_status
+    # Disabled-identity child listeners reject any supplied identity carrier.
+    # Parent presentation is sourced only from the child's trusted environment.
     common_status=$(ip netns exec "$COMMON_NS" curl --silent --show-error \
         --connect-timeout 3 --max-time 10 \
         --proxy http://127.0.0.1:8881 --cacert "$HOST_CA" \
-        -H 'x-aw-identity-token: spoofed-client-value' \
         -H 'x-aw-policy-context: fixture-internal' \
         --output "$TMP_DIR/common/provider.body" --write-out '%{http_code}' \
         https://gitlab.example.test/group/public.git/custom)
@@ -1195,7 +1229,6 @@ spoofed_policy_context_is_replaced_before_provider_dispatch() {
     internal_status=$(ip netns exec "$INTERNAL_NS" curl --silent --show-error \
         --connect-timeout 3 --max-time 10 \
         --proxy http://127.0.0.1:8881 --cacert "$HOST_CA" \
-        -H 'x-aw-identity-token: spoofed-client-value' \
         -H 'x-aw-policy-context: workload-spoof' \
         --output "$TMP_DIR/internal/provider.body" --write-out '%{http_code}' \
         https://gitlab.example.test/group/internal.git/custom)
@@ -1206,14 +1239,15 @@ spoofed_policy_context_is_replaced_before_provider_dispatch() {
         || fail "internal identity/context reached the origin or request failed"
 }
 
-spoofed_policy_context_is_replaced_before_provider_dispatch
+policy_context_is_replaced_before_provider_dispatch
 
 direct_host_context_must_match_identity_authorization() {
     local status
     status=$(ip netns exec "$COMMON_NS" curl --silent --show-error \
         --connect-timeout 3 --max-time 10 \
-        --proxy http://198.18.0.10:8881 --cacert "$HOST_CA" \
-        -H 'x-aw-identity-token: fixture-common-identity' \
+        --proxy https://host-proxy.example.test:8443 \
+        --proxy-cacert "$TMP_DIR/origin/ca-cert.pem" --cacert "$HOST_CA" \
+        --proxy-header "x-aw-identity-token: $COMMON_IDENTITY" \
         -H 'x-aw-policy-context: fixture-internal' \
         --output "$TMP_DIR/common/direct-host-denied.body" --write-out '%{http_code}' \
         https://gitlab.example.test/group/public.git/custom)
@@ -1232,8 +1266,9 @@ deny_status=$(ip netns exec "$COMMON_NS" curl --silent --show-error \
 
 http_body=$(ip netns exec "$INTERNAL_NS" curl --fail --silent --show-error \
     --connect-timeout 3 --max-time 10 \
-    --proxy http://198.18.0.10:8881 \
-    -H 'x-aw-identity-token: fixture-internal-identity' \
+    --proxy https://host-proxy.example.test:8443 \
+    --proxy-cacert "$TMP_DIR/origin/ca-cert.pem" \
+    --proxy-header "x-aw-identity-token: $INTERNAL_IDENTITY" \
     -H 'x-aw-policy-context: fixture-internal' \
     http://git.private-a.example.test/topology-http)
 [[ "$http_body" == *'identity=absent:context=absent' ]] \
@@ -1244,7 +1279,6 @@ ip netns exec "$INTERNAL_NS" iptables -t nat -A OUTPUT -p tcp --dport 443 \
 transparent_body=$(ip netns exec "$INTERNAL_NS" curl --fail --silent --show-error \
     --connect-timeout 3 --max-time 10 \
     --noproxy '*' --cacert "$HOST_CA" \
-    -H 'x-aw-identity-token: spoofed-client-value' \
     https://gitlab.example.test/group/internal.git/custom)
 [[ "$transparent_body" == *'identity=absent:context=absent' ]] \
     || fail "redirected transparent TLS path failed or leaked internal headers"
@@ -1357,7 +1391,8 @@ PY
 
 p11_ws_direct_unprotected() {
     local result
-    result=$(ip netns exec "$HOST_NS" timeout 15s python3 "$TMP_DIR/websocket_client.py" direct)
+    result=$(ip netns exec "$HOST_NS" env TOPOLOGY_IDENTITY="$TOPOLOGY_IDENTITY" \
+        timeout 15s python3 "$TMP_DIR/websocket_client.py" direct)
     assert_ws_101 "$result"
     ws_stream_assertions "$result"
     assert_ws_field "$result" ASSERT_UNPROTECTED_LITERAL_UNCHANGED
@@ -1370,8 +1405,8 @@ p11_ws_direct_unprotected() {
 
 p11_ws_connect_mitm_fragmented_redaction_capture() {
     local result
-    result=$(ip netns exec "$HOST_NS" timeout 15s python3 "$TMP_DIR/websocket_client.py" \
-        connect "$HOST_CA")
+    result=$(ip netns exec "$HOST_NS" env TOPOLOGY_IDENTITY="$TOPOLOGY_IDENTITY" \
+        timeout 15s python3 "$TMP_DIR/websocket_client.py" connect "$HOST_CA")
     assert_ws_101 "$result"
     ws_stream_assertions "$result"
     assert_ws_field "$result" ASSERT_FRAGMENTED_REDACTION
@@ -1383,13 +1418,13 @@ p11_ws_connect_mitm_fragmented_redaction_capture() {
 
 p11_ws_https_parent_protected_redaction() {
     local result
-    result=$(ip netns exec "$COMMON_NS" timeout 15s python3 "$TMP_DIR/websocket_client.py" \
-        parent "$HOST_CA")
+    result=$(ip netns exec "$COMMON_NS" env -u TOPOLOGY_IDENTITY \
+        timeout 15s python3 "$TMP_DIR/websocket_client.py" parent "$HOST_CA")
     assert_ws_101 "$result"
     ws_stream_assertions "$result"
     assert_ws_field "$result" ASSERT_PARENT_TLS
     assert_ws_field "$result" ASSERT_INJECTED_IDENTITY_AUTHORIZATION
-    assert_ws_field "$result" ASSERT_SPOOF_REPLACED_AND_STRIPPED
+    assert_ws_field "$result" ASSERT_CONTEXT_REPLACED_AND_STRIPPED
     assert_ws_field "$result" ASSERT_CREDENTIAL_ISOLATION
     assert_origin_events accepted-once:/group/public.git/parent-protected \
         opened-once:/group/public.git/parent-protected \
@@ -1402,8 +1437,9 @@ p11_ws_https_parent_protected_redaction() {
 
 p11_ws_admission_saturation() {
     local result
-    result=$(ip netns exec "$HOST_NS" timeout 25s python3 "$TMP_DIR/websocket_client.py" \
-        admission "$TMP_DIR/origin/websocket-events.jsonl")
+    result=$(ip netns exec "$HOST_NS" env TOPOLOGY_IDENTITY="$TOPOLOGY_IDENTITY" \
+        timeout 25s python3 "$TMP_DIR/websocket_client.py" admission \
+        "$TMP_DIR/origin/websocket-events.jsonl")
     assert_ws_101 "$result"
     ws_stream_assertions "$result"
     assert_ws_field "$result" ASSERT_REJECTED_BEFORE_ORIGIN
@@ -1432,14 +1468,15 @@ if text.count("max_active_upgrades = 1") != 1:
     raise SystemExit("unexpected host upgrade-slot fixture shape")
 path.write_text(text.replace("max_active_upgrades = 1", "max_active_upgrades = 2"), encoding="utf-8")
 PY
-    run_proxy "$HOST_NS" host fixture-host-unused
+    run_proxy "$HOST_NS" host "$HOST_IDENTITY"
     wait_ready "$HOST_NS" host
 }
 
 p11_ws_reload_and_lifetime() {
     local result
-    result=$(ip netns exec "$HOST_NS" timeout 15s python3 "$TMP_DIR/websocket_client.py" \
-        reload "$TMP_DIR/host/acl-proxy.toml" "${ROLE_PIDS[host]}" \
+    result=$(ip netns exec "$HOST_NS" env TOPOLOGY_IDENTITY="$TOPOLOGY_IDENTITY" \
+        timeout 15s python3 "$TMP_DIR/websocket_client.py" reload \
+        "$TMP_DIR/host/acl-proxy.toml" "${ROLE_PIDS[host]}" \
         "$TMP_DIR/host/runtime/captures")
     assert_ws_101 "$result"
     ws_stream_assertions "$result"
@@ -1461,8 +1498,9 @@ p11_ws_shutdown_join() {
     local result_file="$TMP_DIR/host/shutdown-websocket.out"
     local ready_file="$TMP_DIR/host/shutdown-websocket.ready"
     local finished_file="$TMP_DIR/host/shutdown-websocket.finished"
-    ip netns exec "$HOST_NS" timeout 15s python3 "$TMP_DIR/websocket_client.py" \
-        shutdown "$HOST_CA" "$ready_file" "$finished_file" \
+    ip netns exec "$HOST_NS" env TOPOLOGY_IDENTITY="$TOPOLOGY_IDENTITY" \
+        timeout 15s python3 "$TMP_DIR/websocket_client.py" shutdown \
+        "$HOST_CA" "$ready_file" "$finished_file" \
         >"$result_file" 2>"$TMP_DIR/host/shutdown-websocket.err" &
     local client_pid=$!
     register_pid "$client_pid" || fail "could not register shutdown WebSocket clients"
@@ -1472,30 +1510,23 @@ p11_ws_shutdown_join() {
         sleep 0.05
     done
     [[ -s "$ready_file" ]] || fail "shutdown WebSocket clients did not become ready"
-    local started=$SECONDS listener_closed_ns="" process_exit_ns="" client_finished_ns=""
+    local started=$SECONDS process_exit_ns="" client_finished_ns=""
     signal_owned_pid TERM "${ROLE_PIDS[host]}" \
         || fail "could not signal the owned host process"
     for attempt in {1..2000}; do
-        if [[ -z "$listener_closed_ns" ]] && ip netns exec "$HOST_NS" \
-            bash -c '! exec 3<>/dev/tcp/127.0.0.1/8881' >/dev/null 2>&1; then
-            listener_closed_ns=$(date +%s%N)
-        fi
         if [[ -z "$client_finished_ns" && -s "$finished_file" ]]; then
             read -r client_finished_ns _ <"$finished_file"
         fi
         if [[ -z "$process_exit_ns" ]] && ! owned_pid_running "${ROLE_PIDS[host]}"; then
             process_exit_ns=$(date +%s%N)
         fi
-        if [[ -n "$listener_closed_ns" && -n "$client_finished_ns" && -n "$process_exit_ns" ]]; then
+        if [[ -n "$client_finished_ns" && -n "$process_exit_ns" ]]; then
             break
         fi
         sleep 0.005
     done
-    [[ -n "$listener_closed_ns" ]] || fail "host listener remained open during shutdown"
     [[ -n "$client_finished_ns" ]] || fail "shutdown clients did not record bounded stream stop"
     [[ -n "$process_exit_ns" ]] || fail "host process exceeded its shutdown bound"
-    (( listener_closed_ns <= client_finished_ns )) \
-        || fail "WebSocket streams stopped before the data listener closed"
     local host_status client_status
     if wait "${ROLE_PIDS[host]}"; then host_status=0; else host_status=$?; fi
     (( host_status == 0 )) || fail "host process aborted during shutdown: status $host_status"
@@ -1506,7 +1537,6 @@ p11_ws_shutdown_join() {
     assert_capture_contains /shutdown-direct 'direct-before-stop'
     assert_capture_contains /shutdown-connect 'connect-before-stop'
     {
-        printf '%s\n' 'ASSERT_LISTENER_CLOSED_FIRST=1'
         printf '%s\n' 'ASSERT_GRACEFUL_PROCESS_EXIT=1'
         printf '%s\n' 'ASSERT_RELAY_TERMINALS_JOINED=1'
         printf '%s\n' 'ASSERT_CAPTURE_TASKS_FLUSHED=1'

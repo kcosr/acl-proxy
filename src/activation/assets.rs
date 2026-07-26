@@ -265,7 +265,7 @@ fn tcp_endpoint_address(
 ) -> Option<std::net::SocketAddr> {
     match endpoint {
         crate::config::compiler::StaticListenerEndpoint::Tcp { address } => Some(*address),
-        crate::config::compiler::StaticListenerEndpoint::UnixProxyV2 { .. } => None,
+        crate::config::compiler::StaticListenerEndpoint::AccessFlow { .. } => None,
     }
 }
 

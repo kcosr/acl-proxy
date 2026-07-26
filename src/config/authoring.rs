@@ -49,6 +49,9 @@ pub(super) struct AuthoringConfig {
     pub listeners: ListenersConfig,
 
     #[serde(default)]
+    pub identity: Option<IdentityConfig>,
+
+    #[serde(default)]
     pub mitm: Option<MitmConfig>,
 
     #[serde(default)]
@@ -339,6 +342,81 @@ pub(super) struct ListenersConfig {
     pub transparent_https: Option<TransparentHttpsListenerConfig>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct IdentityConfig {
+    pub max_pending_authentications: usize,
+    pub max_pending_authentications_per_connection: usize,
+    pub resolver: StaticIdentityResolverConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct StaticIdentityResolverConfig {
+    pub kind: StaticIdentityResolverKind,
+    pub authority: String,
+    pub principals: Vec<StaticIdentityPrincipalConfig>,
+    #[serde(default)]
+    pub groups: Vec<StaticIdentityGroupConfig>,
+    pub tokens: Vec<StaticIdentityTokenConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum StaticIdentityResolverKind {
+    Static,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct StaticIdentityPrincipalConfig {
+    pub id: String,
+    pub kind: IdentityPrincipalKindConfig,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum IdentityPrincipalKindConfig {
+    User,
+    ServiceAccount,
+    System,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct StaticIdentityGroupConfig {
+    pub id: String,
+    pub members: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum StaticIdentityTokenConfig {
+    Environment {
+        id: String,
+        principal: String,
+        variable: String,
+    },
+    File {
+        id: String,
+        principal: String,
+        path: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ListenerIdentityConfig {
+    pub mode: ListenerIdentityModeConfig,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ListenerIdentityModeConfig {
+    Optional,
+    Required,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(super) enum HttpVersion {
@@ -352,12 +430,17 @@ pub(super) enum ListenerEndpointConfig {
     Tcp {
         address: SocketAddr,
     },
-    UnixProxyV2 {
-        path: PathBuf,
-        mode: String,
-        proxy_header_timeout: PositiveDuration,
+    AccessFlow {
+        admission_timeout: PositiveDuration,
         allowed_destination_ports: Vec<u16>,
+        transport: AccessFlowTransportConfig,
     },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum AccessFlowTransportConfig {
+    Unix { path: PathBuf, mode: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -376,6 +459,9 @@ pub(super) struct ExplicitHttpListenerConfig {
     pub max_concurrent_streams: u32,
 
     pub connect: ConnectConfig,
+
+    #[serde(default)]
+    pub identity: Option<ListenerIdentityConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -392,6 +478,9 @@ pub(super) struct TransparentHttpListenerConfig {
 
     #[serde(default = "default_listener_max_concurrent_streams")]
     pub max_concurrent_streams: u32,
+
+    #[serde(default)]
+    pub identity: Option<ListenerIdentityConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -414,6 +503,9 @@ pub(super) struct ExplicitHttpsListenerConfig {
 
     pub connect: ConnectConfig,
     pub tls: StaticTlsIdentityConfig,
+
+    #[serde(default)]
+    pub identity: Option<ListenerIdentityConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -433,6 +525,9 @@ pub(super) struct TransparentHttpsListenerConfig {
 
     #[serde(default = "default_listener_max_concurrent_streams")]
     pub max_concurrent_streams: u32,
+
+    #[serde(default)]
+    pub identity: Option<ListenerIdentityConfig>,
 }
 
 fn default_listener_timeout() -> PositiveDuration {
@@ -592,6 +687,16 @@ pub(super) struct ParentProxyConfig {
 
     #[serde(default)]
     pub tls: Option<ParentProxyTlsConfig>,
+
+    #[serde(default)]
+    pub presentation: Option<ParentProxyPresentationConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum ParentProxyPresentationConfig {
+    BearerEnvironment { variable: String },
+    BearerFile { path: PathBuf },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -650,6 +755,12 @@ pub(super) struct PolicyRuleConfig {
     pub client_cidrs: Vec<IpNet>,
 
     #[serde(default)]
+    pub identity_states: Option<Vec<IdentityStateConfig>>,
+
+    #[serde(default)]
+    pub identity_subjects: Option<Vec<IdentitySubjectConfig>>,
+
+    #[serde(default)]
     pub headers: HeaderPredicatesConfig,
 
     #[serde(default)]
@@ -672,6 +783,21 @@ pub(super) struct PolicyRuleConfig {
 
     #[serde(default)]
     pub credential_actions: Vec<CredentialActionConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum IdentityStateConfig {
+    Disabled,
+    Anonymous,
+    Authenticated,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum IdentitySubjectConfig {
+    Principal { authority: String, id: String },
+    Group { authority: String, id: String },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -778,10 +904,11 @@ fn default_max_pending_operations() -> usize {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum AuthorizationProviderConfig {
     Webhook(WebhookProviderConfig),
     Process(ProcessProviderConfig),
+    UnixSocket(UnixSocketProviderConfig),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -797,6 +924,9 @@ pub(super) struct WebhookProviderConfig {
 
     #[serde(default)]
     pub include_headers: Vec<String>,
+
+    #[serde(default)]
+    pub include_identity: bool,
 
     #[serde(default = "default_webhook_max_request_bytes")]
     pub max_request_bytes: usize,
@@ -848,6 +978,9 @@ pub(super) struct ProcessProviderConfig {
     pub include_headers: Vec<String>,
 
     #[serde(default)]
+    pub include_identity: bool,
+
+    #[serde(default)]
     pub include_request_body: bool,
 
     #[serde(default)]
@@ -870,6 +1003,28 @@ pub(super) struct ProcessProviderConfig {
 
     #[serde(default = "default_retire_timeout")]
     pub retire_timeout: PositiveDuration,
+
+    #[serde(default)]
+    pub outputs: BTreeMap<String, ProviderOutputConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct UnixSocketProviderConfig {
+    pub socket_path: PathBuf,
+    pub timeout: PositiveDuration,
+    pub on_failure: ProviderFailureMode,
+    pub include_headers: Vec<String>,
+
+    #[serde(default)]
+    pub include_identity: bool,
+
+    pub max_request_bytes: usize,
+    pub max_response_bytes: usize,
+    pub max_pending_requests: usize,
+
+    #[serde(default)]
+    pub peer_uid: Option<u32>,
 
     #[serde(default)]
     pub outputs: BTreeMap<String, ProviderOutputConfig>,
@@ -1793,7 +1948,10 @@ max_inflight_body_bytes = 134217728
         assert_eq!(parsed.credentials.inbound.len(), 1);
         let webhook = match &parsed.authorization.providers["approval"] {
             AuthorizationProviderConfig::Webhook(webhook) => webhook,
-            AuthorizationProviderConfig::Process(_) => panic!("expected webhook provider"),
+            AuthorizationProviderConfig::Process(_)
+            | AuthorizationProviderConfig::UnixSocket(_) => {
+                panic!("expected webhook provider")
+            }
         };
         assert_eq!(webhook.timeout.get(), Duration::from_secs(30));
         assert_eq!(webhook.on_failure, ProviderFailureMode::Deny);
@@ -1802,7 +1960,10 @@ max_inflight_body_bytes = 134217728
 
         let process = match &parsed.authorization.providers["local"] {
             AuthorizationProviderConfig::Process(process) => process,
-            AuthorizationProviderConfig::Webhook(_) => panic!("expected process provider"),
+            AuthorizationProviderConfig::Webhook(_)
+            | AuthorizationProviderConfig::UnixSocket(_) => {
+                panic!("expected process provider")
+            }
         };
         assert!(process.include_request_body);
         assert!(process.allow_request_body_replacement);
@@ -1826,6 +1987,98 @@ max_inflight_body_bytes = 134217728
         assert_eq!(capture.redaction_profile, "secrets");
         assert_eq!(capture.max_inflight_body_bytes, 128 * 1024 * 1024);
         assert_eq!(capture.max_pending_records, 1024);
+    }
+
+    #[test]
+    fn unix_socket_provider_has_one_strict_required_shape_and_closed_defaults() {
+        let input = format!(
+            r#"{MINIMAL}
+
+[authorization.providers.local]
+kind = "unix_socket"
+socket_path = "/run/acl-proxy/authorization.sock"
+timeout = "2s"
+on_failure = "deny"
+include_headers = []
+max_request_bytes = 262144
+max_response_bytes = 65536
+max_pending_requests = 128
+"#
+        );
+        let parsed: AuthoringConfig = toml::from_str(&input).unwrap();
+        let provider = match &parsed.authorization.providers["local"] {
+            AuthorizationProviderConfig::UnixSocket(provider) => provider,
+            AuthorizationProviderConfig::Webhook(_) | AuthorizationProviderConfig::Process(_) => {
+                panic!("expected Unix socket provider")
+            }
+        };
+        assert_eq!(
+            provider.socket_path,
+            PathBuf::from("/run/acl-proxy/authorization.sock")
+        );
+        assert_eq!(provider.timeout.get(), Duration::from_secs(2));
+        assert_eq!(provider.on_failure, ProviderFailureMode::Deny);
+        assert!(provider.include_headers.is_empty());
+        assert!(!provider.include_identity);
+        assert_eq!(provider.max_request_bytes, 262_144);
+        assert_eq!(provider.max_response_bytes, 65_536);
+        assert_eq!(provider.max_pending_requests, 128);
+        assert_eq!(provider.peer_uid, None);
+        assert!(provider.outputs.is_empty());
+    }
+
+    #[test]
+    fn unix_socket_provider_rejects_missing_alias_mixed_remote_and_body_fields() {
+        const REQUIRED: &str = r#"
+[authorization.providers.local]
+kind = "unix_socket"
+socket_path = "/run/acl-proxy/authorization.sock"
+timeout = "2s"
+on_failure = "deny"
+include_headers = []
+max_request_bytes = 262144
+max_response_bytes = 65536
+max_pending_requests = 128
+"#;
+        for field in [
+            "socket_path",
+            "timeout",
+            "on_failure",
+            "include_headers",
+            "max_request_bytes",
+            "max_response_bytes",
+            "max_pending_requests",
+        ] {
+            let removed = REQUIRED
+                .lines()
+                .filter(|line| !line.starts_with(&format!("{field} =")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            toml::from_str::<AuthoringConfig>(&format!("{MINIMAL}\n{removed}"))
+                .expect_err("every operational Unix provider field is required");
+        }
+
+        let alias = REQUIRED.replace("kind = \"unix_socket\"", "kind = \"unix\"");
+        toml::from_str::<AuthoringConfig>(&format!("{MINIMAL}\n{alias}"))
+            .expect_err("the Unix provider kind has no alias");
+
+        for unsupported in [
+            "socket = \"/run/provider.sock\"",
+            "url = \"https://provider.example.test\"",
+            "host = \"provider.example.test\"",
+            "port = 443",
+            "command = \"/bin/provider\"",
+            "tls = {}",
+            "include_request_body = true",
+            "allow_request_body_replacement = true",
+            "max_request_body_bytes = 1024",
+            "max_stdout_line_bytes = 1024",
+            "restart_backoff = \"1s\"",
+        ] {
+            let mixed = format!("{MINIMAL}\n{REQUIRED}\n{unsupported}\n");
+            toml::from_str::<AuthoringConfig>(&mixed)
+                .expect_err("unsupported Unix provider fields must remain closed");
+        }
     }
 
     #[test]
@@ -1927,6 +2180,101 @@ directory = "certs"
 
         let obsolete = MINIMAL.replace("inject = true", "enabled = true\ninject = true");
         assert!(toml::from_str::<AuthoringConfig>(&obsolete).is_err());
+    }
+
+    #[test]
+    fn policy_identity_predicates_use_only_the_strict_plural_typed_shape() {
+        let valid = format!(
+            r#"{MINIMAL}
+
+[[policy.rules]]
+id = "identity"
+decision = "allow"
+identity_states = ["disabled", "anonymous", "authenticated"]
+identity_subjects = [
+  {{ kind = "principal", authority = "workstation", id = "agent" }},
+  {{ kind = "group", authority = "workstation", id = "developers" }},
+]
+"#
+        );
+        let parsed: AuthoringConfig = toml::from_str(&valid).unwrap();
+        assert_eq!(
+            parsed.policy.rules[0].identity_states.as_deref(),
+            Some(
+                [
+                    IdentityStateConfig::Disabled,
+                    IdentityStateConfig::Anonymous,
+                    IdentityStateConfig::Authenticated,
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(
+            parsed.policy.rules[0]
+                .identity_subjects
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        for invalid in [
+            valid.replace("identity_states =", "identity_state ="),
+            valid.replace("\"authenticated\"", "\"unknown\""),
+            valid.replace(
+                "id = \"agent\" }",
+                "id = \"agent\", unexpected = \"value\" }",
+            ),
+        ] {
+            assert!(
+                toml::from_str::<AuthoringConfig>(&invalid).is_err(),
+                "invalid identity predicate shape was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn static_identity_tokens_reject_literal_sources_and_values() {
+        let environment = format!(
+            r#"{MINIMAL}
+
+[identity]
+max_pending_authentications = 8
+max_pending_authentications_per_connection = 2
+
+[identity.resolver]
+kind = "static"
+authority = "workstation"
+
+[[identity.resolver.principals]]
+id = "agent"
+kind = "service_account"
+
+[[identity.resolver.tokens]]
+id = "agent-primary"
+principal = "agent"
+source = "environment"
+variable = "AW_IDENTITY_TOKEN"
+"#
+        );
+        toml::from_str::<AuthoringConfig>(&environment)
+            .expect("the environment descriptor is the canonical token source");
+
+        for invalid in [
+            environment.replace(
+                "source = \"environment\"\nvariable = \"AW_IDENTITY_TOKEN\"",
+                "source = \"literal\"\nvalue = \"not-allowed\"",
+            ),
+            environment.replace(
+                "variable = \"AW_IDENTITY_TOKEN\"",
+                "variable = \"AW_IDENTITY_TOKEN\"\nvalue = \"not-allowed\"",
+            ),
+        ] {
+            assert!(
+                toml::from_str::<AuthoringConfig>(&invalid).is_err(),
+                "literal token material was accepted by the authoring schema"
+            );
+        }
     }
 
     #[test]

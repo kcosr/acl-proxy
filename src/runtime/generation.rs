@@ -169,10 +169,10 @@ pub(crate) trait AuthorizationSnapshot: Send + Sync {
 }
 
 pub(crate) struct AuthorizationDispatchContext<'a> {
-    rule_id: &'a str,
     request: crate::authorization::protocol::ProviderRequest<'a>,
     invocation_mode: AuthorizationInvocationMode,
     generation: &'a GenerationLease,
+    cancellation: http_access_runtime::ForwardingCancellation,
 }
 
 impl<'a> AuthorizationDispatchContext<'a> {
@@ -185,11 +185,20 @@ impl<'a> AuthorizationDispatchContext<'a> {
         (self.request, self.invocation_mode)
     }
 
+    pub(crate) fn into_unix_parts(
+        self,
+    ) -> (
+        crate::authorization::protocol::ProviderRequest<'a>,
+        AuthorizationInvocationMode,
+        http_access_runtime::ForwardingCancellation,
+    ) {
+        (self.request, self.invocation_mode, self.cancellation)
+    }
+
     pub(crate) fn into_webhook_parts(
         self,
     ) -> Result<
         (
-            &'a str,
             crate::authorization::protocol::ProviderRequest<'a>,
             AuthorizationInvocationMode,
             GenerationRetention,
@@ -197,7 +206,7 @@ impl<'a> AuthorizationDispatchContext<'a> {
         GenerationRetentionError,
     > {
         let retention = self.generation.retain_for_operation()?;
-        Ok((self.rule_id, self.request, self.invocation_mode, retention))
+        Ok((self.request, self.invocation_mode, retention))
     }
 }
 
@@ -490,9 +499,9 @@ impl GenerationLease {
     pub(crate) fn dispatch_authorization<'a>(
         &'a self,
         provider: ProviderIndex,
-        rule_id: &'a str,
         request: crate::authorization::protocol::ProviderRequest<'a>,
         invocation_mode: AuthorizationInvocationMode,
+        cancellation: http_access_runtime::ForwardingCancellation,
         guard: &'a crate::safety::HttpWireBodyGuard,
         request_deadline: tokio::time::Instant,
     ) -> BoxFuture<
@@ -505,10 +514,10 @@ impl GenerationLease {
         self.generation.authorization.dispatch(
             provider,
             AuthorizationDispatchContext {
-                rule_id,
                 request,
                 invocation_mode,
                 generation: self,
+                cancellation,
             },
             guard,
             request_deadline,

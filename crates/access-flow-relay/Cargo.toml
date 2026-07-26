@@ -1,0 +1,27 @@
+[package]
+name = "acl-proxy-access-flow-relay"
+version.workspace = true
+edition = "2021"
+license = "MIT"
+publish = false
+description = "ACL Proxy adapter for the shared Linux Access Flow relay"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+access-async-contracts = { path = "../../../access-runtime/crates/access-async-contracts", version = "=0.1.0" }
+access-flow-relay = { path = "../../../access-runtime/crates/access-flow-relay", version = "=0.1.0" }
+access-flow-unix = { path = "../../../access-runtime/crates/access-flow-unix", version = "=0.1.0" }
+access-identity = { path = "../../../access-runtime/crates/access-identity", version = "=0.1.0" }
+humantime = "2.1"
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tokio = { version = "1.39", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "json"] }
+zeroize = "1.8"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+access-flow = { path = "../../../access-runtime/crates/access-flow", version = "=0.1.0" }
+access-flow-conformance = { path = "../../../access-runtime/crates/access-flow-conformance", version = "=0.1.0" }
+tempfile = "3.10"

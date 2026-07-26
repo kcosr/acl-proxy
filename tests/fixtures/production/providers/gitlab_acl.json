@@ -1,18 +1,28 @@
 {
-  "schema": "synthetic-fixture-v1",
-  "identities": {
-    "fixture-common-identity": {
-      "contexts": {
-        "": [
-          "group/public"
-        ]
+  "schema": "synthetic-fixture-v2",
+  "authority": "aw-workstation",
+  "rules": {
+    "prod-host-r42-gitlab-delegate": {
+      "principals": {},
+      "groups": {
+        "fixture-developers": {
+          "": [
+            "group/public"
+          ],
+          "fixture-internal": [
+            "group/internal"
+          ]
+        }
       }
     },
-    "fixture-internal-identity": {
-      "contexts": {
-        "fixture-internal": [
-          "group/internal"
-        ]
+    "p11-ws-protected": {
+      "principals": {},
+      "groups": {
+        "fixture-developers": {
+          "": [
+            "group/public"
+          ]
+        }
       }
     }
   }

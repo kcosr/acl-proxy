@@ -1,3 +1,4 @@
+use access_identity::ProviderIdentityProjection;
 use http::HeaderValue;
 
 use crate::authorization::callback::ResumeToken;
@@ -5,7 +6,7 @@ use crate::authorization::protocol::{ProviderRequest, ProviderRequestHeaders};
 use crate::safety::wire_body::{ReservedGuardedBodyBuilder, WireBodyBufferError};
 use crate::safety::{GuardedBody, HttpWireBodyGuard};
 
-const MAX_IDENTIFIER_BYTES: usize = 4096;
+const MAX_WEBHOOK_REQUEST_ID_BYTES: usize = 4096;
 
 /// Body-free request projected specifically for the callback webhook protocol.
 pub(crate) struct WebhookRequest<'a> {
@@ -15,6 +16,7 @@ pub(crate) struct WebhookRequest<'a> {
     pub(crate) method: &'a str,
     pub(crate) client_ip: &'a str,
     pub(crate) headers: Option<&'a ProviderRequestHeaders<'a>>,
+    pub(crate) identity: Option<&'a ProviderIdentityProjection>,
 }
 
 pub(crate) struct PreparedWebhookRequest {
@@ -65,6 +67,10 @@ impl WebhookRequest<'_> {
             }
             add_literal(&mut length, b"}")?;
         }
+        if let Some(identity) = self.identity {
+            add_literal(&mut length, b",\"identity\":")?;
+            add_provider_identity_len(&mut length, identity)?;
+        }
         add_literal(&mut length, b",\"callbackUrl\":")?;
         add_json_string_len(&mut length, callback_url)?;
         add_literal(&mut length, b",\"resumeToken\":\"")?;
@@ -113,6 +119,10 @@ impl WebhookRequest<'_> {
             }
             append(&mut output, b"}")?;
         }
+        if let Some(identity) = self.identity {
+            append(&mut output, b",\"identity\":")?;
+            append_provider_identity(&mut output, identity)?;
+        }
         append(&mut output, b",\"callbackUrl\":")?;
         append_json_string(&mut output, callback_url)?;
         append(&mut output, b",\"resumeToken\":\"")?;
@@ -122,9 +132,9 @@ impl WebhookRequest<'_> {
 
     fn validate(&self) -> Result<(), WebhookRequestError> {
         if self.request_id.is_empty()
-            || self.request_id.len() > MAX_IDENTIFIER_BYTES
+            || self.request_id.len() > MAX_WEBHOOK_REQUEST_ID_BYTES
             || self.rule_id.is_empty()
-            || self.rule_id.len() > MAX_IDENTIFIER_BYTES
+            || self.rule_id.len() > super::super::MAX_PROVIDER_RULE_ID_BYTES
             || self.url.is_empty()
             || self.method.is_empty()
             || !self.method.bytes().all(|byte| {
@@ -167,13 +177,15 @@ impl WebhookRequest<'_> {
 }
 
 impl<'a> WebhookRequest<'a> {
-    pub(crate) fn from_provider(rule_id: &'a str, request: ProviderRequest<'a>) -> Self {
+    pub(crate) fn from_provider(request: ProviderRequest<'a>) -> Self {
         let ProviderRequest {
             request_id,
+            rule_id,
             url,
             method,
             client_ip,
             headers,
+            identity,
             body: _,
         } = request;
         Self {
@@ -183,6 +195,7 @@ impl<'a> WebhookRequest<'a> {
             method,
             client_ip,
             headers,
+            identity,
         }
     }
 }
@@ -202,6 +215,82 @@ fn header_text(value: &HeaderValue) -> Result<&str, WebhookRequestError> {
     value
         .to_str()
         .map_err(|_| WebhookRequestError::InvalidShape)
+}
+
+fn add_provider_identity_len(
+    length: &mut usize,
+    identity: &ProviderIdentityProjection,
+) -> Result<(), WebhookRequestError> {
+    match identity {
+        ProviderIdentityProjection::Disabled => {
+            add_literal(length, b"{\"state\":\"disabled\"}")?;
+        }
+        ProviderIdentityProjection::Anonymous => {
+            add_literal(length, b"{\"state\":\"anonymous\"}")?;
+        }
+        ProviderIdentityProjection::Authenticated { principal, groups } => {
+            add_literal(
+                length,
+                b"{\"state\":\"authenticated\",\"principal\":{\"authority\":",
+            )?;
+            add_json_string_len(length, principal.authority.as_str())?;
+            add_literal(length, b",\"id\":")?;
+            add_json_string_len(length, principal.id.as_str())?;
+            add_literal(length, b",\"kind\":")?;
+            add_json_string_len(length, principal.kind.as_str())?;
+            add_literal(length, b"},\"groups\":[")?;
+            for (index, group) in groups.iter().enumerate() {
+                if index != 0 {
+                    add_literal(length, b",")?;
+                }
+                add_literal(length, b"{\"authority\":")?;
+                add_json_string_len(length, group.authority().as_str())?;
+                add_literal(length, b",\"id\":")?;
+                add_json_string_len(length, group.id().as_str())?;
+                add_literal(length, b"}")?;
+            }
+            add_literal(length, b"]}")?;
+        }
+    }
+    Ok(())
+}
+
+fn append_provider_identity(
+    output: &mut ReservedGuardedBodyBuilder,
+    identity: &ProviderIdentityProjection,
+) -> Result<(), WebhookRequestError> {
+    match identity {
+        ProviderIdentityProjection::Disabled => {
+            append(output, b"{\"state\":\"disabled\"}")?;
+        }
+        ProviderIdentityProjection::Anonymous => {
+            append(output, b"{\"state\":\"anonymous\"}")?;
+        }
+        ProviderIdentityProjection::Authenticated { principal, groups } => {
+            append(
+                output,
+                b"{\"state\":\"authenticated\",\"principal\":{\"authority\":",
+            )?;
+            append_json_string(output, principal.authority.as_str())?;
+            append(output, b",\"id\":")?;
+            append_json_string(output, principal.id.as_str())?;
+            append(output, b",\"kind\":")?;
+            append_json_string(output, principal.kind.as_str())?;
+            append(output, b"},\"groups\":[")?;
+            for (index, group) in groups.iter().enumerate() {
+                if index != 0 {
+                    append(output, b",")?;
+                }
+                append(output, b"{\"authority\":")?;
+                append_json_string(output, group.authority().as_str())?;
+                append(output, b",\"id\":")?;
+                append_json_string(output, group.id().as_str())?;
+                append(output, b"}")?;
+            }
+            append(output, b"]}")?;
+        }
+    }
+    Ok(())
 }
 
 fn add_literal(length: &mut usize, bytes: &[u8]) -> Result<(), WebhookRequestError> {
@@ -287,6 +376,9 @@ fn hex(value: u8) -> u8 {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
+    use access_identity::{
+        AuthorityId, GroupId, GroupRef, PrincipalId, PrincipalKind, ProviderPrincipalProjection,
+    };
     use http::{HeaderName, HeaderValue};
 
     use super::*;
@@ -298,6 +390,22 @@ mod tests {
             peak,
             WireBodyQuotaKey::from_peer(IpAddr::V4(Ipv4Addr::LOCALHOST), |_| false),
         )
+    }
+
+    fn authenticated_projection() -> ProviderIdentityProjection {
+        let authority = AuthorityId::new("test-authority").unwrap();
+        ProviderIdentityProjection::Authenticated {
+            principal: ProviderPrincipalProjection {
+                authority: authority.clone(),
+                id: PrincipalId::new("test-principal").unwrap(),
+                kind: PrincipalKind::ServiceAccount,
+            },
+            groups: vec![
+                GroupRef::new(authority.clone(), GroupId::new("developers").unwrap()),
+                GroupRef::new(authority, GroupId::new("operators").unwrap()),
+            ]
+            .into_boxed_slice(),
+        }
     }
 
     #[test]
@@ -315,6 +423,7 @@ mod tests {
             url: "https://example.test/a?b=c",
             method: "GET",
             client_ip: "127.0.0.1",
+            identity: None,
             headers: Some(&headers),
         };
         let token =
@@ -345,6 +454,164 @@ mod tests {
     }
 
     #[test]
+    fn l05_process_and_webhook_project_the_same_rule_and_complete_checked_identity() {
+        let identities = [
+            ProviderIdentityProjection::Disabled,
+            ProviderIdentityProjection::Anonymous,
+            authenticated_projection(),
+        ];
+        let token =
+            ResumeToken::from_encoded_for_test(*b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+
+        for identity in &identities {
+            let provider = ProviderRequest {
+                request_id: "request-1",
+                rule_id: "matched-rule",
+                url: "https://example.test/resource",
+                method: "GET",
+                client_ip: "127.0.0.1",
+                identity: Some(identity),
+                headers: None,
+                body: None,
+            };
+            let mut process = Vec::new();
+            provider
+                .write_compact("p0000000000000001-0000000000000001", &mut process)
+                .unwrap();
+            let process: serde_json::Value = serde_json::from_slice(&process).unwrap();
+
+            let webhook = WebhookRequest::from_provider(provider);
+            let exact = webhook
+                .encoded_len("https://proxy.test/_acl/external-auth/callback")
+                .unwrap();
+            let body_guard = guard(128 * 1024);
+            assert!(matches!(
+                webhook.prepare(
+                    "https://proxy.test/_acl/external-auth/callback",
+                    exact - 1,
+                    &body_guard,
+                ),
+                Err(WebhookRequestError::TooLarge)
+            ));
+            let webhook = webhook
+                .prepare(
+                    "https://proxy.test/_acl/external-auth/callback",
+                    exact,
+                    &body_guard,
+                )
+                .unwrap()
+                .finish(&token)
+                .unwrap();
+            let webhook = webhook.segments().flatten().copied().collect::<Vec<_>>();
+            let webhook: serde_json::Value = serde_json::from_slice(&webhook).unwrap();
+
+            assert_eq!(process["ruleId"], "matched-rule");
+            assert_eq!(webhook["ruleId"], "matched-rule");
+            assert_eq!(process["ruleId"], webhook["ruleId"]);
+            assert_eq!(process["identity"], webhook["identity"]);
+        }
+
+        let omitted = ProviderRequest {
+            request_id: "request-1",
+            rule_id: "matched-rule",
+            url: "https://example.test/resource",
+            method: "GET",
+            client_ip: "127.0.0.1",
+            identity: None,
+            headers: None,
+            body: None,
+        };
+        let mut process = Vec::new();
+        omitted
+            .write_compact("p0000000000000001-0000000000000001", &mut process)
+            .unwrap();
+        let process: serde_json::Value = serde_json::from_slice(&process).unwrap();
+        assert!(process.get("identity").is_none());
+
+        let webhook = WebhookRequest::from_provider(omitted);
+        let body_guard = guard(128 * 1024);
+        let webhook = webhook
+            .prepare(
+                "https://proxy.test/_acl/external-auth/callback",
+                16 * 1024,
+                &body_guard,
+            )
+            .unwrap()
+            .finish(&token)
+            .unwrap();
+        let webhook = webhook.segments().flatten().copied().collect::<Vec<_>>();
+        let webhook: serde_json::Value = serde_json::from_slice(&webhook).unwrap();
+        assert!(webhook.get("identity").is_none());
+    }
+
+    #[test]
+    fn l05_authenticated_projection_excludes_expiry_and_resolver_generation() {
+        use std::time::{Duration, Instant, SystemTime};
+
+        use access_identity::{
+            AuthenticatedIdentity, IdentityContext, IdentityExpiry, PrincipalRef,
+            ResolverGeneration,
+        };
+
+        let authority = AuthorityId::new("test-authority").unwrap();
+        let principal = PrincipalRef::new(
+            authority.clone(),
+            PrincipalId::new("test-principal").unwrap(),
+            PrincipalKind::ServiceAccount,
+        );
+        let expiry = IdentityExpiry::checked_from_wall(
+            SystemTime::now() + Duration::from_secs(60),
+            SystemTime::now(),
+            Instant::now(),
+        )
+        .unwrap();
+        let context = IdentityContext::Authenticated(
+            AuthenticatedIdentity::new(
+                principal,
+                vec![GroupRef::new(
+                    authority,
+                    GroupId::new("developers").unwrap(),
+                )],
+                Some(expiry),
+                ResolverGeneration::from_conformance_fixture([0x5a; 32]),
+            )
+            .unwrap(),
+        );
+        assert!(context
+            .authenticated()
+            .and_then(AuthenticatedIdentity::valid_until)
+            .is_some());
+        let baseline = ProviderIdentityProjection::from(&context);
+
+        let fixture = ProviderIdentityProjection::from(
+            &access_identity::authenticated_identity_context_fixture(),
+        );
+        let changed_generation = ProviderIdentityProjection::from(
+            &access_identity::authenticated_identity_context_generation_mutation_fixture(),
+        );
+        assert_eq!(fixture, changed_generation);
+
+        let provider = ProviderRequest {
+            request_id: "request-1",
+            rule_id: "matched-rule",
+            url: "https://example.test/resource",
+            method: "GET",
+            client_ip: "127.0.0.1",
+            identity: Some(&baseline),
+            headers: None,
+            body: None,
+        };
+        let mut encoded = Vec::new();
+        provider
+            .write_compact("p0000000000000001-0000000000000001", &mut encoded)
+            .unwrap();
+        let encoded = String::from_utf8(encoded).unwrap();
+        assert!(!encoded.contains("expir"));
+        assert!(!encoded.contains("validUntil"));
+        assert!(!encoded.contains("generation"));
+    }
+
+    #[test]
     fn webhook_request_body_never_disclosed() {
         use crate::authorization::protocol::GuardedProviderBody;
 
@@ -355,9 +622,11 @@ mod tests {
         let body = body.finish();
         let provider = ProviderRequest {
             request_id: "request-1",
+            rule_id: "rule-1",
             url: "https://example.test/resource",
             method: "POST",
             client_ip: "127.0.0.1",
+            identity: None,
             headers: None,
             body: Some(GuardedProviderBody {
                 content_type: Some("application/octet-stream"),
@@ -365,7 +634,7 @@ mod tests {
                 decoded: &body,
             }),
         };
-        let request = WebhookRequest::from_provider("rule-1", provider);
+        let request = WebhookRequest::from_provider(provider);
         let token =
             ResumeToken::from_encoded_for_test(*b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
         let encoded = request
@@ -394,6 +663,7 @@ mod tests {
             url: "http://localhost/",
             method: "A",
             client_ip: "::",
+            identity: None,
             headers: None,
         };
         let callback = "http://localhost/_acl/external-auth/callback";

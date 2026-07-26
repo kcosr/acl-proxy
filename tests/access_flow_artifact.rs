@@ -3,14 +3,14 @@
 use std::io::Read as _;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use acl_proxy_transparent_uds_relay::config::Route;
-use acl_proxy_transparent_uds_relay::relay::relay_known_destination_for_test;
+use access_flow::{write_access_flow_preface, AccessFlowDestination};
+use access_identity::IdentityPresentation;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpStream, UnixStream};
 
 struct ChildGuard(Child);
 
@@ -82,7 +82,7 @@ async fn stop(child: &mut ChildGuard, socket: &Path) {
 }
 
 #[tokio::test]
-async fn relay_and_acl_proxy_binary_round_trip_http_across_the_unix_artifact_boundary() {
+async fn access_flow_and_acl_proxy_binary_round_trip_http_across_the_unix_artifact_boundary() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = directory.path().join("transparent-http.sock");
@@ -102,12 +102,15 @@ bind = "{control}"
 base_path = "/_acl-proxy"
 
 [listeners.transparent_http]
-endpoint.kind = "unix_proxy_v2"
-endpoint.path = {socket:?}
-endpoint.mode = "0600"
-endpoint.proxy_header_timeout = "2s"
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
 endpoint.allowed_destination_ports = [80]
 http_versions = ["http1"]
+
+[listeners.transparent_http.endpoint.transport]
+kind = "unix"
+path = {socket:?}
+mode = "0600"
 
 [egress]
 route = "direct"
@@ -129,63 +132,41 @@ default = "deny"
     );
     wait_until_ready(&mut child.0, control, &socket).await;
 
-    let rejected_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-    let rejected_address = rejected_listener.local_addr().unwrap();
-    let rejected_client_task = tokio::spawn(TcpStream::connect(rejected_address));
-    let (rejected_relay_client, rejected_peer) = rejected_listener.accept().await.unwrap();
-    let mut rejected_client = rejected_client_task.await.unwrap().unwrap();
-    let rejected_route = Route {
-        name: "disallowed-product-port".to_owned(),
-        listen: rejected_address,
-        allowed_original_ports: vec![443],
-        upstream_socket: PathBuf::from(&socket),
-    };
-    let rejected_relay = tokio::spawn(relay_known_destination_for_test(
-        rejected_relay_client,
-        rejected_peer,
-        "203.0.113.8:443".parse().unwrap(),
-        rejected_route,
-        Duration::from_secs(1),
-        1024,
-    ));
-    rejected_client
+    let mut rejected = UnixStream::connect(&socket).await.unwrap();
+    write_access_flow_preface(
+        &mut rejected,
+        AccessFlowDestination::new("203.0.113.8".parse().unwrap(), 443).unwrap(),
+        &IdentityPresentation::Disabled,
+    )
+    .await
+    .unwrap();
+    rejected
         .write_all(
             b"GET /must-not-dispatch HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
         )
         .await
         .unwrap();
-    rejected_client.shutdown().await.unwrap();
+    rejected.shutdown().await.unwrap();
     let mut rejected_response = Vec::new();
-    tokio::time::timeout(
+    let rejected_read = tokio::time::timeout(
         Duration::from_secs(1),
-        rejected_client.read_to_end(&mut rejected_response),
+        rejected.read_to_end(&mut rejected_response),
     )
     .await
-    .unwrap()
     .unwrap();
+    if let Err(error) = rejected_read {
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+    }
     assert!(rejected_response.is_empty());
-    assert_eq!(rejected_relay.await.unwrap().bytes_to_client, 0);
 
-    let relay_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-    let relay_address = relay_listener.local_addr().unwrap();
-    let client_task = tokio::spawn(TcpStream::connect(relay_address));
-    let (relay_client, peer) = relay_listener.accept().await.unwrap();
-    let mut client = client_task.await.unwrap().unwrap();
-    let route = Route {
-        name: "http".to_owned(),
-        listen: relay_address,
-        allowed_original_ports: vec![80],
-        upstream_socket: PathBuf::from(&socket),
-    };
-    let relay = tokio::spawn(relay_known_destination_for_test(
-        relay_client,
-        peer,
-        "203.0.113.8:80".parse().unwrap(),
-        route,
-        Duration::from_secs(1),
-        1024,
-    ));
-
+    let mut client = UnixStream::connect(&socket).await.unwrap();
+    write_access_flow_preface(
+        &mut client,
+        AccessFlowDestination::new("203.0.113.8".parse().unwrap(), 80).unwrap(),
+        &IdentityPresentation::Disabled,
+    )
+    .await
+    .unwrap();
     client
         .write_all(
             b"GET /artifact HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
@@ -201,10 +182,5 @@ default = "deny"
         String::from_utf8_lossy(&response)
     );
     assert!(String::from_utf8_lossy(&response).contains("request denied"));
-    let outcome = relay.await.unwrap();
-    assert!(outcome.completed);
-    assert!(outcome.bytes_to_upstream > 0);
-    assert!(outcome.bytes_to_client > 0);
-
     stop(&mut child, &socket).await;
 }

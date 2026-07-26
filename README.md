@@ -14,13 +14,19 @@ parser or migration mode.
 
 Release archives contain `acl-proxy`, the capture-body extraction helper, this
 README, `LICENSE`, `THIRD_PARTY_NOTICES`, and `acl-proxy.sample.toml`. Linux
-archives also contain the Linux-only transparent UDS relay. To build locally:
+archives also contain the Linux-only Access Flow relay. To build locally:
+
+The current local candidate contains only
+`acl-proxy-<version>-<acl12>-linux-x86_64.tar.gz`. The planned filename for a
+future native-host-validated macOS ARM64 archive is
+`acl-proxy-<version>-<acl12>-macos-arm64.tar.gz`; no macOS archive is built or
+included in this candidate.
 
 ```text
 acl-proxy-<version>-<acl12>/
   bin/acl-proxy
   bin/acl-proxy-extract-capture-body
-  bin/acl-proxy-transparent-uds-relay  # Linux archives only
+  bin/acl-proxy-access-flow-relay  # Linux archives only
   README.md
   LICENSE
   THIRD_PARTY_NOTICES
@@ -29,8 +35,9 @@ acl-proxy-<version>-<acl12>/
 
 `<version>` is the exact Cargo package version and `<acl12>` is the first 12
 lowercase hexadecimal characters of the packaged `acl-proxy` commit. That
-directory is the archive root. Linux archives have the three shown `bin/`
-entries; non-Linux archives omit the Linux-only relay and have the other two.
+directory is the archive root. The current Linux archive has the three shown
+`bin/` entries; the planned macOS archive would omit the Linux-only relay and
+have the other two.
 
 The `0.3.0-rc.1` candidate requires `schema_version = 3`; configurations for
 the `0.2.x` contract must be rewritten rather than migrated through aliases or
@@ -147,18 +154,64 @@ max_concurrent_streams = 128
 http1 = "deny" # deny | mitm
 ```
 
+Listeners support `optional` or `required` workload identity. Omit the
+listener's `identity` table to disable identity:
+
+```toml
+[listeners.explicit_http.identity]
+mode = "required"
+
+[identity]
+max_pending_authentications = 256
+max_pending_authentications_per_connection = 16
+
+[identity.resolver]
+kind = "static"
+authority = "workstation"
+
+[[identity.resolver.principals]]
+id = "local-workload"
+kind = "service_account" # user | service_account | system
+
+[[identity.resolver.groups]]
+id = "developers"
+members = ["local-workload"]
+
+[[identity.resolver.tokens]]
+id = "local-workload-primary"
+principal = "local-workload"
+source = "environment"
+variable = "AW_IDENTITY_TOKEN"
+```
+
+Environment token sources are read once before runtime threads start, removed
+from the process environment, and retained in sensitive process-owned storage.
+File sources use `source = "file"` with an absolute `path` and are read through
+the proxy's private credential-file checks during candidate activation. Reload
+may replace file-backed catalogs, but cannot introduce a new environment
+locator after startup. Cleartext TCP identity is restricted to loopback;
+Access Flow carries the typed presentation in its authenticated preface.
+
+For HTTP listeners, `optional` treats a missing protected carrier as anonymous,
+while `required` rejects it. Every presented invalid bearer fails closed.
+`x-aw-identity-token` is reserved for this carrier and cannot be used by
+ordinary header predicates, mutations, credentials, provider header
+projection, capture, or generic egress.
+
 Transparent HTTP and HTTPS listeners may instead accept a Unix stream carrying
-one strict PROXY Protocol v2 IPv4/STREAM preface followed by the untouched TCP
-stream:
+one strict AW Access Flow preface followed by the untouched TCP stream:
 
 ```toml
 [listeners.transparent_http]
-endpoint.kind = "unix_proxy_v2"
-endpoint.path = "/Users/your-user/Library/Application Support/AW Gateway/runtime/transparent-http.sock"
-endpoint.mode = "0600"
-endpoint.proxy_header_timeout = "2s"
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
 endpoint.allowed_destination_ports = [80]
 http_versions = ["http1"]
+
+[listeners.transparent_http.endpoint.transport]
+kind = "unix"
+path = "/Users/your-user/Library/Application Support/AW Gateway/runtime/transparent-http.sock"
+mode = "0600"
 ```
 
 The workstation host path must be inside a user-writable runtime directory
@@ -193,29 +246,39 @@ stage fails following socket publication. The immediate parent must already
 exist as a real directory owned by the workstation user with no group or other
 permission bits (normally mode `0700`).
 
-Unix-PROXY-v2 ingress represents one local workstation principal. The asserted
-PROXY source is discarded, the effective client is loopback and local for quota
-purposes, and configurations using this transport may not contain
+Access Flow ingress represents one local workstation principal. The effective
+client is loopback and local for quota purposes, and configurations using this
+transport may not contain
 `client_cidrs` predicates. The validated original destination is retained and
 must belong to that endpoint's nonempty `allowed_destination_ports` set. The
 workstation profile uses port 80 for transparent HTTP and port 443 for
 transparent HTTPS. This transport is available on supported Unix hosts. The companion
-`acl-proxy-transparent-uds-relay` artifact is Linux-only because it retrieves
+`acl-proxy-access-flow-relay` artifact is Linux-only because it retrieves
 `SO_ORIGINAL_DST` from redirected TCP connections.
 
 Run the relay with its separate strict JSON configuration:
 
 ```bash
-acl-proxy-transparent-uds-relay --config /etc/acl-proxy/transparent-uds-relay.json
+acl-proxy-access-flow-relay --config /etc/acl-proxy/access-flow-relay.json
 ```
 
-See `examples/transparent-uds-relay.json` for the complete schema and
-`examples/acl-proxy-transparent-uds.toml` for the paired host listeners. Relay
-listener addresses must be unprivileged IPv4 loopback addresses. Route names,
-listeners, original-port sets, and Unix paths are unique. `setupTimeout` covers
-both the Unix connection and complete PROXY preface write. `maxConnections` is
-global across routes, and the relay validates its projected file descriptors
-and `maxConnections * 2 * copyBufferBytesPerDirection` memory before binding.
+See `examples/access-flow-relay.json` for the complete schema and
+`examples/acl-proxy-access-flow.toml` for the paired host listeners. Relay
+listener addresses must be nonzero IPv4 loopback addresses. Route names and
+listen addresses must each be unique. `setupTimeout` covers both the Unix connection and
+complete AW Access Flow preface write. `maxConnections` is global across routes.
+Existing relay configurations require a one-time rewrite:
+`allowedOriginalPorts` becomes `allowedDestinationPorts`, and
+`upstreamSocket` becomes the nested
+`"transport": {"kind": "unix", "path": "..."}` object. The old fields and
+mixed old/new route shapes are rejected; there are no aliases.
+The strict `presentation` union accepts `disabled`, `anonymous`, or
+`bearer_environment`; the latter requires a `variable`, consumes and removes
+that environment value before the Tokio runtime starts, and presents the same
+bearer on every admitted relay connection.
+The relay reserves 16 non-relay descriptors from `RLIMIT_NOFILE`, reserves
+2 MiB from its fixed 256 MiB process preflight ceiling, and delegates exact
+checked resource projection to the shared relay engine before binding.
 The relay never parses HTTP or TLS and has no TCP egress fallback.
 The shipped host example requires TLS parent-proxy egress; it does not silently
 fall back to direct origin access.
@@ -223,9 +286,10 @@ fall back to direct origin access.
 Repository tests cover the relay-to-ACL HTTP artifact boundary through an
 injected original-destination seam and cover TLS MITM on the Unix listener.
 Kernel `SO_ORIGINAL_DST`/iptables netns behavior and the complete
-TLS/HTTP2/WebSocket topology remain the T04 AW Gateway cross-repository release
-gates because they require the privileged Linux redirect environment and the
-Apple host socket relay.
+TLS/HTTP2/WebSocket topology remain part of Gate A and the exact-tuple Gate X
+suite. Gate X runs both relay consumers in a privileged Linux redirect
+environment. Live Apple Container socket-relay execution remains a
+host-conditional platform gate and is not inferred from Linux coverage.
 
 HTTP/2 CONNECT is intentionally deny-only. Enabling `http1 = "mitm"` or a
 transparent HTTPS listener requires `[mitm]`:
@@ -297,12 +361,23 @@ route = "parent_proxy"
 
 [egress.parent_proxy]
 kind = "acl_proxy" # acl_proxy | generic
-url = "http://parent-proxy.example.test:8881"
+url = "https://parent-proxy.example.test:8443"
+
+[egress.parent_proxy.presentation]
+kind = "bearer_environment" # bearer_environment | bearer_file
+variable = "AW_IDENTITY_TOKEN"
+
+[egress.parent_proxy.tls]
+trust = "system"
 ```
 
 Parent endpoints may not resolve to loopback, a local interface, a data
 listener, or the control listener. DNS results are pinned and revalidated
-before and after connect.
+before and after connect. Presentation requires an HTTPS endpoint and is valid
+only for `kind = "acl_proxy"`; the bearer is added to ACL Proxy parent requests
+and never to direct-origin or generic-parent traffic. A file presentation uses
+`path` instead of `variable`. Cleartext HTTP parents cannot carry a typed
+identity presentation.
 
 ### Policy
 
@@ -321,6 +396,10 @@ decision = "allow"
 urls = ["https://api.example.test/v1/**"]
 methods = ["GET", "HEAD"]
 client_cidrs = ["192.0.2.0/24"]
+identity_states = ["authenticated"]
+identity_subjects = [
+  { kind = "group", authority = "workstation", id = "developers" }
+]
 
 [policy.rules.headers]
 present_all = ["x-workload-id"]
@@ -329,6 +408,13 @@ none = { x-blocked = ["true"] }
 
 Every rule requires a stable, unique `id` and a `decision`. An empty `urls`
 list means every canonical HTTP/HTTPS URL, subject to the other predicates.
+`identity_states` is an optional nonempty, duplicate-free OR set drawn from
+`disabled`, `anonymous`, and `authenticated`; omission means no identity-state
+predicate. Authoring order does not affect the compiled rule. The singular
+`identity_state` field is rejected and has no alias. `identity_subjects` is an
+OR set of exact authority-qualified `principal` or `group` references and may
+appear only with `identity_states = ["authenticated"]`. Identity predicates
+combine with the other predicates using the rule-wide AND behavior.
 
 URL patterns are component aware:
 
@@ -460,13 +546,55 @@ detaches into another process group is outside that authority.
 Webhook providers require a control listener and a canonical public callback
 URL. Control routes are never exposed by a data listener.
 
+Unix authorization providers connect to a separately managed local service for
+each selected request. They use one bounded `AWAP` version 1 request/response
+exchange over the shared access RPC frame, without a callback listener,
+connection pool, retry, request body, or dynamic credential destination:
+
+```toml
+[authorization.providers.repo_acl]
+kind = "unix_socket"
+socket_path = "/run/acl-proxy/repo-authorization.sock"
+timeout = "2s"
+on_failure = "deny"
+include_headers = ["x-workload-id"]
+include_identity = true
+max_request_bytes = 262144
+max_response_bytes = 65536
+max_pending_requests = 128
+peer_uid = 1000
+
+[authorization.providers.repo_acl.outputs.access_token]
+kind = "bearer"
+transport_security = "tls_required"
+required = true
+```
+
+All fields shown above except `include_identity`, `peer_uid`, and `outputs` are
+required. `include_identity` defaults to false, `peer_uid` is optional, and an
+omitted `outputs` table is empty. The socket path is absolute and normalized.
+Activation validates the platform and optional peer-UID capability but never
+probes or connects to the socket. Socket loss affects only requests selecting
+that provider; rebinding the same path lets later requests recover.
+
+AWAP requests contain the exact matched `ruleId`, invocation mode, canonical
+URL and method, fixed workstation client, mandatory header object, and checked
+identity only when selected. They never contain the raw identity bearer,
+request body, caller credentials, provider configuration, or output
+destinations. Responses echo the protocol request ID and return `allow`,
+`deny`, or `pass`; only an effects-allowed `allow` may carry values declared by
+the active configuration. Returned values are authorization effects passed to
+the existing late credential-injection boundary. AWAP is not a credential
+lookup protocol.
+
 #### Outer CONNECT Decisions
 
 When an HTTP/1 CONNECT is selected for MITM, a matching delegated policy rule
-still calls its process or webhook provider before the tunnel is established.
-This synthetic outer request is decision-only: the provider request has
-`method = "CONNECT"`, uses the canonical HTTPS root URL for the CONNECT
-authority, and never contains a body, even when the provider is configured
+still calls its process, webhook, or Unix provider before the tunnel is
+established. This synthetic outer request is decision-only: the provider
+request has `method = "CONNECT"`, uses the canonical HTTPS root URL for the
+CONNECT authority, and never contains a body, even when the provider is
+configured
 with `include_request_body = true`.
 
 The provider must return only `allow`, `deny`, or `pass`. An `allow` response
@@ -673,6 +801,11 @@ process-wide resource changes are rejected as static changes.
 polled while admitted work drains within `service.shutdown_drain_timeout`.
 `SIGHUP` is ignored after shutdown begins. A second `SIGINT` or `SIGTERM`
 abandons the graceful wait and forces prompt process termination.
+
+Capture and policy-decision admission closes when graceful shutdown begins,
+before admitted data-plane work drains. Capture jobs accepted before that
+boundary drain within the remaining shutdown deadline; observations completed
+during the later flow-drain window are intentionally omitted.
 
 Configured sockets are reserved during static preparation, but proxy listeners
 cannot start admitting data-plane work until the initial generation has

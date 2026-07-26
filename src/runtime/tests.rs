@@ -134,6 +134,7 @@ fn test_forwarding_executor(
             protocols,
             http_access_types::TlsTrust::Insecure,
             http_access_types::Route::Direct,
+            None,
             standalone.snapshot_lease(),
             &http_access_runtime::ForwardingCancellation::new(),
         )
@@ -843,6 +844,7 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
                 timeout: Duration::from_secs(5),
                 on_failure: CompiledProviderFailureMode::Deny,
                 include_headers: vec![],
+                include_identity: false,
                 max_request_bytes: 8192,
                 max_response_bytes: 4096,
                 outputs: std::collections::BTreeMap::new(),
@@ -910,17 +912,19 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
     );
     let request = ProviderRequest {
         request_id: "request-1",
+        rule_id: "rule-1",
         url: "https://example.test/resource",
         method: "GET",
         client_ip: "192.0.2.10",
+        identity: None,
         headers: None,
         body: None,
     };
     let dispatch = lease.dispatch_authorization(
         provider,
-        "rule-1",
         request,
         crate::runtime::AuthorizationInvocationMode::EffectsAllowed,
+        http_access_runtime::ForwardingCancellation::new(),
         &body_guard,
         tokio::time::Instant::now() + Duration::from_secs(5),
     );
@@ -971,16 +975,18 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
     let rejected = lease
         .dispatch_authorization(
             provider,
-            "rule-after-shutdown",
             ProviderRequest {
                 request_id: "request-after-shutdown",
+                rule_id: "rule-after-shutdown",
                 url: "https://example.test/resource",
                 method: "GET",
                 client_ip: "192.0.2.10",
+                identity: None,
                 headers: None,
                 body: None,
             },
             crate::runtime::AuthorizationInvocationMode::EffectsAllowed,
+            http_access_runtime::ForwardingCancellation::new(),
             &body_guard,
             tokio::time::Instant::now() + Duration::from_secs(5),
         )
@@ -1533,6 +1539,14 @@ async fn live_upgrade_reload_retires_generation_and_releases_terminal_once() {
         assert!(fin);
         assert_eq!(opcode, 0x1);
         assert_eq!(payload, b"old-secret [WIRE-NEW]");
+        let (fin, opcode, payload) = read_websocket_frame(&mut new_stream, true).await;
+        assert!(fin);
+        assert_eq!(opcode, 0x9);
+        assert_eq!(payload, b"new-capture-complete");
+        new_stream
+            .write_all(&websocket_frame(true, 0xA, false, b"new-capture-complete"))
+            .await
+            .unwrap();
     });
 
     let mut old_client = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
@@ -1629,6 +1643,14 @@ async fn live_upgrade_reload_retires_generation_and_releases_terminal_once() {
         .write_all(&websocket_frame(true, 0x1, true, b"old-secret new-secret"))
         .await
         .unwrap();
+    new_client
+        .write_all(&websocket_frame(true, 0x9, true, b"new-capture-complete"))
+        .await
+        .unwrap();
+    let (fin, opcode, payload) = read_websocket_frame(&mut new_client, false).await;
+    assert!(fin);
+    assert_eq!(opcode, 0xA);
+    assert_eq!(payload, b"new-capture-complete");
 
     drop(old_client);
     drop(new_client);

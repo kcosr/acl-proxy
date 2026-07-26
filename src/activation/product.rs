@@ -16,7 +16,7 @@ use crate::runtime::{
 use crate::safety::ProductSafetySnapshot;
 use crate::standalone::UnboundStandaloneGenerationPlan;
 
-use super::owner::ProductGenerationOwner;
+use super::owner::{IdentityBoundGenerationOwner, ProductGenerationOwner};
 use super::static_resources::ProductStaticResources;
 
 /// Process-lifetime factory for complete generation candidates.
@@ -126,6 +126,8 @@ impl ProductActivator {
             request_timeout,
             max_content_decoding_expansion_ratio,
             forwarding: _,
+            identity,
+            identity_connection_capacity,
             egress,
             policy: _,
             authorization,
@@ -135,6 +137,23 @@ impl ProductActivator {
             safety,
             resource_plan,
         } = plan;
+        let parent_presentation_source = egress
+            .parent_proxy
+            .as_ref()
+            .and_then(|parent| parent.presentation.clone());
+        let identity_sources = self.static_resources.identity_sources();
+        let (identity_owner, parent_presentation) = self
+            .static_resources
+            .identity_publisher()
+            .stage(
+                identity,
+                identity_connection_capacity,
+                parent_presentation_source.as_ref(),
+                &identity_sources,
+            )
+            .map_err(|error| candidate_error(&cancellation, "identity", error.to_string()))?;
+        let parent_presentation =
+            parent_presentation.map(http_access_runtime::AclProxyParentPresentation::new);
         let logging_level_owner = self
             .static_resources
             .logging_level()
@@ -208,6 +227,7 @@ impl ProductActivator {
             protocols,
             origin_https_trust,
             route,
+            parent_presentation,
             standalone.snapshot_lease(),
             &forwarding_cancellation,
         );
@@ -239,7 +259,11 @@ impl ProductActivator {
             .into_vec()
             .into_iter()
             .chain([observation_owner, logging_level_owner]);
-        let owner: Arc<dyn GenerationOwner> = Arc::new(ProductGenerationOwner::new(owners));
+        let product_owner: Arc<dyn GenerationOwner> = Arc::new(ProductGenerationOwner::new(owners));
+        let owner: Arc<dyn GenerationOwner> = Arc::new(IdentityBoundGenerationOwner::new(
+            product_owner,
+            identity_owner,
+        ));
 
         let standalone = match standalone.bind(
             &credential_sources,
@@ -613,6 +637,114 @@ redaction_profile = "environment"
         runtime.shutdown().await;
     }
 
+    fn environment_identity_product_config(variable: &str, connection_capacity: usize) -> String {
+        format!(
+            r#"{}
+
+[identity]
+max_pending_authentications = 8
+max_pending_authentications_per_connection = {connection_capacity}
+
+[identity.resolver]
+kind = "static"
+authority = "product-reload"
+
+[[identity.resolver.principals]]
+id = "reload-workload"
+kind = "service_account"
+
+[[identity.resolver.tokens]]
+id = "reload-workload-primary"
+principal = "reload-workload"
+source = "environment"
+variable = "{variable}"
+"#,
+            MINIMAL.replace(
+                "[listeners.explicit_http.connect]",
+                "[listeners.explicit_http.identity]\nmode = \"required\"\n\n[listeners.explicit_http.connect]"
+            )
+        )
+    }
+
+    #[tokio::test]
+    async fn environment_identity_capacity_reload_reuses_resolver_and_failed_candidate_is_atomic() {
+        const VARIABLE: &str = "AW_PRODUCT_RELOAD_IDENTITY_TOKEN";
+        const BEARER: &str = "product-reload-identity-bearer-000000000000";
+        let initial = compile(&environment_identity_product_config(VARIABLE, 2));
+        let successor = compile(&environment_identity_product_config(VARIABLE, 7));
+        assert_eq!(initial.static_fingerprint, successor.static_fingerprint);
+        let static_fingerprint = initial.static_fingerprint.clone();
+        unsafe {
+            std::env::set_var(VARIABLE, BEARER);
+        }
+        let identity_sources = crate::identity::IdentitySourceRegistry::activate().unwrap();
+        identity_sources.preload(&initial.reloadable_plan).unwrap();
+        assert!(std::env::var_os(VARIABLE).is_none());
+
+        let resources = ProductStaticResources::try_new_with_identity_sources(
+            &initial.static_config,
+            identity_sources,
+        )
+        .await
+        .unwrap();
+        let publisher = resources.identity_publisher();
+        let activator = resources.activator();
+        let source = Arc::new(ProductCandidateSource::default());
+        let ownership = crate::runtime::StaticOwnership::new(
+            initial.static_config.clone(),
+            initial.static_fingerprint.clone(),
+            resources,
+        );
+        let runtime = crate::runtime::Runtime::new(ownership, source.clone(), activator)
+            .await
+            .unwrap();
+        let first = runtime.start(initial).await.unwrap();
+        let resolver = publisher.generation_marker_for_test().unwrap();
+        assert_eq!(publisher.connection_capacity_for_test(), 2);
+
+        source.push(successor);
+        let crate::runtime::ReloadTriggerResult::Completed {
+            generation: second, ..
+        } = runtime.trigger_reload().await.unwrap()
+        else {
+            panic!("capacity-only reload did not publish");
+        };
+        assert_ne!(first, second);
+        assert_eq!(publisher.generation_marker_for_test(), Some(resolver));
+        assert_eq!(publisher.connection_capacity_for_test(), 7);
+
+        let failed = compile(&format!(
+            r#"{}
+
+[egress]
+route = "parent_proxy"
+
+[egress.parent_proxy]
+kind = "acl_proxy"
+url = "https://parent.example.test:8443"
+
+[egress.parent_proxy.presentation]
+kind = "bearer_file"
+path = "/missing/acl-proxy-product-reload-identity-token"
+
+[egress.parent_proxy.tls]
+trust = "system"
+"#,
+            environment_identity_product_config(VARIABLE, 8)
+        ));
+        assert_eq!(failed.static_fingerprint, static_fingerprint);
+        source.push(failed);
+        assert!(matches!(
+            runtime.trigger_reload().await,
+            Err(RuntimeError::CandidateActivation(_))
+        ));
+        assert_eq!(runtime.active_generation_id(), Some(second));
+        assert_eq!(publisher.generation_marker_for_test(), Some(resolver));
+        assert_eq!(publisher.connection_capacity_for_test(), 7);
+
+        runtime.shutdown().await;
+    }
+
     #[tokio::test]
     async fn product_static_owner_and_activator_share_one_authorization_runtime() {
         let compiled = compile(MINIMAL);
@@ -912,6 +1044,7 @@ redaction_profile = "environment"
             1,
             http_access_types::BodyRepresentation::PreservedContentCoded,
             http_access_types::BodyObservation::unobserved(),
+            &access_identity::IdentityContext::Disabled,
         )
         .unwrap();
         let policy = activated

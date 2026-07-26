@@ -20,7 +20,7 @@ const ROOT = join(__dirname, "..");
 const PACKAGE_NAME = "acl-proxy";
 const WORKSPACE_PACKAGE_NAMES = [
 	PACKAGE_NAME,
-	"acl-proxy-transparent-uds-relay",
+	"acl-proxy-access-flow-relay",
 ];
 const REPO = "kcosr/acl-proxy-access-runtime";
 const RELEASE_REMOTE = "access-runtime";

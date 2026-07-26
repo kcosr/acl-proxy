@@ -7,8 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::sync::watch;
 
 use http_access_runtime::{
-    ListenerRuntime, LocalAddressProvider, UpgradeRuntime, UpgradeRuntimeError,
-    UpgradeRuntimeLimits,
+    LocalAddressProvider, UpgradeRuntime, UpgradeRuntimeError, UpgradeRuntimeLimits,
 };
 
 use crate::authorization::callback::PendingTerminalCause;
@@ -23,6 +22,7 @@ use crate::control::server::{
 use crate::credential_io_runtime::{
     CredentialIoRuntime, CredentialIoRuntimeError, CredentialIoShutdownOutcome,
 };
+use crate::identity::{IdentityActivationError, IdentityPublisher, IdentitySourceRegistry};
 use crate::logging::{process_logging_level_control, LoggingLevelControl};
 use crate::observation::{
     ProductObservationRuntime, ProductObservationRuntimeStartError,
@@ -34,8 +34,8 @@ use crate::tls_io_runtime::{TlsIoRuntime, TlsIoRuntimeError, TlsIoShutdownOutcom
 
 use super::assets::{ProductIngressAssets, ProductIngressAssetsError};
 use super::listeners::{
-    LocalAddressRefreshFailureObserver, PreparedProxyListeners, ProductLocalAddressRuntime,
-    ProxyListenerBindError, ProxyListenerFailure, UnixSocketLifetime,
+    LocalAddressRefreshFailureObserver, PreparedProxyListeners, ProductListenerRuntime,
+    ProductLocalAddressRuntime, ProxyListenerBindError, ProxyListenerFailure, UnixSocketLifetime,
 };
 use super::product::ProductActivator;
 
@@ -56,7 +56,7 @@ pub(crate) struct ProductStaticResources {
     listener_failure: watch::Sender<Option<Arc<ProxyListenerFailure>>>,
     #[cfg(test)]
     listener_failure_notifications: AtomicUsize,
-    listener_runtime: Mutex<Option<Arc<ListenerRuntime>>>,
+    listener_runtime: Mutex<Option<Arc<ProductListenerRuntime>>>,
     unix_socket_lifetimes: Mutex<Vec<Arc<UnixSocketLifetime>>>,
     listener_shutdown_started: AtomicBool,
     #[cfg(test)]
@@ -81,6 +81,8 @@ pub(crate) struct ProductStaticResources {
     tls_io_runtime: Arc<TlsIoRuntime>,
     authorization_runtime: Arc<WebhookAuthorizationRuntime>,
     upgrade_runtime: Arc<UpgradeRuntime>,
+    identity_sources: Arc<IdentitySourceRegistry>,
+    identity_publisher: Arc<IdentityPublisher>,
     local_addresses: OnceLock<Arc<ProductLocalAddressRuntime>>,
 }
 
@@ -202,6 +204,7 @@ impl ControlServerFailureObserver for ProductControlFailureObserver {
 }
 
 impl ProductStaticResources {
+    #[cfg(test)]
     pub(crate) async fn try_new(
         static_config: &StaticProductConfig,
     ) -> Result<Arc<Self>, ProductStaticResourcesError> {
@@ -209,6 +212,21 @@ impl ProductStaticResources {
             static_config.clone(),
             ProductIngressAssetSource::System,
             None,
+            None,
+            ConstructionControl::Continue,
+        )
+        .await
+    }
+
+    pub(crate) async fn try_new_with_identity_sources(
+        static_config: &StaticProductConfig,
+        identity_sources: Arc<IdentitySourceRegistry>,
+    ) -> Result<Arc<Self>, ProductStaticResourcesError> {
+        Self::try_new_coordinated(
+            static_config.clone(),
+            ProductIngressAssetSource::System,
+            None,
+            Some(identity_sources),
             ConstructionControl::Continue,
         )
         .await
@@ -223,6 +241,23 @@ impl ProductStaticResources {
             static_config.clone(),
             ProductIngressAssetSource::ForwardingNetwork(forwarding_network),
             None,
+            None,
+            ConstructionControl::Continue,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn try_new_with_forwarding_network_and_identity_sources(
+        static_config: &StaticProductConfig,
+        forwarding_network: Arc<http_access_runtime::ForwardingNetworkGuard>,
+        identity_sources: Arc<IdentitySourceRegistry>,
+    ) -> Result<Arc<Self>, ProductStaticResourcesError> {
+        Self::try_new_coordinated(
+            static_config.clone(),
+            ProductIngressAssetSource::ForwardingNetwork(forwarding_network),
+            None,
+            Some(identity_sources),
             ConstructionControl::Continue,
         )
         .await
@@ -236,6 +271,7 @@ impl ProductStaticResources {
             static_config.clone(),
             ProductIngressAssetSource::System,
             None,
+            None,
             ConstructionControl::FailAfterObservationActivation,
         )
         .await
@@ -245,6 +281,7 @@ impl ProductStaticResources {
         static_config: StaticProductConfig,
         asset_source: ProductIngressAssetSource,
         webhook_connector: Option<Arc<crate::authorization::webhook::connector::WebhookConnector>>,
+        identity_sources: Option<Arc<IdentitySourceRegistry>>,
         construction_control: ConstructionControl,
     ) -> Result<Arc<Self>, ProductStaticResourcesError> {
         let (result_send, result_receive) = tokio::sync::oneshot::channel();
@@ -261,6 +298,7 @@ impl ProductStaticResources {
                 static_config,
                 asset_source,
                 webhook_connector,
+                identity_sources,
                 construction_control,
             )
             .await;
@@ -281,9 +319,15 @@ impl ProductStaticResources {
         static_config: StaticProductConfig,
         asset_source: ProductIngressAssetSource,
         webhook_connector: Option<Arc<crate::authorization::webhook::connector::WebhookConnector>>,
+        identity_sources: Option<Arc<IdentitySourceRegistry>>,
         construction_control: ConstructionControl,
     ) -> Result<Arc<Self>, ProductStaticResourcesError> {
         let static_fingerprint = StaticFingerprint::from_config(&static_config)?;
+        let identity_sources = match identity_sources {
+            Some(sources) => sources,
+            None => IdentitySourceRegistry::activate()?,
+        };
+        let identity_publisher = IdentityPublisher::activate()?;
         let webhook_connector = match webhook_connector {
             Some(connector) => connector,
             None => {
@@ -412,6 +456,8 @@ impl ProductStaticResources {
             tls_io_runtime,
             authorization_runtime,
             upgrade_runtime,
+            identity_sources,
+            identity_publisher,
             local_addresses: OnceLock::new(),
         });
         let local_addresses = match ProductLocalAddressRuntime::activate(Arc::new(
@@ -474,6 +520,14 @@ impl ProductStaticResources {
 
     pub(crate) fn upgrade_runtime(&self) -> Arc<UpgradeRuntime> {
         self.upgrade_runtime.clone()
+    }
+
+    pub(crate) fn identity_sources(&self) -> Arc<IdentitySourceRegistry> {
+        Arc::clone(&self.identity_sources)
+    }
+
+    pub(crate) fn identity_publisher(&self) -> Arc<IdentityPublisher> {
+        Arc::clone(&self.identity_publisher)
     }
 
     pub(crate) fn ingress_assets(&self) -> &Arc<ProductIngressAssets> {
@@ -723,7 +777,7 @@ impl ProductStaticResources {
 
     pub(super) fn adopt_listener_runtime(
         &self,
-        runtime: ListenerRuntime,
+        runtime: ProductListenerRuntime,
         unix_socket_lifetimes: Vec<Arc<UnixSocketLifetime>>,
     ) -> Result<(), ProductStaticResourcesError> {
         let mut owned = self
@@ -848,6 +902,16 @@ impl ProductStaticResources {
             .is_some()
     }
 
+    #[cfg(test)]
+    pub(super) fn listener_runtime_for_test(&self) -> Arc<ProductListenerRuntime> {
+        self.listener_runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned()
+            .expect("listener runtime is not active")
+    }
+
     fn record_control_shutdown_error(&self, error: Arc<ControlServerShutdownError>) {
         let mut recorded = self
             .control_shutdown_error
@@ -888,6 +952,7 @@ impl StaticResources for ProductStaticResources {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.readiness.begin_shutdown();
+        self.identity_publisher.begin_shutdown();
         if self.shutdown_started.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -1060,6 +1125,8 @@ pub(crate) enum ProductStaticResourcesError {
     LocalAddress(#[from] http_access_runtime::RuntimeError),
     #[error("static observation runtime construction failed")]
     Observation(#[from] ProductObservationRuntimeStartError),
+    #[error("static identity runtime construction failed")]
+    Identity(#[from] IdentityActivationError),
     #[error("control server construction failed")]
     Control(#[from] ControlServerError),
     #[error(transparent)]
@@ -1159,6 +1226,7 @@ header = "x-acl-proxy-request-id"
             request_header_timeout,
             max_connections,
             max_concurrent_streams,
+            identity_mode: crate::config::compiler::CompiledListenerIdentityMode::Disabled,
             connect: None,
         });
         std::fs::create_dir_all(identity_directory).unwrap();
@@ -1177,6 +1245,7 @@ header = "x-acl-proxy-request-id"
             request_header_timeout: Duration::from_secs(1),
             max_connections: 2,
             max_concurrent_streams: 8,
+            identity_mode: crate::config::compiler::CompiledListenerIdentityMode::Disabled,
             connect,
             tls: CompiledTlsIdentity {
                 certificate_chain,
@@ -1192,6 +1261,7 @@ header = "x-acl-proxy-request-id"
             request_header_timeout: Duration::from_secs(1),
             max_connections: 2,
             max_concurrent_streams: 8,
+            identity_mode: crate::config::compiler::CompiledListenerIdentityMode::Disabled,
         });
         config.mitm = Some(StaticMitmConfig::Generated {
             directory: identity_directory.join("mitm"),
@@ -1365,6 +1435,7 @@ header = "x-acl-proxy-request-id"
             ProductStaticResources::try_new_coordinated(
                 construction_config,
                 ProductIngressAssetSource::System,
+                None,
                 None,
                 ConstructionControl::PauseAfterObservationActivation {
                     reached: reached_send,

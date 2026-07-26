@@ -3,10 +3,83 @@
 version = 4
 
 [[package]]
+name = "access-async-contracts"
+version = "0.1.0"
+
+[[package]]
+name = "access-flow"
+version = "0.1.0"
+dependencies = [
+ "access-async-contracts",
+ "access-identity",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
+name = "access-flow-conformance"
+version = "0.1.0"
+dependencies = [
+ "access-flow",
+ "access-flow-relay",
+ "access-flow-unix",
+ "access-identity",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "access-flow-relay"
+version = "0.1.0"
+dependencies = [
+ "access-async-contracts",
+ "access-flow",
+ "access-identity",
+ "rustix",
+ "tokio",
+]
+
+[[package]]
+name = "access-flow-unix"
+version = "0.1.0"
+dependencies = [
+ "access-async-contracts",
+ "access-flow",
+ "access-flow-relay",
+ "rustix",
+ "tokio",
+]
+
+[[package]]
+name = "access-identity"
+version = "0.1.0"
+dependencies = [
+ "access-async-contracts",
+ "hmac",
+ "rand",
+ "sha2",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "access-rpc-framing"
+version = "0.1.0"
+dependencies = [
+ "access-async-contracts",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "acl-proxy"
 version = "0.3.0-rc.1"
 dependencies = [
- "acl-proxy-transparent-uds-relay",
+ "access-async-contracts",
+ "access-flow",
+ "access-flow-unix",
+ "access-identity",
+ "access-rpc-framing",
  "allocator-api2",
  "arc-swap",
  "assert_cmd",
@@ -63,12 +136,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "acl-proxy-transparent-uds-relay"
+name = "acl-proxy-access-flow-relay"
 version = "0.3.0-rc.1"
 dependencies = [
+ "access-async-contracts",
+ "access-flow",
+ "access-flow-conformance",
+ "access-flow-relay",
+ "access-flow-unix",
+ "access-identity",
  "humantime",
  "libc",
- "proxy-protocol-v2-codec",
  "serde",
  "serde_json",
  "tempfile",
@@ -76,6 +154,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -730,6 +809,7 @@ dependencies = [
 name = "http-access-conformance"
 version = "0.1.0"
 dependencies = [
+ "access-identity",
  "http-access-types",
  "http-access-url",
  "serde",
@@ -761,6 +841,7 @@ dependencies = [
 name = "http-access-policy-acl"
 version = "0.1.0"
 dependencies = [
+ "access-identity",
  "http-access-types",
  "http-access-url",
 ]
@@ -779,6 +860,9 @@ dependencies = [
 name = "http-access-runtime"
 version = "0.1.0"
 dependencies = [
+ "access-async-contracts",
+ "access-flow",
+ "access-identity",
  "allocator-api2",
  "bytes",
  "credential-core",
@@ -794,7 +878,6 @@ dependencies = [
  "hyper",
  "hyper-util",
  "if-addrs",
- "proxy-protocol-v2-codec",
  "rand",
  "rustls",
  "sha2",
@@ -809,6 +892,7 @@ dependencies = [
 name = "http-access-types"
 version = "0.1.0"
 dependencies = [
+ "access-identity",
  "idna",
  "memchr",
  "serde",
@@ -1311,10 +1395,6 @@ checksum = "5ee95bc4ef87b8d5ba32e8b7714ccc834865276eab0aed5c9958d00ec45f49e8"
 dependencies = [
  "unicode-ident",
 ]
-
-[[package]]
-name = "proxy-protocol-v2-codec"
-version = "0.1.0"
 
 [[package]]
 name = "quote"

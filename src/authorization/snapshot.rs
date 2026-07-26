@@ -16,6 +16,7 @@ use super::protocol::{
     ProviderCredentialWireStore, ProviderDecision, ProviderOutputDefinition, ProviderOutputIndex,
     ProviderOutputRegistry,
 };
+use super::unix_socket::{UnixSocketActivationError, UnixSocketProvider, UnixSocketRequestError};
 use super::webhook::provider::{WebhookActivationError, WebhookProvider};
 use super::webhook::runtime::{WebhookAuthorizationRuntime, WebhookDispatchError};
 use crate::candidate_tls::CandidateTlsResolver;
@@ -39,6 +40,7 @@ pub(crate) struct ProductAuthorizationSnapshot {
 
 enum ActiveProvider {
     Process(Arc<ProcessProvider>),
+    UnixSocket(Arc<UnixSocketProvider>),
     Webhook(Arc<WebhookProvider>),
 }
 
@@ -51,6 +53,7 @@ pub(crate) struct AuthorizationActivation {
 #[derive(Clone, Copy)]
 pub(crate) struct AuthorizationProviderMetadata<'snapshot> {
     pub(crate) include_headers: &'snapshot [HeaderName],
+    pub(crate) include_identity: bool,
     pub(crate) include_request_body: bool,
     pub(crate) max_request_body_bytes: usize,
     pub(crate) max_decoded_request_body_bytes: usize,
@@ -92,6 +95,8 @@ pub(crate) enum AuthorizationDispatchError {
     Process(#[source] ProcessRequestError),
     #[error("webhook authorization provider dispatch failed")]
     Webhook(#[source] WebhookDispatchError),
+    #[error("Unix authorization provider dispatch failed")]
+    UnixSocket(#[source] UnixSocketRequestError),
 }
 
 impl AuthorizationDispatchError {
@@ -109,8 +114,13 @@ impl AuthorizationDispatchError {
                     | PendingTerminalCause::ProviderDeadline
                     | PendingTerminalCause::ResumeTokenDeadline
             ),
+            Self::UnixSocket(error) => error.is_timeout(),
             Self::UnknownProvider | Self::Process(_) | Self::Webhook(_) => false,
         }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        matches!(self, Self::UnixSocket(error) if error.is_cancelled())
     }
 }
 
@@ -130,6 +140,12 @@ pub(crate) enum AuthorizationActivationError {
     },
     #[error("process authorization provider '{provider}' could not be activated")]
     ProcessActivation { provider: String },
+    #[error("Unix authorization provider '{provider}' could not be activated")]
+    UnixSocketActivation {
+        provider: String,
+        #[source]
+        reason: UnixSocketActivationError,
+    },
 }
 
 impl ProductAuthorizationSnapshot {
@@ -230,6 +246,19 @@ impl ProductAuthorizationSnapshot {
                     after_provider_activation(&process);
                     providers.push(ActiveProvider::Process(process));
                 }
+                AuthorizationProviderPlan::UnixSocket(unix_plan) => {
+                    let unix = match UnixSocketProvider::activate(unix_plan) {
+                        Ok(unix) => unix,
+                        Err(reason) => {
+                            rollback.rollback().await;
+                            return Err(AuthorizationActivationError::UnixSocketActivation {
+                                provider: name,
+                                reason,
+                            });
+                        }
+                    };
+                    providers.push(ActiveProvider::UnixSocket(unix));
+                }
                 AuthorizationProviderPlan::Webhook(webhook_plan) => {
                     let webhook = match WebhookProvider::activate(webhook_plan, tls_resolver).await
                     {
@@ -300,6 +329,7 @@ impl ProductAuthorizationSnapshot {
     fn outputs(&self, provider: ProviderIndex) -> Option<&ProviderOutputRegistry> {
         match self.providers.get(provider.get())? {
             ActiveProvider::Process(process) => process.outputs(),
+            ActiveProvider::UnixSocket(unix) => Some(unix.outputs()),
             ActiveProvider::Webhook(webhook) => Some(webhook.outputs()),
         }
     }
@@ -311,6 +341,7 @@ impl ProductAuthorizationSnapshot {
         match self.providers.get(provider.get())? {
             ActiveProvider::Process(process) => Some(AuthorizationProviderMetadata {
                 include_headers: process.include_headers(),
+                include_identity: process.include_identity(),
                 include_request_body: process.include_request_body(),
                 max_request_body_bytes: process.max_request_body_bytes(),
                 max_decoded_request_body_bytes: process.max_decoded_request_body_bytes(),
@@ -318,10 +349,19 @@ impl ProductAuthorizationSnapshot {
             }),
             ActiveProvider::Webhook(webhook) => Some(AuthorizationProviderMetadata {
                 include_headers: webhook.include_headers(),
+                include_identity: webhook.include_identity(),
                 include_request_body: false,
                 max_request_body_bytes: 0,
                 max_decoded_request_body_bytes: 0,
                 failure_mode: webhook.failure_mode(),
+            }),
+            ActiveProvider::UnixSocket(unix) => Some(AuthorizationProviderMetadata {
+                include_headers: unix.include_headers(),
+                include_identity: unix.include_identity(),
+                include_request_body: false,
+                max_request_body_bytes: 0,
+                max_decoded_request_body_bytes: 0,
+                failure_mode: unix.failure_mode(),
             }),
         }
     }
@@ -341,6 +381,7 @@ impl ProductAuthorizationSnapshot {
                 .outputs()
                 .ok_or(ProviderCredentialWireError::ForeignRegistry)?,
             ActiveProvider::Webhook(webhook) => webhook.outputs(),
+            ActiveProvider::UnixSocket(unix) => unix.outputs(),
         };
         outputs.compact_provider_credential_wire(credentials, guard)
     }
@@ -367,7 +408,7 @@ impl ProductAuthorizationSnapshot {
         }
     }
 
-    fn bind_webhook_decision(
+    fn bind_provider_decision(
         &self,
         provider: ProviderIndex,
         decision: ProviderDecision,
@@ -415,6 +456,9 @@ impl ProductAuthorizationSnapshot {
                     .map_err(AuthorizationDispatchError::Process),
                 ActiveProvider::Webhook(_) => {
                     unreachable!("process-only test dispatch selected a webhook provider")
+                }
+                ActiveProvider::UnixSocket(_) => {
+                    unreachable!("process-only test dispatch selected a Unix provider")
                 }
             }
         })
@@ -534,8 +578,21 @@ impl AuthorizationSnapshot for ProductAuthorizationSnapshot {
                         request_deadline,
                     )
                     .await
-                    .map(|decision| self.bind_webhook_decision(provider, decision))
+                    .map(|decision| self.bind_provider_decision(provider, decision))
                     .map_err(AuthorizationDispatchError::Webhook),
+                ActiveProvider::UnixSocket(unix) => {
+                    let (request, invocation_mode, cancellation) = context.into_unix_parts();
+                    unix.decide(
+                        request,
+                        invocation_mode,
+                        &cancellation,
+                        guard,
+                        request_deadline,
+                    )
+                    .await
+                    .map(|decision| self.bind_provider_decision(provider, decision))
+                    .map_err(AuthorizationDispatchError::UnixSocket)
+                }
             }
         })
     }
@@ -561,7 +618,7 @@ impl AuthorizationActivation {
     pub(crate) fn process_provider_for_test(&self, index: usize) -> Option<Arc<ProcessProvider>> {
         match self.snapshot.providers.get(index)? {
             ActiveProvider::Process(provider) => Some(provider.clone()),
-            ActiveProvider::Webhook(_) => None,
+            ActiveProvider::UnixSocket(_) | ActiveProvider::Webhook(_) => None,
         }
     }
 }
@@ -730,7 +787,9 @@ mod tests {
             inherit_environment: false,
             pass_environment: vec![],
             environment: BTreeMap::new(),
+            blocked_environment: vec![],
             include_headers: vec![],
+            include_identity: false,
             include_request_body: false,
             allow_request_body_replacement: false,
             max_request_body_bytes: 1024,
@@ -798,6 +857,7 @@ mod tests {
                         timeout: Duration::from_secs(1),
                         on_failure: CompiledProviderFailureMode::Deny,
                         include_headers: vec![],
+                        include_identity: false,
                         max_request_bytes: 1024,
                         max_response_bytes: 1024,
                         outputs: BTreeMap::new(),
@@ -893,9 +953,11 @@ mod tests {
     fn request(id: &str) -> ProviderRequest<'_> {
         ProviderRequest {
             request_id: id,
+            rule_id: "rule-1",
             url: "https://example.test/resource",
             method: "GET",
             client_ip: "192.0.2.10",
+            identity: None,
             headers: None,
             body: None,
         }
@@ -994,6 +1056,7 @@ mod tests {
                     timeout: Duration::from_secs(2),
                     on_failure: CompiledProviderFailureMode::Deny,
                     include_headers: vec![HeaderName::from_static("x-context")],
+                    include_identity: false,
                     max_request_bytes: 8192,
                     max_response_bytes: 4096,
                     outputs: BTreeMap::new(),
@@ -1047,6 +1110,7 @@ mod tests {
                     timeout: Duration::from_secs(2),
                     on_failure: CompiledProviderFailureMode::Deny,
                     include_headers: vec![],
+                    include_identity: false,
                     max_request_bytes: 8192,
                     max_response_bytes: 4096,
                     outputs: BTreeMap::from([(

@@ -97,7 +97,10 @@ header = "x-acl-proxy-request-id"
 #
 # [egress.parent_proxy]
 # kind = "acl_proxy"
-# url = "http://parent-proxy.example.test:8881"
+# url = "https://parent-proxy.example.test:8443"
+#
+# [egress.parent_proxy.tls]
+# trust = "system"
 
 # Typed environment credentials replace attacker-supplied destination values.
 # Generic ${NAME} interpolation is not supported.

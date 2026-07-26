@@ -14,6 +14,57 @@ pub(crate) struct ProductGenerationOwner {
     cleanup: Arc<CleanupState>,
 }
 
+pub(crate) struct IdentityBoundGenerationOwner {
+    product: Arc<dyn GenerationOwner>,
+    identity: Arc<crate::identity::IdentityCandidateLease>,
+}
+
+struct IdentityBoundPublicationGuard<'owner> {
+    product: Box<dyn PublicationGuard + 'owner>,
+    identity: Box<dyn PublicationGuard + 'owner>,
+}
+
+impl IdentityBoundGenerationOwner {
+    pub(crate) fn new(
+        product: Arc<dyn GenerationOwner>,
+        identity: Arc<crate::identity::IdentityCandidateLease>,
+    ) -> Self {
+        Self { product, identity }
+    }
+}
+
+impl PublicationGuard for IdentityBoundPublicationGuard<'_> {
+    fn commit(&mut self) {
+        self.product.commit();
+        self.identity.commit();
+    }
+}
+
+impl GenerationOwner for IdentityBoundGenerationOwner {
+    fn publication_guard(&self) -> Result<Box<dyn PublicationGuard + '_>, RuntimeError> {
+        let identity = self.identity.publication_guard();
+        let product = self.product.publication_guard()?;
+        Ok(Box::new(IdentityBoundPublicationGuard {
+            product,
+            identity,
+        }))
+    }
+
+    fn retirement_started(&self, reason: CleanupReason) {
+        self.product.retirement_started(reason);
+    }
+
+    fn cleanup(&self, reason: CleanupReason) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            match reason {
+                CleanupReason::CandidateRejected => self.identity.reject(),
+                CleanupReason::Retired | CleanupReason::Shutdown => self.identity.release(),
+            }
+            self.product.cleanup(reason).await;
+        })
+    }
+}
+
 struct CleanupState {
     started: AtomicBool,
     complete: AtomicBool,

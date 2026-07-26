@@ -95,8 +95,15 @@ impl StandaloneRequestFactory for ProductStandaloneRequestFactory {
         Box::pin(async move {
             let started_at = Instant::now();
             let listener_transport = ingress.listener_transport();
-            let (facts, peer, peer_is_local, listener_connect_denied, body, private_fields) =
-                ingress.into_parts();
+            let (
+                facts,
+                peer,
+                peer_is_local,
+                listener_connect_denied,
+                identity,
+                body,
+                private_fields,
+            ) = ingress.into_parts();
             let lease = self
                 .runtime
                 .lease()
@@ -108,7 +115,7 @@ impl StandaloneRequestFactory for ProductStandaloneRequestFactory {
                 request_id,
                 listener_transport = match listener_transport {
                     http_access_runtime::ListenerTransport::Tcp => "tcp",
-                    http_access_runtime::ListenerTransport::UnixProxyV2 => "unix_proxy_v2",
+                    http_access_runtime::ListenerTransport::AccessFlow => "access_flow",
                 },
                 ingress_mode = ?facts.ingress_mode(),
                 "proxy request admitted"
@@ -160,6 +167,7 @@ impl StandaloneRequestFactory for ProductStandaloneRequestFactory {
                 cancellation: ProductForwardingCancellation::new(),
                 clock,
                 listener_denied: listener_connect_denied,
+                identity,
                 decision_target: Arc::clone(&self.observation).into(),
                 capture,
             };
@@ -231,6 +239,7 @@ struct StandaloneProviderInput {
     pub(crate) cancellation: ProductForwardingCancellation,
     pub(crate) clock: Arc<TokioRuntimeClock>,
     pub(crate) listener_denied: bool,
+    pub(crate) identity: Arc<access_identity::IdentityContext>,
     pub(crate) decision_target: DecisionSubmissionTarget,
     pub(crate) capture: HttpCaptureContext,
 }
@@ -516,6 +525,7 @@ impl StandalonePolicyProvider {
             cancellation,
             clock,
             listener_denied,
+            identity,
             decision_target,
             capture,
         } = input;
@@ -559,6 +569,7 @@ impl StandalonePolicyProvider {
             RuntimeRequest::INITIAL_REVISION,
             BodyRepresentation::PreservedContentCoded,
             BodyObservation::unobserved(),
+            identity.as_ref(),
         )
         .map_err(|_| StandaloneProviderPrepareError::Policy)?;
         let initial_binding = evaluation_input.request_binding();
@@ -641,6 +652,7 @@ impl StandalonePolicyProvider {
             BodyRepresentation::PreservedContentCoded,
             body,
             absolute_deadline_millis,
+            identity,
         )?;
         let prepared_target = preflight_target.and_then(|preflight_target| {
             preflight_target
@@ -958,6 +970,9 @@ impl StandalonePolicyProvider {
                     let provider_headers =
                         ProviderRequestHeaders::new(&included).map_err(|_| 500_u16)?;
                     let peer_ip = state.peer_ip.to_string();
+                    let provider_identity = metadata.include_identity.then(|| {
+                        access_identity::ProviderIdentityProjection::from(request.identity())
+                    });
                     let provider_body = (invocation_mode
                         == AuthorizationInvocationMode::EffectsAllowed
                         && metadata.include_request_body)
@@ -973,18 +988,20 @@ impl StandalonePolicyProvider {
                         });
                     let provider_request = ProviderRequest {
                         request_id: &state.request_id,
+                        rule_id,
                         url: request.facts().url().as_str(),
                         method: request.facts().method().as_str(),
                         client_ip: &peer_ip,
                         headers: (!included.is_empty()).then_some(&provider_headers),
+                        identity: provider_identity.as_ref(),
                         body: provider_body,
                     };
                     let decision = generation
                         .dispatch_authorization(
                             provider,
-                            rule_id,
                             provider_request,
                             invocation_mode,
+                            terminal.cancellation.capability(),
                             &guard,
                             deadline,
                         )
@@ -994,6 +1011,7 @@ impl StandalonePolicyProvider {
                     }
                     let decision = match decision {
                         Ok(decision) => decision,
+                        Err(error) if error.is_cancelled() => return Err(503),
                         Err(_) if metadata.failure_mode == CompiledProviderFailureMode::Deny => {
                             let policy_result = resolve_delegate(
                                 generation,
@@ -1769,6 +1787,7 @@ fn resolve_delegate(
         RuntimeRequest::INITIAL_REVISION,
         BodyRepresentation::PreservedContentCoded,
         BodyObservation::unobserved(),
+        request.identity(),
     )
     .map_err(|_| 500_u16)?;
     generation
@@ -1861,6 +1880,7 @@ mod local_response_contract_tests {
             BodyRepresentation::PreservedContentCoded,
             body,
             deadline,
+            Arc::new(access_identity::IdentityContext::Disabled),
         )
         .unwrap();
         (request, clock)

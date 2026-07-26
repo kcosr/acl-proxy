@@ -55,7 +55,7 @@ fn strings<'a>(value: &'a TomlValue, key: &str) -> Vec<&'a str> {
 #[test]
 fn sanitized_production_role_structure_matches_difference_record() {
     let expectations = [
-        ("host-proxy-tcp.toml", 45, 134, 22, 2, 4),
+        ("host-proxy-tcp.toml", 44, 133, 22, 2, 4),
         ("host-proxy-uds.toml", 1, 1, 0, 0, 0),
         ("common-container-proxy.toml", 1, 1, 0, 0, 0),
         ("internal-container-proxy.toml", 8, 12, 1, 0, 0),
@@ -155,7 +155,7 @@ fn sanitized_production_role_structure_matches_difference_record() {
             counts
         });
     assert_eq!(decisions.get("allow"), Some(&37));
-    assert_eq!(decisions.get("deny"), Some(&7));
+    assert_eq!(decisions.get("deny"), Some(&6));
     assert_eq!(decisions.get("delegate"), Some(&1));
 
     let delegate = rules(&host)
@@ -171,6 +171,17 @@ fn sanitized_production_role_structure_matches_difference_record() {
             .get("authorization_provider")
             .and_then(TomlValue::as_str),
         Some("gitlab_acl")
+    );
+    assert_eq!(strings(delegate, "identity_states"), ["authenticated"]);
+    assert_eq!(
+        delegate
+            .get("identity_subjects")
+            .and_then(TomlValue::as_array)
+            .and_then(|subjects| subjects.first())
+            .and_then(TomlValue::as_table)
+            .and_then(|subject| subject.get("id"))
+            .and_then(TomlValue::as_str),
+        Some("fixture-developers")
     );
 
     let host_patterns: BTreeSet<_> = rules(&host)
@@ -211,6 +222,18 @@ fn sanitized_production_role_structure_matches_difference_record() {
         all_provider_names,
         BTreeSet::from(["agent_runner_acl", "gitlab_acl"])
     );
+    for provider in ["gitlab_acl", "agent_runner_acl"] {
+        assert_eq!(
+            table(
+                table(&host, "authorization").get("providers").unwrap(),
+                provider,
+            )
+            .get("include_identity")
+            .and_then(TomlValue::as_bool),
+            Some(true),
+            "{provider} must receive only the checked identity projection"
+        );
+    }
 
     let uds = parse_fixture("host-proxy-uds.toml");
     let listeners = table(&uds, "listeners");
@@ -226,10 +249,18 @@ fn sanitized_production_role_structure_matches_difference_record() {
         let endpoint = table(listener, "endpoint");
         assert_eq!(
             endpoint.get("kind").and_then(TomlValue::as_str),
-            Some("unix_proxy_v2")
+            Some("access_flow")
+        );
+        let transport = endpoint
+            .get("transport")
+            .and_then(TomlValue::as_table)
+            .unwrap();
+        assert_eq!(
+            transport.get("kind").and_then(TomlValue::as_str),
+            Some("unix")
         );
         assert_eq!(
-            endpoint.get("mode").and_then(TomlValue::as_str),
+            transport.get("mode").and_then(TomlValue::as_str),
             Some("0600")
         );
     }
@@ -249,17 +280,33 @@ fn sanitized_production_role_structure_matches_difference_record() {
         "internal-container-proxy.toml",
     ] {
         let config = parse_fixture(name);
-        let actions = table(&config, "egress")
-            .get("credential_actions")
-            .and_then(TomlValue::as_array)
-            .expect("container production fixture credential action");
-        assert_eq!(actions.len(), 1, "{name} credential action count");
+        let egress = table(&config, "egress");
+        assert!(
+            egress
+                .get("credential_actions")
+                .and_then(TomlValue::as_array)
+                .is_none_or(Vec::is_empty),
+            "{name} must not model identity as a generic credential action"
+        );
+        let parent = egress
+            .get("parent_proxy")
+            .and_then(TomlValue::as_table)
+            .expect("container production fixture ACL Proxy parent");
         assert_eq!(
-            actions[0]
-                .get("transport_security")
-                .and_then(TomlValue::as_str),
-            Some("cleartext_allowed"),
-            "{name} workload identity must explicitly permit its HTTP parent hop"
+            parent.get("kind").and_then(TomlValue::as_str),
+            Some("acl_proxy")
+        );
+        let presentation = parent
+            .get("presentation")
+            .and_then(TomlValue::as_table)
+            .expect("container production fixture parent presentation");
+        assert_eq!(
+            presentation.get("kind").and_then(TomlValue::as_str),
+            Some("bearer_environment")
+        );
+        assert_eq!(
+            presentation.get("variable").and_then(TomlValue::as_str),
+            Some("AW_IDENTITY_TOKEN")
         );
     }
 }
@@ -410,40 +457,100 @@ fn assert_provider_parity(fixture: ProviderFixture) {
 
 #[test]
 fn production_gitlab_process_provider_parity() {
-    assert_provider_parity(ProviderFixture {
+    let fixture = ProviderFixture {
         script: "gitlab_acl.py",
         config: "gitlab_acl.json",
         allowed: json!({
             "id": "git-allow",
+            "requestId": "git-request-allow",
+            "ruleId": "prod-host-r42-gitlab-delegate",
             "type": "request",
             "url": "https://gitlab.example.test/group/internal.git",
+            "identity": {
+                "state": "authenticated",
+                "principal": {
+                    "authority": "aw-workstation",
+                    "id": "fixture-container",
+                    "kind": "service_account"
+                },
+                "groups": [
+                    {"authority": "aw-workstation", "id": "fixture-agent-runners"},
+                    {"authority": "aw-workstation", "id": "fixture-developers"}
+                ]
+            },
             "headers": {
-                "x-aw-identity-token": ["fixture-internal-identity"],
                 "x-aw-policy-context": ["fixture-internal"]
             }
         }),
         denied: json!({
             "id": "git-deny",
+            "requestId": "git-request-deny",
+            "ruleId": "prod-host-r42-gitlab-delegate",
             "type": "request",
             "url": "https://gitlab.example.test/group/private.git",
-            "headers": {"x-aw-identity-token": ["fixture-internal-identity"]}
+            "identity": {
+                "state": "authenticated",
+                "principal": {
+                    "authority": "aw-workstation",
+                    "id": "fixture-container",
+                    "kind": "service_account"
+                },
+                "groups": [
+                    {"authority": "aw-workstation", "id": "fixture-developers"}
+                ]
+            },
+            "headers": {"x-aw-policy-context": ["fixture-internal"]}
         }),
         missing_identity: json!({
             "id": "git-missing",
+            "requestId": "git-request-missing",
+            "ruleId": "prod-host-r42-gitlab-delegate",
             "type": "request",
             "url": "https://gitlab.example.test/group/internal.git",
             "headers": {"x-aw-policy-context": ["fixture-internal"]}
         }),
         unknown_identity: json!({
             "id": "git-unknown",
+            "requestId": "git-request-unknown",
+            "ruleId": "prod-host-r42-gitlab-delegate",
             "type": "request",
             "url": "https://gitlab.example.test/group/internal.git",
+            "identity": {
+                "state": "authenticated",
+                "principal": {
+                    "authority": "other-authority",
+                    "id": "unknown",
+                    "kind": "service_account"
+                },
+                "groups": []
+            },
             "headers": {
-                "x-aw-identity-token": ["fixture-unknown"],
                 "x-aw-policy-context": ["fixture-internal"]
             }
         }),
-    });
+    };
+    let mut common = fixture.allowed.clone();
+    common["id"] = json!("git-common-allow");
+    common["requestId"] = json!("git-request-common-allow");
+    common["url"] = json!("https://gitlab.example.test/group/public.git");
+    common.as_object_mut().unwrap().remove("headers");
+    let mut protected_websocket = common.clone();
+    protected_websocket["id"] = json!("git-ws-allow");
+    protected_websocket["requestId"] = json!("git-request-ws-allow");
+    protected_websocket["ruleId"] = json!("p11-ws-protected");
+    protected_websocket["url"] =
+        json!("https://gitlab.example.test:8443/group/public.git/parent-protected");
+    let response = invoke_provider(
+        &fixture,
+        &[
+            serde_json::to_string(&common).unwrap(),
+            serde_json::to_string(&protected_websocket).unwrap(),
+        ],
+    );
+    assert_eq!(response[0].get("decision"), Some(&json!("allow")));
+    assert_eq!(response[1].get("decision"), Some(&json!("allow")));
+
+    assert_provider_parity(fixture);
 }
 
 #[test]
@@ -453,27 +560,60 @@ fn production_agent_runner_process_provider_parity() {
         config: "agent_runner_acl.json",
         allowed: json!({
             "id": "runner-allow",
+            "requestId": "runner-request-allow",
+            "ruleId": "fixture-agent-runner-delegate",
             "type": "request",
             "url": "https://runner.example.test/jobs/42",
-            "headers": {"x-aw-identity-token": ["fixture-runner-identity"]}
+            "identity": {
+                "state": "authenticated",
+                "principal": {
+                    "authority": "aw-workstation",
+                    "id": "fixture-container",
+                    "kind": "service_account"
+                },
+                "groups": [
+                    {"authority": "aw-workstation", "id": "fixture-agent-runners"}
+                ]
+            }
         }),
         denied: json!({
             "id": "runner-deny",
+            "requestId": "runner-request-deny",
+            "ruleId": "fixture-agent-runner-delegate",
             "type": "request",
             "url": "https://runner.example.test/admin",
-            "headers": {"x-aw-identity-token": ["fixture-runner-identity"]}
+            "identity": {
+                "state": "authenticated",
+                "principal": {
+                    "authority": "aw-workstation",
+                    "id": "fixture-container",
+                    "kind": "service_account"
+                },
+                "groups": []
+            }
         }),
         missing_identity: json!({
             "id": "runner-missing",
+            "requestId": "runner-request-missing",
+            "ruleId": "fixture-agent-runner-delegate",
             "type": "request",
-            "url": "https://runner.example.test/jobs/42",
-            "headers": {}
+            "url": "https://runner.example.test/jobs/42"
         }),
         unknown_identity: json!({
             "id": "runner-unknown",
+            "requestId": "runner-request-unknown",
+            "ruleId": "fixture-agent-runner-delegate",
             "type": "request",
             "url": "https://runner.example.test/jobs/42",
-            "headers": {"x-aw-identity-token": ["fixture-unknown"]}
+            "identity": {
+                "state": "authenticated",
+                "principal": {
+                    "authority": "aw-workstation",
+                    "id": "unknown",
+                    "kind": "service_account"
+                },
+                "groups": []
+            }
         }),
     });
 }

@@ -28,6 +28,28 @@ import sys
 
 source = Path(sys.argv[1]).read_text(encoding="utf-8")
 target = Path(sys.argv[2])
+
+
+def replace_once(name, old, new):
+    if source.count(old) != 1:
+        raise SystemExit(f"{name}: expected one mutation target, found {source.count(old)}")
+    target.joinpath(f"{name}.sh").write_text(source.replace(old, new, 1))
+
+
+def replace_nth(name, old, new, occurrence, expected_count):
+    if source.count(old) != expected_count:
+        raise SystemExit(
+            f"{name}: expected {expected_count} mutation targets, found {source.count(old)}"
+        )
+    offset = 0
+    for _ in range(occurrence):
+        offset = source.index(old, offset)
+        selected = offset
+        offset += len(old)
+    mutated = source[:selected] + new + source[selected + len(old):]
+    target.joinpath(f"{name}.sh").write_text(mutated)
+
+
 case = "p11_ws_direct_unprotected"
 target.joinpath("missing.sh").write_text(source.replace(f"P11_WS_CASE {case} PASS", "removed", 1))
 target.joinpath("duplicate.sh").write_text(source.replace(
@@ -72,8 +94,8 @@ target.joinpath("lifetime-origin.sh").write_text(source.replace(
 target.joinpath("lifetime-reset.sh").write_text(source.replace(
     'assert post_reload_elapsed < 3.7, post_reload_elapsed', '', 1))
 target.joinpath("shutdown-order.sh").write_text(source.replace(
-    '    (( listener_closed_ns <= client_finished_ns )) \\\n        || fail "WebSocket streams stopped before the data listener closed"',
-    '    true # removed listener-first assertion', 1))
+    '    assert_listener_closed()\n',
+    '    pass # removed listener-first assertion\n', 1))
 target.joinpath("shutdown-relay.sh").write_text(source.replace(
     'assert_origin_events terminal-once:/shutdown-direct terminal-once:/shutdown-connect',
     'true # removed relay join proof', 1))
@@ -261,6 +283,192 @@ target.joinpath("pidfd-open-removed.sh").write_text(source.replace(
 target.joinpath("pidfd-identity-removed.sh").write_text(source.replace(
     'if fields_after_comm[19] != expected_start_time or fields_after_comm[0] == "Z":',
     'if False:', 1))
+
+replace_once(
+    "topology-token-short",
+    "readonly TOPOLOGY_IDENTITY=fixture-topology-identity-000000000000",
+    "readonly TOPOLOGY_IDENTITY=short-token",
+)
+for alias in ("HOST", "COMMON", "INTERNAL"):
+    replace_once(
+        f"{alias.lower()}-identity-alias",
+        f"readonly {alias}_IDENTITY=$TOPOLOGY_IDENTITY",
+        f"readonly {alias}_IDENTITY=wrong-{alias.lower()}-identity",
+    )
+replace_nth(
+    "host-proxy-identity",
+    'run_proxy "$HOST_NS" host "$HOST_IDENTITY"',
+    'run_proxy "$HOST_NS" host "$COMMON_IDENTITY"',
+    1,
+    2,
+)
+replace_once(
+    "common-proxy-identity",
+    'run_proxy "$COMMON_NS" common "$COMMON_IDENTITY"',
+    'run_proxy "$COMMON_NS" common "$INTERNAL_IDENTITY"',
+)
+replace_once(
+    "internal-proxy-identity",
+    'run_proxy "$INTERNAL_NS" internal "$INTERNAL_IDENTITY"',
+    'run_proxy "$INTERNAL_NS" internal "$COMMON_IDENTITY"',
+)
+replace_once(
+    "client-identity-binding",
+    'IDENTITY = os.environ.get("TOPOLOGY_IDENTITY")',
+    'IDENTITY = "fixture-constant-identity"',
+)
+replace_once(
+    "identity-headers-direct",
+    '''    upgrade(
+        stream,
+        f"http://{host}:8080{path}",
+        f"{host}:8080",
+        identity_headers(),
+    )''',
+    '''    upgrade(
+        stream,
+        f"http://{host}:8080{path}",
+        f"{host}:8080",
+        (),
+    )''',
+)
+replace_once(
+    "identity-headers-connect",
+    '''def outer_connect(proxy, authority):
+    stream = connect_tcp(proxy)
+    headers = "".join(f"{name}: {value}\\r\\n" for name, value in identity_headers())''',
+    '''def outer_connect(proxy, authority):
+    stream = connect_tcp(proxy)
+    headers = "".join(f"{name}: {value}\\r\\n" for name, value in ())''',
+)
+replace_once(
+    "identity-header-projection",
+    'return (("x-aw-identity-token", IDENTITY),) if IDENTITY else ()',
+    'return ()',
+)
+host_identity_environment = 'env TOPOLOGY_IDENTITY="$TOPOLOGY_IDENTITY"'
+for occurrence, case_name in enumerate(
+    ("direct", "connect", "admission", "reload", "shutdown"),
+    start=1,
+):
+    replace_nth(
+        f"host-environment-{case_name}",
+        host_identity_environment,
+        "env",
+        occurrence,
+        5,
+    )
+replace_once(
+    "child-identity-present",
+    'result=$(ip netns exec "$COMMON_NS" env -u TOPOLOGY_IDENTITY \\\n'
+    '        timeout 15s python3 "$TMP_DIR/websocket_client.py" parent "$HOST_CA")',
+    'result=$(ip netns exec "$COMMON_NS" env TOPOLOGY_IDENTITY="$TOPOLOGY_IDENTITY" \\\n'
+    '        timeout 15s python3 "$TMP_DIR/websocket_client.py" parent "$HOST_CA")',
+)
+replace_once(
+    "child-identity-unset-removed",
+    'env -u TOPOLOGY_IDENTITY \\\n'
+    '        timeout 15s python3 "$TMP_DIR/websocket_client.py" parent "$HOST_CA")',
+    'env timeout 15s python3 "$TMP_DIR/websocket_client.py" parent "$HOST_CA")',
+)
+replace_nth(
+    "host-environment-unset-after-set",
+    host_identity_environment,
+    'env TOPOLOGY_IDENTITY="$TOPOLOGY_IDENTITY" -u TOPOLOGY_IDENTITY',
+    1,
+    5,
+)
+replace_once(
+    "https-listener-identity-omitted",
+    '[listeners.explicit_https.identity]\nmode = "required"',
+    '',
+)
+replace_once(
+    "common-proxy-origin-header",
+    '--proxy-header "x-aw-identity-token: $COMMON_IDENTITY"',
+    '--proxy-header "x-aw-identity-token: $COMMON_IDENTITY" \\\n'
+    '        -H "x-aw-identity-token: $COMMON_IDENTITY"',
+)
+replace_once(
+    "internal-proxy-origin-header",
+    '--proxy-header "x-aw-identity-token: $INTERNAL_IDENTITY"',
+    '--proxy-header "x-aw-identity-token: $INTERNAL_IDENTITY" \\\n'
+    '    -H "x-aw-identity-token: $INTERNAL_IDENTITY"',
+)
+replace_once(
+    "common-proxy-long-origin-header",
+    '--proxy-header "x-aw-identity-token: $COMMON_IDENTITY"',
+    '--proxy-header "x-aw-identity-token: $COMMON_IDENTITY" \\\n'
+    '        --header " X-AW-Identity-Token : $COMMON_IDENTITY"',
+)
+replace_once(
+    "internal-proxy-long-origin-header",
+    '--proxy-header "x-aw-identity-token: $INTERNAL_IDENTITY"',
+    '--proxy-header "x-aw-identity-token: $INTERNAL_IDENTITY" \\\n'
+    '    --header " X-AW-Identity-Token : $INTERNAL_IDENTITY"',
+)
+replace_once(
+    "common-proxy-attached-short-origin-header",
+    '--proxy-header "x-aw-identity-token: $COMMON_IDENTITY"',
+    '--proxy-header "x-aw-identity-token: $COMMON_IDENTITY" \\\n'
+    '        -H" X-AW-Identity-Token : $COMMON_IDENTITY"',
+)
+replace_once(
+    "internal-proxy-attached-short-origin-header",
+    '--proxy-header "x-aw-identity-token: $INTERNAL_IDENTITY"',
+    '--proxy-header "x-aw-identity-token: $INTERNAL_IDENTITY" \\\n'
+    '    -H" X-AW-Identity-Token : $INTERNAL_IDENTITY"',
+)
+replace_once(
+    "common-proxy-attached-long-origin-header",
+    '--proxy-header "x-aw-identity-token: $COMMON_IDENTITY"',
+    '--proxy-header "x-aw-identity-token: $COMMON_IDENTITY" \\\n'
+    '        --header=" X-AW-Identity-Token : $COMMON_IDENTITY"',
+)
+replace_once(
+    "internal-proxy-attached-long-origin-header",
+    '--proxy-header "x-aw-identity-token: $INTERNAL_IDENTITY"',
+    '--proxy-header "x-aw-identity-token: $INTERNAL_IDENTITY" \\\n'
+    '    --header=" X-AW-Identity-Token : $INTERNAL_IDENTITY"',
+)
+replace_nth(
+    "common-proxy-plaintext",
+    "--proxy https://host-proxy.example.test:8443",
+    "--proxy http://host-proxy.example.test:8443",
+    1,
+    2,
+)
+replace_nth(
+    "internal-proxy-plaintext",
+    "--proxy https://host-proxy.example.test:8443",
+    "--proxy http://host-proxy.example.test:8443",
+    2,
+    2,
+)
+replace_once(
+    "policy-anchor-count",
+    "if text.count(policy_anchor) != 1:",
+    "if text.count(policy_anchor) != 2:",
+)
+anchor_guard = '''policy_anchor = '[[policy.rules]]\\nid = "prod-host-parent-connect"'
+if text.count(policy_anchor) != 1:
+    raise SystemExit("unexpected host policy anchor fixture shape")'''
+anchor_wrong_order = '''if text.count(policy_anchor) != 1:
+    raise SystemExit("unexpected host policy anchor fixture shape")
+policy_anchor = '[[policy.rules]]\\nid = "prod-host-parent-connect"' '''
+replace_once("policy-anchor-order", anchor_guard, anchor_wrong_order)
+replace_once(
+    "context-proof-stale",
+    '''    success(ASSERT_PARENT_TLS=1, ASSERT_INJECTED_IDENTITY_AUTHORIZATION=1,
+            ASSERT_CONTEXT_REPLACED_AND_STRIPPED=1, ASSERT_CREDENTIAL_ISOLATION=1)''',
+    '''    success(ASSERT_PARENT_TLS=1, ASSERT_INJECTED_IDENTITY_AUTHORIZATION=1,
+            ASSERT_SPOOF_REPLACED_AND_STRIPPED=1, ASSERT_CREDENTIAL_ISOLATION=1)''',
+)
+replace_once(
+    "context-consumer-stale",
+    'assert_ws_field "$result" ASSERT_CONTEXT_REPLACED_AND_STRIPPED',
+    'assert_ws_field "$result" ASSERT_SPOOF_REPLACED_AND_STRIPPED',
+)
 PY
 
 for mutation in missing duplicate skipped unexpected ordering proof uncalled \
@@ -283,7 +491,22 @@ for mutation in missing duplicate skipped unexpected ordering proof uncalled \
     inert-python-proof-string inert-python-proof-assignment \
     duplicate-later-case-function case-early-return same-line-quoted-noop \
     python-if-false-proof config-inert-assignment cleanup-if-false \
-    pidfd-open-removed pidfd-identity-removed; do
+    pidfd-open-removed pidfd-identity-removed topology-token-short \
+    host-identity-alias common-identity-alias internal-identity-alias \
+    host-proxy-identity common-proxy-identity internal-proxy-identity \
+    client-identity-binding identity-headers-direct identity-headers-connect \
+    identity-header-projection host-environment-direct host-environment-connect \
+    host-environment-admission host-environment-reload host-environment-shutdown \
+    child-identity-present child-identity-unset-removed \
+    host-environment-unset-after-set https-listener-identity-omitted \
+    common-proxy-origin-header internal-proxy-origin-header \
+    common-proxy-long-origin-header internal-proxy-long-origin-header \
+    common-proxy-attached-short-origin-header \
+    internal-proxy-attached-short-origin-header \
+    common-proxy-attached-long-origin-header \
+    internal-proxy-attached-long-origin-header \
+    common-proxy-plaintext internal-proxy-plaintext policy-anchor-count \
+    policy-anchor-order context-proof-stale context-consumer-stale; do
     expect_rejected "$mutation"
 done
 

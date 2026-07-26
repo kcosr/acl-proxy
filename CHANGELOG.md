@@ -6,10 +6,16 @@
 
 - Replaced scalar data-listener `bind` fields with the closed typed `endpoint`
   contract. TCP listeners use `{ kind = "tcp", address = "..." }`; transparent
-  HTTP and HTTPS may use Unix-PROXY-v2 endpoints whose preface timeout and
-  allowed destination ports are structurally owned by that endpoint. Legacy
+  HTTP and HTTPS may use Access Flow endpoints whose admission timeout and
+  allowed destination ports are structurally owned by that endpoint and whose
+  Unix channel is a nested tagged transport. Legacy
   `bind` is rejected with an actionable migration diagnostic and is not
   retained as an alias.
+- Replaced the internal `unix_proxy_v2` contract and the old standalone relay
+  route fields with AW Access Flow. Relay JSON now uses
+  `allowedDestinationPorts` and a nested Unix `transport`; the removed
+  `allowedOriginalPorts` and `upstreamSocket` fields are rejected without a
+  dual parser. The Linux artifact is now `acl-proxy-access-flow-relay`.
 - Replaced the unreleased schema-2 draft with the strict integer
   `schema_version = 3` contract. Missing, string, schema-1, schema-2, and future
   versions are rejected without migration aliases or fallback parsing.
@@ -28,13 +34,22 @@
 
 ### Added
 
-- Added host-owned transparent HTTP/HTTPS Unix listeners and the minimal
-  Linux-only `acl-proxy-transparent-uds-relay` artifact, including strict PROXY
-  v2 framing, bounded relay resources, fail-closed pre-existing path refusal,
+- Added host-owned transparent HTTP/HTTPS Unix listeners and the Linux-only
+  `acl-proxy-access-flow-relay` adapter over the shared Access Flow engine,
+  including strict AWAF framing, bounded relay resources, fail-closed pre-existing path refusal,
   bounded diagnostic socket liveness probes, atomic no-replace socket
   publication with verified ownership/mode, explicit supervisor-owned pathname
-  cleanup, shared strict wire codec, Linux release packaging, and distinct
+  cleanup, shared strict wire protocol, Linux release packaging, and distinct
   sanitized TCP and UDS production fixtures.
+- Added typed workload identity on explicit HTTP/HTTPS and Access Flow
+  listeners, static environment/file bearer resolution to principals and
+  groups, and exact plural `identity_states` plus authority-qualified
+  `identity_subjects` ACL predicates. The protected bearer is removed before
+  policy, providers, capture, and origin forwarding.
+- Added checked identity and matched-rule projection to process and webhook
+  delegates, plus bounded one-request/one-response AWAP authorization over Unix
+  sockets. Unix authorization reuses the existing allow/deny/pass and declared
+  output model; it is not credential lookup.
 - Added one common ingress runtime for explicit and transparent HTTP/HTTPS,
   CONNECT MITM, HTTP/1.1, HTTP/2, upgrades, and direct or parent egress.
 - Added generation-owned process and webhook authorization providers, typed

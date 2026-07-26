@@ -9,8 +9,8 @@ use http_access_url::canonicalize_tls_server_name;
 
 use crate::candidate_tls::CandidateTlsResolver;
 use crate::config::compiler::{
-    CompiledEgressRoute, CompiledHttpVersion, CompiledTlsTrust, EgressPlan, ParentProxyPlan,
-    ParentProxyTlsPlan, TransportTlsPlan,
+    CompiledEgressRoute, CompiledHttpVersion, CompiledParentProxyKind, CompiledTlsTrust,
+    EgressPlan, ParentProxyPlan, ParentProxyTlsPlan, TransportTlsPlan,
 };
 use crate::tls::TlsActivationError;
 
@@ -254,7 +254,12 @@ async fn activate_parent(
     generation: PolicyGeneration,
     tls_resolver: &mut CandidateTlsResolver,
 ) -> Result<(Route, Option<TlsRootsRegistration>), EgressActivationError> {
-    let ParentProxyPlan { target, tls, .. } = plan;
+    let ParentProxyPlan {
+        kind,
+        target,
+        tls,
+        presentation: _,
+    } = plan;
     if target.path() != "/" || target.query().is_some() {
         return Err(EgressActivationError::ParentUrl);
     }
@@ -267,7 +272,11 @@ async fn activate_parent(
         }
         _ => return Err(EgressActivationError::Route),
     };
-    Ok((Route::Parent { target, security }, roots))
+    let route = match kind {
+        CompiledParentProxyKind::AclProxy => Route::AclProxyParent { target, security },
+        CompiledParentProxyKind::Generic => Route::GenericParent { target, security },
+    };
+    Ok((route, roots))
 }
 
 async fn activate_parent_tls(
@@ -550,6 +559,7 @@ mod tests {
                 timeout: Duration::from_secs(3),
                 on_failure: CompiledProviderFailureMode::Deny,
                 include_headers: Vec::new(),
+                include_identity: false,
                 max_request_bytes: 8192,
                 max_response_bytes: 4096,
                 outputs: BTreeMap::new(),
@@ -591,7 +601,6 @@ mod tests {
             route: CompiledEgressRoute::ParentProxy,
             origin_tls: origin(CompiledTlsTrust::Custom, Some(ca.clone())),
             parent_proxy: Some(ParentProxyPlan {
-                #[cfg(test)]
                 kind: crate::config::compiler::CompiledParentProxyKind::Generic,
                 target: canonicalize_http_url("https://parent.example:8443/").unwrap(),
                 tls: Some(ParentProxyTlsPlan {
@@ -599,6 +608,7 @@ mod tests {
                     ca_certificate: Some(ca),
                     server_name: "parent.example".to_owned(),
                 }),
+                presentation: None,
             }),
             request_headers: Vec::new(),
             credential_actions: Vec::new(),
@@ -615,7 +625,7 @@ mod tests {
         let (_, executor) = activation.into_parts();
         let (_, origin_trust, route) = executor.into_parts();
         assert!(matches!(origin_trust, TlsTrust::CustomRoots(_)));
-        let Route::Parent { target, security } = route else {
+        let Route::GenericParent { target, security } = route else {
             panic!("expected parent route");
         };
         assert_eq!(target.as_str(), "https://parent.example:8443/");
@@ -660,6 +670,7 @@ mod tests {
                 timeout: Duration::from_secs(3),
                 on_failure: CompiledProviderFailureMode::Deny,
                 include_headers: Vec::new(),
+                include_identity: false,
                 max_request_bytes: 8192,
                 max_response_bytes: 4096,
                 outputs: BTreeMap::new(),
@@ -682,6 +693,7 @@ mod tests {
                 timeout: Duration::from_secs(3),
                 on_failure: CompiledProviderFailureMode::Deny,
                 include_headers: Vec::new(),
+                include_identity: false,
                 max_request_bytes: 8192,
                 max_response_bytes: 4096,
                 outputs: BTreeMap::new(),
@@ -784,7 +796,6 @@ mod tests {
             route: CompiledEgressRoute::ParentProxy,
             origin_tls: origin(CompiledTlsTrust::Custom, Some(ca.clone())),
             parent_proxy: Some(ParentProxyPlan {
-                #[cfg(test)]
                 kind: crate::config::compiler::CompiledParentProxyKind::Generic,
                 target: canonicalize_http_url("https://parent.example:8443/").unwrap(),
                 tls: Some(ParentProxyTlsPlan {
@@ -792,6 +803,7 @@ mod tests {
                     ca_certificate: Some(ca),
                     server_name: "authenticated-parent.example".to_owned(),
                 }),
+                presentation: None,
             }),
             request_headers: Vec::new(),
             credential_actions: Vec::new(),
@@ -817,7 +829,7 @@ mod tests {
         };
         assert_eq!(origin_ref.id().as_str(), "egress-origin-roots");
         assert!(origin_ref.belongs_to(&identity));
-        let Route::Parent { target, security } = &activation.neutral.route else {
+        let Route::GenericParent { target, security } = &activation.neutral.route else {
             panic!("neutral route must retain parent")
         };
         assert_eq!(target.as_str(), "https://parent.example:8443/");
@@ -839,12 +851,11 @@ mod tests {
     #[test]
     fn http_parent_owns_canonical_endpoint_and_kind() {
         let parent = ParentProxyPlan {
-            #[cfg(test)]
             kind: crate::config::compiler::CompiledParentProxyKind::AclProxy,
             target: canonicalize_http_url("http://parent.example:8080/").unwrap(),
             tls: None,
+            presentation: None,
         };
-        #[cfg(test)]
         assert!(matches!(
             parent.kind,
             crate::config::compiler::CompiledParentProxyKind::AclProxy
@@ -857,7 +868,7 @@ mod tests {
             credential_actions: Vec::new(),
         });
         let (_, executor) = activation.into_parts();
-        let (_, _, Route::Parent { target, security }) = executor.into_parts() else {
+        let (_, _, Route::AclProxyParent { target, security }) = executor.into_parts() else {
             panic!("expected parent route")
         };
         assert_eq!(target.as_str(), "http://parent.example:8080/");
@@ -882,7 +893,6 @@ mod tests {
                 route: CompiledEgressRoute::ParentProxy,
                 origin_tls: origin(CompiledTlsTrust::Insecure, None),
                 parent_proxy: Some(ParentProxyPlan {
-                    #[cfg(test)]
                     kind: crate::config::compiler::CompiledParentProxyKind::Generic,
                     target: canonicalize_http_url("https://parent.example/").unwrap(),
                     tls: Some(ParentProxyTlsPlan {
@@ -890,6 +900,7 @@ mod tests {
                         ca_certificate: None,
                         server_name: "sensitive-parent-name.example".to_owned(),
                     }),
+                    presentation: None,
                 }),
                 request_headers: Vec::new(),
                 credential_actions: Vec::new(),
@@ -1017,10 +1028,10 @@ mod tests {
                 route: CompiledEgressRoute::ParentProxy,
                 origin_tls: origin(CompiledTlsTrust::System, None),
                 parent_proxy: Some(ParentProxyPlan {
-                    #[cfg(test)]
                     kind: crate::config::compiler::CompiledParentProxyKind::Generic,
                     target: canonicalize_http_url(target).unwrap(),
                     tls: None,
+                    presentation: None,
                 }),
                 request_headers: Vec::new(),
                 credential_actions: Vec::new(),

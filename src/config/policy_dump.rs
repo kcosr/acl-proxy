@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use access_identity::{IdentityState, IdentitySubject};
 use serde::Serialize;
 
 use super::compiler::{
@@ -43,6 +44,8 @@ pub(crate) struct PolicyDumpRule {
     pub(crate) urls: Vec<String>,
     pub(crate) methods: Vec<String>,
     pub(crate) client_cidrs: Vec<String>,
+    pub(crate) identity_states: Vec<PolicyDumpIdentityState>,
+    pub(crate) identity_subjects: Vec<PolicyDumpIdentitySubject>,
     pub(crate) headers: PolicyDumpHeaderPredicates,
     pub(crate) request_timeout_ms: Option<u64>,
     pub(crate) allow_upgrades: bool,
@@ -51,6 +54,21 @@ pub(crate) struct PolicyDumpRule {
     pub(crate) request_header_mutations: Vec<PolicyDumpHeaderMutation>,
     pub(crate) response_header_mutations: Vec<PolicyDumpHeaderMutation>,
     pub(crate) credential_mutations: Vec<PolicyDumpCredentialMutation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum PolicyDumpIdentityState {
+    Disabled,
+    Anonymous,
+    Authenticated,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum PolicyDumpIdentitySubject {
+    Principal { authority: String, id: String },
+    Group { authority: String, id: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -164,6 +182,7 @@ pub(crate) struct PolicyDumpTableRow {
     pub(crate) urls: String,
     pub(crate) methods: String,
     pub(crate) client_cidrs: String,
+    pub(crate) identity_predicates: String,
     pub(crate) header_predicates: String,
     pub(crate) description: String,
     pub(crate) authorization_provider: String,
@@ -190,6 +209,7 @@ impl PolicyDump {
                 let outputs = match provider {
                     AuthorizationProviderPlan::Webhook(provider) => &provider.outputs,
                     AuthorizationProviderPlan::Process(provider) => &provider.outputs,
+                    AuthorizationProviderPlan::UnixSocket(provider) => &provider.outputs,
                 };
                 (
                     provider_name.clone(),
@@ -233,6 +253,37 @@ impl PolicyDump {
                         .collect(),
                     methods: rule.methods.iter().map(ToString::to_string).collect(),
                     client_cidrs: rule.client_cidrs.iter().map(ToString::to_string).collect(),
+                    identity_states: rule
+                        .identity
+                        .as_ref()
+                        .map_or(&[][..], |identity| identity.states.as_slice())
+                        .iter()
+                        .map(|state| match state {
+                            IdentityState::Disabled => PolicyDumpIdentityState::Disabled,
+                            IdentityState::Anonymous => PolicyDumpIdentityState::Anonymous,
+                            IdentityState::Authenticated => PolicyDumpIdentityState::Authenticated,
+                        })
+                        .collect(),
+                    identity_subjects: rule
+                        .identity
+                        .as_ref()
+                        .map_or(&[][..], |identity| identity.subjects.as_slice())
+                        .iter()
+                        .map(|subject| match subject {
+                            IdentitySubject::Principal { authority, id } => {
+                                PolicyDumpIdentitySubject::Principal {
+                                    authority: authority.as_str().to_owned(),
+                                    id: id.as_str().to_owned(),
+                                }
+                            }
+                            IdentitySubject::Group { authority, id } => {
+                                PolicyDumpIdentitySubject::Group {
+                                    authority: authority.as_str().to_owned(),
+                                    id: id.as_str().to_owned(),
+                                }
+                            }
+                        })
+                        .collect(),
                     headers: PolicyDumpHeaderPredicates {
                         absent_any: rule
                             .headers
@@ -285,6 +336,7 @@ impl PolicyDump {
                 urls: rule.urls.join(","),
                 methods: rule.methods.join(","),
                 client_cidrs: rule.client_cidrs.join(","),
+                identity_predicates: format_identity_predicates(rule),
                 header_predicates: format_header_predicates(&rule.headers),
                 description: rule.description.clone().unwrap_or_default(),
                 authorization_provider: rule.authorization_provider.clone().unwrap_or_default(),
@@ -293,6 +345,27 @@ impl PolicyDump {
             })
             .collect()
     }
+}
+
+fn format_identity_predicates(rule: &PolicyDumpRule) -> String {
+    let mut values = rule
+        .identity_states
+        .iter()
+        .map(|state| match state {
+            PolicyDumpIdentityState::Disabled => "state=disabled".to_owned(),
+            PolicyDumpIdentityState::Anonymous => "state=anonymous".to_owned(),
+            PolicyDumpIdentityState::Authenticated => "state=authenticated".to_owned(),
+        })
+        .collect::<Vec<_>>();
+    values.extend(rule.identity_subjects.iter().map(|subject| match subject {
+        PolicyDumpIdentitySubject::Principal { authority, id } => {
+            format!("principal={authority}:{id}")
+        }
+        PolicyDumpIdentitySubject::Group { authority, id } => {
+            format!("group={authority}:{id}")
+        }
+    }));
+    values.join(",")
 }
 
 fn project_provider_output(output: &ProviderOutputPlan) -> PolicyDumpProviderCredentialOutput {
@@ -620,6 +693,59 @@ credential = "file_source"
             .mutations
             .contains("credential:bearer:environment_source:tls_required"));
         assert!(!rows[0].mutations.contains("literal-secret-value"));
+    }
+
+    #[test]
+    fn unix_provider_dump_projects_outputs_without_disclosing_socket_path() {
+        let input = r#"schema_version = 3
+
+[listeners.explicit_http]
+endpoint.kind = "tcp"
+endpoint.address = "127.0.0.1:8881"
+http_versions = ["http1"]
+
+[listeners.explicit_http.connect]
+http1 = "deny"
+
+[authorization.providers.local]
+kind = "unix_socket"
+socket_path = "/run/private/authorization-provider.sock"
+timeout = "2s"
+on_failure = "deny"
+include_headers = []
+max_request_bytes = 262144
+max_response_bytes = 65536
+max_pending_requests = 128
+
+[authorization.providers.local.outputs.api_token]
+kind = "bearer"
+transport_security = "tls_required"
+required = true
+
+[policy]
+default = "deny"
+"#;
+        let compiled = compile_config_text(ConfigTextInput {
+            text: input,
+            source_path: Path::new("/etc/acl-proxy/acl-proxy.toml"),
+            config_root: Path::new("/etc/acl-proxy"),
+        })
+        .unwrap();
+        let json = serde_json::to_string(&PolicyDump::from_compiled(&compiled)).unwrap();
+        assert!(!json.contains("/run/private/authorization-provider.sock"));
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["provider_credential_outputs"]["local"]["api_token"]["kind"],
+            "bearer"
+        );
+        assert_eq!(
+            value["provider_credential_outputs"]["local"]["api_token"]["transport_security"],
+            "tls_required"
+        );
+        assert_eq!(
+            value["provider_credential_outputs"]["local"]["api_token"]["required"],
+            true
+        );
     }
 
     #[test]

@@ -495,6 +495,20 @@ impl ProviderResponseCharge {
     pub(crate) fn buffer(&self) -> GuardedBodyBuilder {
         GuardedBodyBuilder::new(WireAllocationAuthority(self.inner.clone()))
     }
+
+    pub(crate) fn charge_exact_allocation(
+        &self,
+        bytes: usize,
+    ) -> Result<GuardedAllocationCharge, WireBodyBufferError> {
+        GuardedAllocationCharge::try_new(WireAllocationAuthority(self.inner.clone()), bytes)
+    }
+
+    pub(crate) fn exact_bytes(
+        &self,
+        bytes: usize,
+    ) -> Result<GuardedExactBytes, WireBodyBufferError> {
+        GuardedExactBytes::try_zeroed(WireAllocationAuthority(self.inner.clone()), bytes)
+    }
 }
 
 #[derive(Clone)]

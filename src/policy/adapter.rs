@@ -1,8 +1,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use http_access_policy_acl::{
-    AclError, DefaultDecision, DelegateMatch, HeaderPredicate, PeerCidr, ProductActionRef, Rule,
-    RulePredicates, TrafficPolicySnapshot,
+    AclError, DefaultDecision, DelegateMatch, HeaderPredicate, IdentityPredicate, PeerCidr,
+    ProductActionRef, Rule, RulePredicates, TrafficPolicySnapshot,
 };
 use http_access_types::{
     ContractError, DecisionProvenance, EffectivePolicy, HeaderName as NeutralHeaderName,
@@ -344,6 +344,13 @@ fn compile_predicates(rule: &PolicyRulePlan) -> Result<RulePredicates, ProductAc
         methods,
         peers,
         compile_header_predicates(&rule.headers)?,
+        rule.identity
+            .as_ref()
+            .map(|identity| {
+                IdentityPredicate::new(identity.states.clone(), identity.subjects.clone())
+                    .map_err(map_acl_error)
+            })
+            .transpose()?,
     )
     .map_err(map_acl_error)
 }
@@ -374,7 +381,9 @@ fn compile_header_predicates(
             .map(neutral_header_name)
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
-            .map(HeaderPredicate::present),
+            .map(HeaderPredicate::present)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ProductAclCompileError::InvalidCheckedValue)?,
     );
     for predicate in &plan.all {
         predicates.push(compile_value_predicate(predicate, true)?);
@@ -438,7 +447,14 @@ const fn map_contract_error(_error: ContractError) -> ProductAclCompileError {
 mod tests {
     use std::net::IpAddr;
     use std::str::FromStr;
+    use std::time::{Duration, Instant};
 
+    use access_async_contracts::{AccessCancellation, BoxAccessFuture};
+    use access_identity::{
+        AuthorityId, GroupId, IdentityAudience, IdentityContext, IdentityFingerprintKey,
+        IdentityResolver, IdentityState, IdentitySubject, PrincipalId, PrincipalKind,
+        SensitiveBearer, StaticGroup, StaticPrincipal, StaticResolverBuilder, StaticToken, TokenId,
+    };
     use http::header::{HeaderName, HeaderValue};
     use http::Method;
     use http_access_policy_acl::{
@@ -499,6 +515,15 @@ mod tests {
         }
 
         fn input(&self, peer: &str, revision: u64) -> EvaluationInput<'_> {
+            self.input_with_identity(peer, revision, &access_identity::IdentityContext::Disabled)
+        }
+
+        fn input_with_identity<'a>(
+            &'a self,
+            peer: &str,
+            revision: u64,
+            identity: &'a IdentityContext,
+        ) -> EvaluationInput<'a> {
             EvaluationInput::new(
                 &self.facts,
                 IpAddr::from_str(peer).unwrap(),
@@ -506,9 +531,56 @@ mod tests {
                 revision,
                 BodyRepresentation::PreservedContentCoded,
                 BodyObservation::unobserved(),
+                identity,
             )
             .unwrap()
         }
+    }
+
+    struct NeverCancelled;
+
+    impl AccessCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+
+        fn cancelled(&self) -> BoxAccessFuture<'_, ()> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    async fn authenticated_identity() -> IdentityContext {
+        let authority = AuthorityId::new("test-authority").unwrap();
+        let principal = PrincipalId::new("test-principal").unwrap();
+        let audience = IdentityAudience::new("acl-proxy.identity").unwrap();
+        let token = b"abcdefghijklmnopqrstuvwxyzABCDEF";
+        let fingerprint_key = IdentityFingerprintKey::generate().unwrap();
+        let resolver = StaticResolverBuilder::new(authority, audience.clone(), &fingerprint_key)
+            .principals(vec![StaticPrincipal {
+                id: principal.clone(),
+                kind: PrincipalKind::ServiceAccount,
+            }])
+            .groups(vec![StaticGroup {
+                id: GroupId::new("developers").unwrap(),
+                members: vec![principal.clone()].into_boxed_slice(),
+            }])
+            .tokens(vec![StaticToken {
+                id: TokenId::new("test-token").unwrap(),
+                principal,
+                bearer: SensitiveBearer::new(token).unwrap(),
+            }])
+            .build()
+            .unwrap();
+        let identity = resolver
+            .resolve(
+                SensitiveBearer::new(token).unwrap(),
+                &audience,
+                Instant::now() + Duration::from_secs(5),
+                &NeverCancelled,
+            )
+            .await
+            .unwrap();
+        IdentityContext::Authenticated(identity)
     }
 
     fn neutral_header(name: &str, value: &[u8]) -> HeaderField {
@@ -545,6 +617,7 @@ mod tests {
             urls: vec![CompiledUrlPattern::compile(url).unwrap()],
             methods: Vec::new(),
             client_cidrs: Vec::new(),
+            identity: None,
             headers: empty_predicates(),
             request_timeout: None,
             allow_upgrades: false,
@@ -681,6 +754,86 @@ mod tests {
         assert!(matches!(
             evaluate(&snapshot, &matching, "198.51.100.4"),
             PolicyEvaluation::Deny { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn identity_predicates_preserve_state_or_subject_or_and_rule_and_semantics() {
+        let request = RequestFixture::new("GET", "https://example.test/resource", &[], &[], &[]);
+
+        let mut unauthenticated = rule(
+            "unauthenticated",
+            CompiledRuleDecision::Allow,
+            "https://example.test/**",
+        );
+        unauthenticated.identity = Some(crate::config::compiler::IdentityPredicatePlan {
+            states: vec![IdentityState::Disabled, IdentityState::Anonymous],
+            subjects: Vec::new(),
+        });
+        let unauthenticated = compile(
+            &plan(CompiledDefaultDecision::Deny, vec![unauthenticated]),
+            80,
+            SnapshotIdentity::new(),
+            &[],
+        );
+        for identity in [IdentityContext::Disabled, IdentityContext::Anonymous] {
+            assert!(matches!(
+                unauthenticated
+                    .snapshot()
+                    .evaluate(&request.input_with_identity("192.0.2.1", 1, &identity))
+                    .unwrap(),
+                PolicyEvaluation::Allow { .. }
+            ));
+        }
+
+        let authenticated = authenticated_identity().await;
+        assert!(matches!(
+            unauthenticated
+                .snapshot()
+                .evaluate(&request.input_with_identity("192.0.2.1", 1, &authenticated))
+                .unwrap(),
+            PolicyEvaluation::Deny { .. }
+        ));
+
+        let mut subject_rule = rule(
+            "subject",
+            CompiledRuleDecision::Allow,
+            "https://example.test/**",
+        );
+        subject_rule.methods.push(Method::POST);
+        subject_rule.identity = Some(crate::config::compiler::IdentityPredicatePlan {
+            states: vec![IdentityState::Authenticated],
+            subjects: vec![
+                IdentitySubject::Principal {
+                    authority: AuthorityId::new("other-authority").unwrap(),
+                    id: PrincipalId::new("other-principal").unwrap(),
+                },
+                IdentitySubject::Group {
+                    authority: AuthorityId::new("test-authority").unwrap(),
+                    id: GroupId::new("developers").unwrap(),
+                },
+            ],
+        });
+        let subject_snapshot = compile(
+            &plan(CompiledDefaultDecision::Deny, vec![subject_rule]),
+            81,
+            SnapshotIdentity::new(),
+            &[],
+        );
+        assert!(matches!(
+            subject_snapshot
+                .snapshot()
+                .evaluate(&request.input_with_identity("192.0.2.1", 1, &authenticated))
+                .unwrap(),
+            PolicyEvaluation::Deny { .. }
+        ));
+        let post = RequestFixture::new("POST", "https://example.test/resource", &[], &[], &[]);
+        assert!(matches!(
+            subject_snapshot
+                .snapshot()
+                .evaluate(&post.input_with_identity("192.0.2.1", 1, &authenticated))
+                .unwrap(),
+            PolicyEvaluation::Allow { .. }
         ));
     }
 
@@ -978,6 +1131,34 @@ mod tests {
             ProductAclSnapshot::compile(
                 &plan(CompiledDefaultDecision::Deny, vec![oversized]),
                 PolicyGeneration::new(16).unwrap(),
+                SnapshotIdentity::new(),
+                &[]
+            ),
+            Err(ProductAclCompileError::SharedBound)
+        ));
+
+        let aggregate_identity_rules = (0
+            ..=http_access_policy_acl::MAX_IDENTITY_SUBJECTS_PER_SNAPSHOT)
+            .map(|index| {
+                let mut value = rule(
+                    &format!("identity-{index}"),
+                    CompiledRuleDecision::Allow,
+                    "https://example.test/**",
+                );
+                value.identity = Some(crate::config::compiler::IdentityPredicatePlan {
+                    states: vec![IdentityState::Authenticated],
+                    subjects: vec![IdentitySubject::Principal {
+                        authority: AuthorityId::new("test-authority").unwrap(),
+                        id: PrincipalId::new(format!("principal-{index}")).unwrap(),
+                    }],
+                });
+                value
+            })
+            .collect();
+        assert!(matches!(
+            ProductAclSnapshot::compile(
+                &plan(CompiledDefaultDecision::Deny, aggregate_identity_rules),
+                PolicyGeneration::new(17).unwrap(),
                 SnapshotIdentity::new(),
                 &[]
             ),

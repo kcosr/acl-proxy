@@ -406,6 +406,7 @@ authorization_provider = "approval"
             1,
             http_access_types::BodyRepresentation::PreservedContentCoded,
             http_access_types::BodyObservation::unobserved(),
+            &access_identity::IdentityContext::Disabled,
         )
         .unwrap();
         let first = policy.snapshot().evaluate(&input).unwrap();
