@@ -91,6 +91,15 @@ async fn response_send_raw(proxy: SocketAddr, request: &[u8]) -> Vec<u8> {
 
 #[tokio::test]
 async fn write_half_closed_client_receives_the_complete_delayed_upstream_response() {
+    assert_half_closed_client_receives_delayed_response(true).await;
+}
+
+#[tokio::test]
+async fn write_half_closed_keep_alive_client_receives_the_complete_response_then_eof() {
+    assert_half_closed_client_receives_delayed_response(false).await;
+}
+
+async fn assert_half_closed_client_receives_delayed_response(connection_close: bool) {
     let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
     let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -100,12 +109,12 @@ async fn write_half_closed_client_receives_the_complete_delayed_upstream_respons
     let origin_task = tokio::spawn(async move {
         let (mut stream, _) = origin_listener.accept().await.unwrap();
         response_read_head(&mut stream).await;
-        stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\n",
-            )
-            .await
-            .unwrap();
+        let response_head = if connection_close {
+            b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\n".as_slice()
+        } else {
+            b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n".as_slice()
+        };
+        stream.write_all(response_head).await.unwrap();
         stream.flush().await.unwrap();
         body_release.await.unwrap();
         stream.write_all(b"delayed-body!").await.unwrap();
@@ -127,10 +136,15 @@ default = "allow"
     .await;
 
     let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    let connection_header = if connection_close {
+        "Connection: close\r\n"
+    } else {
+        ""
+    };
     client
         .write_all(
             format!(
-                "GET http://{authority}/response HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+                "GET http://{authority}/response HTTP/1.1\r\nHost: {authority}\r\n{connection_header}\r\n"
             )
             .as_bytes(),
         )

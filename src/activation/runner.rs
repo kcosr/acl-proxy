@@ -596,6 +596,20 @@ default = "deny"
         message
     }
 
+    async fn read_http_head(stream: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
+        let mut head = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut byte))
+                .await
+                .expect("HTTP head read timed out")
+                .expect("HTTP head ended early");
+            head.push(byte[0]);
+            assert!(head.len() <= 32 * 1024, "HTTP head exceeded test bound");
+        }
+        head
+    }
+
     #[cfg(unix)]
     fn remote_tls_test_identity(
         prefix: &str,
@@ -2006,15 +2020,18 @@ methods = ["GET"]
         );
 
         let request_origin = Arc::clone(&origin);
+        let (release_body, body_release) = oneshot::channel();
         let origin_task = tokio::spawn(async move {
             let (mut stream, _) = request_origin.accept().await.unwrap();
             let request = read_http_message(&mut stream).await;
             stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\naccepted",
-                )
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n")
                 .await
                 .unwrap();
+            stream.flush().await.unwrap();
+            body_release.await.unwrap();
+            stream.write_all(b"accepted").await.unwrap();
+            stream.shutdown().await.unwrap();
             request
         });
 
@@ -2039,14 +2056,19 @@ methods = ["GET"]
         .await
         .unwrap();
         channel
-            .write_all(
-                b"GET /remote HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
-            )
+            .write_all(b"GET /remote HTTP/1.1\r\nHost: origin.example.test\r\n\r\n")
             .await
             .unwrap();
-        let response = read_http_message(&mut channel).await;
-        assert!(response.starts_with(b"HTTP/1.1 200 "));
-        assert!(response.ends_with(b"\r\n\r\naccepted"));
+        channel.shutdown().await.unwrap();
+        let head = read_http_head(&mut channel).await;
+        assert!(head.starts_with(b"HTTP/1.1 200 "));
+        release_body.send(()).unwrap();
+        let mut body = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), channel.read_to_end(&mut body))
+            .await
+            .expect("remote TLS Access Flow did not close after the delayed response")
+            .unwrap();
+        assert_eq!(body, b"accepted");
         let request = String::from_utf8(origin_task.await.unwrap())
             .unwrap()
             .to_ascii_lowercase();
