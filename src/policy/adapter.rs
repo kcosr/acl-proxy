@@ -530,6 +530,7 @@ mod tests {
             EvaluationInput::new(
                 &self.facts,
                 IpAddr::from_str(peer).unwrap(),
+                Some(IpAddr::from_str(peer).unwrap()),
                 &self.header_facts,
                 revision,
                 BodyRepresentation::PreservedContentCoded,

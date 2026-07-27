@@ -15,8 +15,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use access_flow::{AccessFlowAcceptor, AccessFlowPresentationMode};
-use access_flow_unix::UnixAccessFlowListenerAdapter;
+use access_flow::{AcceptedAccessFlow, AccessFlowAcceptor, AccessFlowPresentationMode, PrefixedIo};
+use access_flow_tls::{
+    TlsAccessFlowAdapterFailureKind, TlsAccessFlowAdapterStage, TlsAccessFlowGeneration,
+    TlsAccessFlowServerChannel, TlsAccessFlowServerHandshake, TlsAccessFlowStream,
+    TlsAccessFlowTcpListener,
+};
+use access_flow_unix::{UnixAccessFlowListenerAdapter, UnixListenerAcceptError};
 use http_access_runtime::{
     ForwardingCancellation, Http1ConnectPolicy, HttpAccessFlowService, ListenerConfig,
     ListenerIdentityMode, ListenerLimits, ListenerMode, ListenerRuntime, LocalAddressProvider,
@@ -30,6 +35,10 @@ use crate::config::compiler::{
     CompiledListenerIdentityMode, StaticAccessFlowTransport, StaticCleartextListener,
     StaticExplicitHttpsListener, StaticListenerEndpoint, StaticListenersConfig,
     StaticTransparentHttpsListener,
+};
+
+use super::access_flow_security::{
+    AccessFlowSecurityAdmissionState, AccessFlowSecuritySubscription, AccessFlowTlsRouteId,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,9 +123,15 @@ pub(crate) struct PreparedProxyListener {
 enum PreparedListenerEndpoint {
     Tcp(TcpListener),
     #[cfg(unix)]
-    AccessFlow {
+    AccessFlowUnix {
         listener: UnixListener,
         lifetime: Arc<UnixSocketLifetime>,
+        admission_timeout: Duration,
+        allowed_destination_ports: Vec<u16>,
+    },
+    AccessFlowTlsTcp {
+        listener: TcpListener,
+        route: AccessFlowTlsRouteId,
         admission_timeout: Duration,
         allowed_destination_ports: Vec<u16>,
     },
@@ -205,6 +220,7 @@ impl PreparedProxyListeners {
     pub(super) fn into_runtime_inputs_with_transparent_support(
         self,
         transparent_supported: bool,
+        security: AccessFlowSecuritySubscription,
     ) -> Result<PreparedListenerRuntimeInputs, SharedRuntimeError> {
         if !transparent_supported
             && [
@@ -226,11 +242,11 @@ impl PreparedProxyListeners {
         let mut access_flow = Vec::new();
         let mut lifetimes = Vec::new();
         for listener in self.into_entries() {
-            match listener.into_runtime_input()? {
+            match listener.into_runtime_input(security.clone())? {
                 PreparedRuntimeInput::Tcp(listener) => tcp.push(listener),
                 PreparedRuntimeInput::AccessFlow(listener, lifetime) => {
                     access_flow.push(listener);
-                    lifetimes.push(lifetime);
+                    lifetimes.extend(lifetime);
                 }
             }
         }
@@ -248,7 +264,10 @@ impl PreparedProxyListeners {
 }
 
 impl PreparedProxyListener {
-    fn into_runtime_input(self) -> Result<PreparedRuntimeInput, SharedRuntimeError> {
+    fn into_runtime_input(
+        self,
+        security: AccessFlowSecuritySubscription,
+    ) -> Result<PreparedRuntimeInput, SharedRuntimeError> {
         let kind = self.config.kind();
         let config = match self.config {
             ProxyListenerConfig::ExplicitHttp(config) => ListenerConfig::explicit_http(
@@ -297,7 +316,7 @@ impl PreparedProxyListener {
                 PreboundListener::new(config, PreboundListenerEndpoint::Tcp(listener))?,
             )),
             #[cfg(unix)]
-            PreparedListenerEndpoint::AccessFlow {
+            PreparedListenerEndpoint::AccessFlowUnix {
                 listener,
                 lifetime,
                 admission_timeout,
@@ -326,10 +345,44 @@ impl PreparedProxyListener {
                     PreparedAccessFlowListener {
                         kind,
                         config,
-                        adapter,
+                        transport: PreparedAccessFlowTransport::Unix { adapter, security },
                         acceptor,
                     },
-                    lifetime,
+                    Some(lifetime),
+                ))
+            }
+            PreparedListenerEndpoint::AccessFlowTlsTcp {
+                listener,
+                route,
+                admission_timeout,
+                allowed_destination_ports,
+            } => {
+                let listener = TlsAccessFlowTcpListener::from_std(listener)
+                    .map_err(|_| SharedRuntimeError::InvalidInput)?;
+                let ports = allowed_destination_ports
+                    .into_iter()
+                    .map(|port| {
+                        std::num::NonZeroU16::new(port).ok_or(SharedRuntimeError::InvalidInput)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let acceptor = AccessFlowAcceptor::new(
+                    access_flow_presentation_mode(config.identity_mode()),
+                    ports,
+                )
+                .map_err(|_| SharedRuntimeError::InvalidInput)?;
+                Ok(PreparedRuntimeInput::AccessFlow(
+                    PreparedAccessFlowListener {
+                        kind,
+                        config,
+                        transport: PreparedAccessFlowTransport::TlsTcp {
+                            listener,
+                            route,
+                            admission_timeout,
+                            security,
+                        },
+                        acceptor,
+                    },
+                    None,
                 ))
             }
         }
@@ -337,7 +390,7 @@ impl PreparedProxyListener {
 
     #[cfg(test)]
     fn into_shared(self) -> Result<PreboundListener, SharedRuntimeError> {
-        match self.into_runtime_input()? {
+        match self.into_runtime_input(AccessFlowSecuritySubscription::closed_for_test())? {
             PreparedRuntimeInput::Tcp(listener) => Ok(listener),
             PreparedRuntimeInput::AccessFlow(..) => Err(SharedRuntimeError::InvalidInput),
         }
@@ -346,14 +399,27 @@ impl PreparedProxyListener {
 
 enum PreparedRuntimeInput {
     Tcp(PreboundListener),
-    AccessFlow(PreparedAccessFlowListener, Arc<UnixSocketLifetime>),
+    AccessFlow(PreparedAccessFlowListener, Option<Arc<UnixSocketLifetime>>),
 }
 
 pub(super) struct PreparedAccessFlowListener {
     kind: ProxyListenerKind,
     config: ListenerConfig,
-    adapter: UnixAccessFlowListenerAdapter,
+    transport: PreparedAccessFlowTransport,
     acceptor: AccessFlowAcceptor,
+}
+
+enum PreparedAccessFlowTransport {
+    Unix {
+        adapter: UnixAccessFlowListenerAdapter,
+        security: AccessFlowSecuritySubscription,
+    },
+    TlsTcp {
+        listener: TlsAccessFlowTcpListener,
+        route: AccessFlowTlsRouteId,
+        admission_timeout: Duration,
+        security: AccessFlowSecuritySubscription,
+    },
 }
 
 struct AccessFlowAdmissionLatch {
@@ -593,21 +659,116 @@ async fn run_access_flow_listener(
     force_cancellation: ForwardingCancellation,
     admission_guard: AccessFlowAdmissionGuard,
 ) -> Result<ProxyListenerKind, Arc<ProxyListenerFailure>> {
-    let kind = listener.kind;
+    let PreparedAccessFlowListener {
+        kind,
+        config,
+        transport,
+        acceptor,
+    } = listener;
+    match transport {
+        PreparedAccessFlowTransport::Unix { adapter, security } => {
+            run_access_flow_unix_listener(
+                kind,
+                config,
+                adapter,
+                security,
+                acceptor,
+                service,
+                identity_admission,
+                admission_cancellation,
+                force_cancellation,
+                admission_guard,
+            )
+            .await
+        }
+        PreparedAccessFlowTransport::TlsTcp {
+            listener,
+            route,
+            admission_timeout,
+            security,
+        } => {
+            run_access_flow_tls_listener(
+                kind,
+                config,
+                listener,
+                route,
+                admission_timeout,
+                security,
+                acceptor,
+                service,
+                identity_admission,
+                admission_cancellation,
+                force_cancellation,
+                admission_guard,
+            )
+            .await
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_access_flow_unix_listener(
+    kind: ProxyListenerKind,
+    config: ListenerConfig,
+    adapter: UnixAccessFlowListenerAdapter,
+    mut security: AccessFlowSecuritySubscription,
+    acceptor: AccessFlowAcceptor,
+    service: HttpAccessFlowService,
+    identity_admission: Arc<crate::identity::IdentityPublisher>,
+    admission_cancellation: ForwardingCancellation,
+    force_cancellation: ForwardingCancellation,
+    admission_guard: AccessFlowAdmissionGuard,
+) -> Result<ProxyListenerKind, Arc<ProxyListenerFailure>> {
     let capacity = Arc::new(tokio::sync::Semaphore::new(
-        listener.config.limits().max_connections(),
+        config.limits().max_connections(),
     ));
     let mut connections = tokio::task::JoinSet::new();
     let admission_result: Result<(), Arc<ProxyListenerFailure>> = {
         let _admission_guard = admission_guard;
-        let PreparedAccessFlowListener {
-            kind: _,
-            config,
-            adapter,
-            acceptor,
-        } = listener;
         async {
             loop {
+                let security_generation = match security.admission_state() {
+                    AccessFlowSecurityAdmissionState::Healthy(generation) => generation,
+                    AccessFlowSecurityAdmissionState::Closed => break,
+                    AccessFlowSecurityAdmissionState::Unhealthy => {
+                        tokio::select! {
+                            biased;
+                            _ = admission_cancellation.cancelled() => break,
+                            joined = connections.join_next(), if !connections.is_empty() => {
+                                inspect_access_flow_connection(kind, joined, false)?;
+                            }
+                            changed = security.changed() => {
+                                if !changed {
+                                    break;
+                                }
+                            }
+                            rejected = adapter.accept(&admission_cancellation) => {
+                                match rejected {
+                                    Ok(rejected) => drop(rejected),
+                                    Err(error) => match unix_access_flow_accept_failure_disposition(
+                                        admission_cancellation.is_cancelled(),
+                                        error,
+                                    ) {
+                                        UnixAccessFlowAcceptFailureDisposition::Closed => break,
+                                        UnixAccessFlowAcceptFailureDisposition::TerminalListener => {
+                                            return Err(listener_failure(kind, error.to_string()));
+                                        }
+                                        UnixAccessFlowAcceptFailureDisposition::CandidateRejected => {
+                                            tracing::warn!(
+                                                target: "acl_proxy::traffic",
+                                                listener = %kind,
+                                                listener_transport = "access_flow",
+                                                category = "peer_credential_unavailable",
+                                                "Unix Access Flow candidate was rejected"
+                                            );
+                                        }
+                                    },
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                };
                 let permit = tokio::select! {
                     biased;
                     _ = admission_cancellation.cancelled() => break,
@@ -624,6 +785,7 @@ async fn run_access_flow_listener(
                 };
                 let (accepted, permit) = match wait_for_access_flow_accept(
                     &adapter,
+                    &mut security,
                     &admission_cancellation,
                     &mut connections,
                     permit,
@@ -633,6 +795,8 @@ async fn run_access_flow_listener(
                 {
                     Ok(AccessFlowAcceptEvent::Accepted(accepted, permit)) => (accepted, permit),
                     Ok(AccessFlowAcceptEvent::ConnectionCompleted) => continue,
+                    Ok(AccessFlowAcceptEvent::SecurityChanged) => continue,
+                    Ok(AccessFlowAcceptEvent::CandidateRejected) => continue,
                     Ok(AccessFlowAcceptEvent::Cancelled) => break,
                     Err(failure) => return Err(failure),
                 };
@@ -642,18 +806,23 @@ async fn run_access_flow_listener(
                 let admission_cancellation = admission_cancellation.clone();
                 let connection_cancellation = force_cancellation.clone();
                 let identity_admission = Arc::clone(&identity_admission);
+                let mut security = security.clone();
                 connections.spawn(async move {
                     let _permit = permit;
                     let (channel, deadline) = accepted.into_access_flow();
-                    let accepted = match acceptor
-                        .accept(
-                            channel,
-                            deadline,
-                            &admission_cancellation,
-                            identity_admission.as_ref(),
-                        )
-                        .await
-                    {
+                    let admitted = acceptor.accept(
+                        channel,
+                        deadline,
+                        &admission_cancellation,
+                        identity_admission.as_ref(),
+                    );
+                    tokio::pin!(admitted);
+                    let accepted = match tokio::select! {
+                        biased;
+                        _ = admission_cancellation.cancelled() => return Ok(()),
+                        _ = security.changed() => return Ok(()),
+                        accepted = &mut admitted => accepted,
+                    } {
                         Ok(accepted) => accepted,
                         Err(_error) if admission_cancellation.is_cancelled() => return Ok(()),
                         Err(error) => {
@@ -668,6 +837,9 @@ async fn run_access_flow_listener(
                             return Ok(());
                         }
                     };
+                    if !security.is_current(security_generation) {
+                        return Ok(());
+                    }
                     match service
                         .serve_access_flow(accepted, config, &connection_cancellation)
                         .await
@@ -691,6 +863,7 @@ async fn run_access_flow_listener(
         }
         .await
     };
+    drop(adapter);
 
     if let Err(failure) = admission_result {
         admission_cancellation.cancel();
@@ -710,17 +883,424 @@ async fn run_access_flow_listener(
     Ok(kind)
 }
 
+type AcceptedTlsAccessFlow = AcceptedAccessFlow<
+    PrefixedIo<TlsAccessFlowStream>,
+    access_identity::AdmittedIdentity,
+    TlsAccessFlowServerChannel,
+>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnixAccessFlowAcceptFailureDisposition {
+    Closed,
+    TerminalListener,
+    CandidateRejected,
+}
+
+fn unix_access_flow_accept_failure_disposition(
+    admission_cancelled: bool,
+    error: UnixListenerAcceptError,
+) -> UnixAccessFlowAcceptFailureDisposition {
+    if admission_cancelled || error == UnixListenerAcceptError::Cancelled {
+        return UnixAccessFlowAcceptFailureDisposition::Closed;
+    }
+    if error == UnixListenerAcceptError::PeerCredentialUnavailable {
+        return UnixAccessFlowAcceptFailureDisposition::CandidateRejected;
+    }
+    UnixAccessFlowAcceptFailureDisposition::TerminalListener
+}
+
+enum TlsAccessFlowAdmissionOutcome {
+    Accepted {
+        flow: Box<AcceptedTlsAccessFlow>,
+        generation: TlsAccessFlowGeneration,
+    },
+    Rejected,
+    Restart,
+    Closed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TlsAccessFlowAcceptFailureDisposition {
+    Closed,
+    TerminalListener,
+    CandidateRejected,
+}
+
+fn tls_access_flow_accept_failure_disposition(
+    admission_cancelled: bool,
+    stage: TlsAccessFlowAdapterStage,
+    kind: TlsAccessFlowAdapterFailureKind,
+) -> TlsAccessFlowAcceptFailureDisposition {
+    if admission_cancelled || kind == TlsAccessFlowAdapterFailureKind::Cancelled {
+        return TlsAccessFlowAcceptFailureDisposition::Closed;
+    }
+    if stage == TlsAccessFlowAdapterStage::TcpAccept
+        && matches!(
+            kind,
+            TlsAccessFlowAdapterFailureKind::Unavailable
+                | TlsAccessFlowAdapterFailureKind::ResourceExhausted
+        )
+    {
+        return TlsAccessFlowAcceptFailureDisposition::TerminalListener;
+    }
+    TlsAccessFlowAcceptFailureDisposition::CandidateRejected
+}
+
+type TlsAccessFlowAdmissionResult =
+    Result<TlsAccessFlowAdmissionOutcome, Arc<ProxyListenerFailure>>;
+
+#[allow(clippy::too_many_arguments)]
+async fn run_access_flow_tls_listener(
+    kind: ProxyListenerKind,
+    config: ListenerConfig,
+    mut listener: TlsAccessFlowTcpListener,
+    route: AccessFlowTlsRouteId,
+    admission_timeout: Duration,
+    mut security: AccessFlowSecuritySubscription,
+    acceptor: AccessFlowAcceptor,
+    service: HttpAccessFlowService,
+    identity_admission: Arc<crate::identity::IdentityPublisher>,
+    admission_cancellation: ForwardingCancellation,
+    force_cancellation: ForwardingCancellation,
+    admission_guard: AccessFlowAdmissionGuard,
+) -> Result<ProxyListenerKind, Arc<ProxyListenerFailure>> {
+    let capacity = Arc::new(tokio::sync::Semaphore::new(
+        config.limits().max_connections(),
+    ));
+    let mut admissions = tokio::task::JoinSet::new();
+    let mut connections = tokio::task::JoinSet::new();
+
+    let admission_result: Result<(), Arc<ProxyListenerFailure>> = {
+        let _admission_guard = admission_guard;
+        async {
+            loop {
+                let generation = match security.admission_state() {
+                    AccessFlowSecurityAdmissionState::Healthy(generation) => generation,
+                    AccessFlowSecurityAdmissionState::Closed => break,
+                    AccessFlowSecurityAdmissionState::Unhealthy => {
+                        admissions.abort_all();
+                        let rejection_adapter = security.tls_rejection_adapter(route).ok_or_else(|| {
+                            listener_failure(
+                                kind,
+                                "TLS/TCP Access Flow rejection generation is unavailable",
+                            )
+                        })?;
+                        tokio::select! {
+                            biased;
+                            _ = admission_cancellation.cancelled() => break,
+                            joined = connections.join_next(), if !connections.is_empty() => {
+                                inspect_access_flow_connection(kind, joined, false)?;
+                            }
+                            joined = admissions.join_next(), if !admissions.is_empty() => {
+                                let _ = joined;
+                            }
+                            changed = security.changed() => {
+                                if !changed {
+                                    break;
+                                }
+                            }
+                            rejected = rejection_adapter.accept(
+                                &mut listener,
+                                &admission_cancellation,
+                            ) => {
+                                match rejected {
+                                    Ok(rejected) => drop(rejected),
+                                    Err(error) => {
+                                        match tls_access_flow_accept_failure_disposition(
+                                            admission_cancellation.is_cancelled(),
+                                            error.stage(),
+                                            error.kind(),
+                                        ) {
+                                            TlsAccessFlowAcceptFailureDisposition::Closed => break,
+                                            TlsAccessFlowAcceptFailureDisposition::TerminalListener => {
+                                                return Err(listener_failure(
+                                                    kind,
+                                                    "TLS/TCP Access Flow listener became unavailable",
+                                                ));
+                                            }
+                                            TlsAccessFlowAcceptFailureDisposition::CandidateRejected => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                };
+                let Some(current) = security.current_tls_route(route) else {
+                    continue;
+                };
+                if current.generation != generation {
+                    continue;
+                }
+                tokio::select! {
+                    biased;
+                    _ = admission_cancellation.cancelled() => break,
+                    joined = connections.join_next(), if !connections.is_empty() => {
+                        inspect_access_flow_connection(kind, joined, false)?;
+                    }
+                    joined = admissions.join_next(), if !admissions.is_empty() => {
+                        let outcome = joined
+                            .ok_or_else(|| listener_failure(
+                                kind,
+                                "TLS/TCP Access Flow admission task set exited unexpectedly",
+                            ))?
+                            .map_err(|_| listener_failure(
+                                kind,
+                                "TLS/TCP Access Flow admission task failed",
+                            ))??;
+                        match outcome {
+                            TlsAccessFlowAdmissionOutcome::Accepted { flow, generation } => {
+                                if security.is_current(generation) {
+                                    if let Ok(permit) = Arc::clone(&capacity).try_acquire_owned() {
+                                        if security.is_current(generation)
+                                            && flow.channel_peer().mark_admitted()
+                                            && security.is_current(generation)
+                                        {
+                                            let service = service.clone();
+                                            let config = config.clone();
+                                            let connection_cancellation = force_cancellation.clone();
+                                            connections.spawn(async move {
+                                                let _permit = permit;
+                                                match service
+                                                    .serve_access_flow(
+                                                        *flow,
+                                                        config,
+                                                        &connection_cancellation,
+                                                    )
+                                                    .await
+                                                {
+                                                    Ok(_) => Ok(()),
+                                                    Err(
+                                                        http_access_runtime::HttpAccessConnectionError::ConnectionRejected,
+                                                    ) => {
+                                                        tracing::warn!(
+                                                            target: "acl_proxy::traffic",
+                                                            listener = %kind,
+                                                            listener_transport = "access_flow_tls_tcp",
+                                                            category = "connection_rejected",
+                                                            "TLS/TCP Access Flow HTTP/TLS connection was rejected"
+                                                        );
+                                                        Ok(())
+                                                    }
+                                                    Err(error) => {
+                                                        Err(listener_failure(kind, error.to_string()))
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    } else {
+                                        tracing::warn!(
+                                            target: "acl_proxy::traffic",
+                                            listener = %kind,
+                                            listener_transport = "access_flow_tls_tcp",
+                                            category = "active_capacity_exhausted",
+                                            "TLS/TCP Access Flow active capacity is unavailable"
+                                        );
+                                    }
+                                }
+                            }
+                            TlsAccessFlowAdmissionOutcome::Rejected
+                            | TlsAccessFlowAdmissionOutcome::Restart => {}
+                            TlsAccessFlowAdmissionOutcome::Closed => break,
+                        }
+                    }
+                    changed = security.changed() => {
+                        if !changed {
+                            break;
+                        }
+                    }
+                    handshake = current.adapter.accept(
+                        &mut listener,
+                        &admission_cancellation,
+                    ) => {
+                        let handshake = match handshake {
+                            Ok(handshake) => handshake,
+                            Err(error) => {
+                                match tls_access_flow_accept_failure_disposition(
+                                    admission_cancellation.is_cancelled(),
+                                    error.stage(),
+                                    error.kind(),
+                                ) {
+                                    TlsAccessFlowAcceptFailureDisposition::Closed => break,
+                                    TlsAccessFlowAcceptFailureDisposition::TerminalListener => {
+                                        return Err(listener_failure(
+                                            kind,
+                                            "TLS/TCP Access Flow listener became unavailable",
+                                        ));
+                                    }
+                                    TlsAccessFlowAcceptFailureDisposition::CandidateRejected => {
+                                        tracing::warn!(
+                                            target: "acl_proxy::traffic",
+                                            listener = %kind,
+                                            listener_transport = "access_flow_tls_tcp",
+                                            stage = ?error.stage(),
+                                            category = ?error.kind(),
+                                            "TLS/TCP Access Flow pre-handshake candidate was rejected"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                        };
+                        if !security.is_current(generation) {
+                            continue;
+                        }
+                        admissions.spawn(run_tls_access_flow_admission(
+                            kind,
+                            handshake,
+                            admission_timeout,
+                            security.clone(),
+                            acceptor.clone(),
+                            Arc::clone(&identity_admission),
+                            admission_cancellation.clone(),
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await
+    };
+
+    admission_cancellation.cancel();
+    admissions.abort_all();
+    while admissions.join_next().await.is_some() {}
+    drop(listener);
+    if let Err(failure) = admission_result {
+        force_cancellation.cancel();
+        connections.abort_all();
+        let _ = drain_access_flow_connections(kind, &force_cancellation, &mut connections).await;
+        return Err(failure);
+    }
+    if let Err(failure) =
+        drain_access_flow_connections(kind, &force_cancellation, &mut connections).await
+    {
+        force_cancellation.cancel();
+        connections.abort_all();
+        let _ = drain_access_flow_connections(kind, &force_cancellation, &mut connections).await;
+        return Err(failure);
+    }
+    Ok(kind)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_tls_access_flow_admission(
+    kind: ProxyListenerKind,
+    handshake: TlsAccessFlowServerHandshake,
+    admission_timeout: Duration,
+    mut security: AccessFlowSecuritySubscription,
+    acceptor: AccessFlowAcceptor,
+    identity_admission: Arc<crate::identity::IdentityPublisher>,
+    cancellation: ForwardingCancellation,
+) -> TlsAccessFlowAdmissionResult {
+    let generation = handshake.generation();
+    if !security.is_current(generation) {
+        return Ok(TlsAccessFlowAdmissionOutcome::Restart);
+    }
+    let established = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            return Ok(TlsAccessFlowAdmissionOutcome::Closed);
+        }
+        changed = security.changed() => {
+            return Ok(if changed {
+                TlsAccessFlowAdmissionOutcome::Restart
+            } else {
+                TlsAccessFlowAdmissionOutcome::Closed
+            });
+        }
+        established = handshake.establish(&cancellation) => established,
+    };
+    let established = match established {
+        Ok(established) => established,
+        Err(error)
+            if cancellation.is_cancelled()
+                || error.kind() == TlsAccessFlowAdapterFailureKind::Cancelled =>
+        {
+            return Ok(TlsAccessFlowAdmissionOutcome::Closed);
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "acl_proxy::traffic",
+                listener = %kind,
+                listener_transport = "access_flow_tls_tcp",
+                stage = ?error.stage(),
+                category = ?error.kind(),
+                "TLS/TCP Access Flow channel was rejected"
+            );
+            return Ok(TlsAccessFlowAdmissionOutcome::Rejected);
+        }
+    };
+    if !security.is_current(generation) {
+        return Ok(TlsAccessFlowAdmissionOutcome::Restart);
+    }
+    let Some(deadline) = std::time::Instant::now().checked_add(admission_timeout) else {
+        return Err(listener_failure(
+            kind,
+            "TLS/TCP Access Flow admission deadline overflowed",
+        ));
+    };
+    let admitted = acceptor.accept(
+        established,
+        deadline,
+        &cancellation,
+        identity_admission.as_ref(),
+    );
+    tokio::pin!(admitted);
+    let flow = match tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            return Ok(TlsAccessFlowAdmissionOutcome::Closed);
+        }
+        changed = security.changed() => {
+            return Ok(if changed {
+                TlsAccessFlowAdmissionOutcome::Restart
+            } else {
+                TlsAccessFlowAdmissionOutcome::Closed
+            });
+        }
+        admitted = &mut admitted => admitted,
+    } {
+        Ok(flow) => flow,
+        Err(_error) if cancellation.is_cancelled() => {
+            return Ok(TlsAccessFlowAdmissionOutcome::Closed);
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "acl_proxy::traffic",
+                listener = %kind,
+                listener_transport = "access_flow_tls_tcp",
+                category = "access_flow_rejected",
+                error = %error,
+                "TLS/TCP Access Flow preface or bearer was rejected"
+            );
+            return Ok(TlsAccessFlowAdmissionOutcome::Rejected);
+        }
+    };
+    if !security.is_current(generation) {
+        return Ok(TlsAccessFlowAdmissionOutcome::Restart);
+    }
+    Ok(TlsAccessFlowAdmissionOutcome::Accepted {
+        flow: Box::new(flow),
+        generation,
+    })
+}
+
 enum AccessFlowAcceptEvent {
     Accepted(
         access_flow_unix::AcceptedUnixAccessFlowChannel,
         tokio::sync::OwnedSemaphorePermit,
     ),
     ConnectionCompleted,
+    SecurityChanged,
+    CandidateRejected,
     Cancelled,
 }
 
 async fn wait_for_access_flow_accept(
     adapter: &UnixAccessFlowListenerAdapter,
+    security: &mut AccessFlowSecuritySubscription,
     admission_cancellation: &ForwardingCancellation,
     connections: &mut tokio::task::JoinSet<Result<(), Arc<ProxyListenerFailure>>>,
     permit: tokio::sync::OwnedSemaphorePermit,
@@ -732,6 +1312,14 @@ async fn wait_for_access_flow_accept(
             drop(permit);
             Ok(AccessFlowAcceptEvent::Cancelled)
         }
+        changed = security.changed() => {
+            drop(permit);
+            if changed {
+                Ok(AccessFlowAcceptEvent::SecurityChanged)
+            } else {
+                Ok(AccessFlowAcceptEvent::Cancelled)
+            }
+        }
         joined = connections.join_next(), if !connections.is_empty() => {
             drop(permit);
             inspect_access_flow_connection(kind, joined, false)?;
@@ -739,13 +1327,22 @@ async fn wait_for_access_flow_accept(
         }
         accepted = adapter.accept(admission_cancellation) => match accepted {
             Ok(accepted) => Ok(AccessFlowAcceptEvent::Accepted(accepted, permit)),
-            Err(_error) if admission_cancellation.is_cancelled() => {
-                drop(permit);
-                Ok(AccessFlowAcceptEvent::Cancelled)
-            }
             Err(error) => {
                 drop(permit);
-                Err(listener_failure(kind, error.to_string()))
+                match unix_access_flow_accept_failure_disposition(
+                    admission_cancellation.is_cancelled(),
+                    error,
+                ) {
+                    UnixAccessFlowAcceptFailureDisposition::Closed => {
+                        Ok(AccessFlowAcceptEvent::Cancelled)
+                    }
+                    UnixAccessFlowAcceptFailureDisposition::CandidateRejected => {
+                        Ok(AccessFlowAcceptEvent::CandidateRejected)
+                    }
+                    UnixAccessFlowAcceptFailureDisposition::TerminalListener => {
+                        Err(listener_failure(kind, error.to_string()))
+                    }
+                }
             }
         }
     }
@@ -1088,19 +1685,54 @@ fn bind_configured(
                 StaticListenerEndpoint::AccessFlow {
                     admission_timeout,
                     allowed_destination_ports,
-                    transport: StaticAccessFlowTransport::Unix { path, mode },
-                } => bind_access_flow_unix(
-                    path,
-                    *mode,
-                    *admission_timeout,
-                    allowed_destination_ports.clone(),
-                )
-                .map_err(|source| ProxyListenerBindError {
-                    name,
-                    endpoint: path.display().to_string(),
-                    address: None,
-                    source,
-                })?,
+                    transport,
+                } => match transport {
+                    StaticAccessFlowTransport::Unix { path, mode } => bind_access_flow_unix(
+                        path,
+                        *mode,
+                        *admission_timeout,
+                        allowed_destination_ports.clone(),
+                    )
+                    .map_err(|source| ProxyListenerBindError {
+                        name,
+                        endpoint: path.display().to_string(),
+                        address: None,
+                        source,
+                    })?,
+                    StaticAccessFlowTransport::TlsTcp { bind: address, .. } => {
+                        let route = match config.kind() {
+                            ProxyListenerKind::TransparentHttp => {
+                                AccessFlowTlsRouteId::TransparentHttp
+                            }
+                            ProxyListenerKind::TransparentHttps => {
+                                AccessFlowTlsRouteId::TransparentHttps
+                            }
+                            _ => {
+                                return Err(ProxyListenerBindError {
+                                    name,
+                                    endpoint: "invalid TLS/TCP Access Flow listener".to_owned(),
+                                    address: None,
+                                    source: io::Error::new(
+                                        io::ErrorKind::InvalidInput,
+                                        "invalid TLS/TCP Access Flow listener",
+                                    ),
+                                });
+                            }
+                        };
+                        let listener = bind(*address).map_err(|source| ProxyListenerBindError {
+                            name,
+                            endpoint: address.to_string(),
+                            address: Some(*address),
+                            source,
+                        })?;
+                        PreparedListenerEndpoint::AccessFlowTlsTcp {
+                            listener,
+                            route,
+                            admission_timeout: *admission_timeout,
+                            allowed_destination_ports: allowed_destination_ports.clone(),
+                        }
+                    }
+                },
             };
             Ok(PreparedProxyListener { config, endpoint })
         })
@@ -1162,7 +1794,7 @@ fn bind_access_flow_unix(
     }
 
     let lifetime = Arc::new(UnixSocketLifetime { _lock: lock });
-    Ok(PreparedListenerEndpoint::AccessFlow {
+    Ok(PreparedListenerEndpoint::AccessFlowUnix {
         listener,
         lifetime,
         admission_timeout,
@@ -1416,6 +2048,89 @@ mod tests {
     use crate::config::compiler::{
         CompiledHttp1ConnectPolicy, CompiledHttpVersion, CompiledTlsIdentity, StaticConnectPolicy,
     };
+
+    #[test]
+    fn tls_access_flow_accept_failures_preserve_listener_and_candidate_boundaries() {
+        use TlsAccessFlowAcceptFailureDisposition::{CandidateRejected, Closed, TerminalListener};
+
+        assert_eq!(
+            tls_access_flow_accept_failure_disposition(
+                true,
+                TlsAccessFlowAdapterStage::TcpAccept,
+                TlsAccessFlowAdapterFailureKind::Unavailable,
+            ),
+            Closed
+        );
+        assert_eq!(
+            tls_access_flow_accept_failure_disposition(
+                false,
+                TlsAccessFlowAdapterStage::TcpAccept,
+                TlsAccessFlowAdapterFailureKind::Cancelled,
+            ),
+            Closed
+        );
+        for kind in [
+            TlsAccessFlowAdapterFailureKind::Unavailable,
+            TlsAccessFlowAdapterFailureKind::ResourceExhausted,
+        ] {
+            assert_eq!(
+                tls_access_flow_accept_failure_disposition(
+                    false,
+                    TlsAccessFlowAdapterStage::TcpAccept,
+                    kind,
+                ),
+                TerminalListener
+            );
+        }
+        assert_eq!(
+            tls_access_flow_accept_failure_disposition(
+                false,
+                TlsAccessFlowAdapterStage::Capacity,
+                TlsAccessFlowAdapterFailureKind::ResourceExhausted,
+            ),
+            CandidateRejected
+        );
+        assert_eq!(
+            tls_access_flow_accept_failure_disposition(
+                false,
+                TlsAccessFlowAdapterStage::TcpAccept,
+                TlsAccessFlowAdapterFailureKind::RateLimited,
+            ),
+            CandidateRejected
+        );
+    }
+
+    #[test]
+    fn unix_access_flow_accept_failures_preserve_listener_and_candidate_boundaries() {
+        use UnixAccessFlowAcceptFailureDisposition::{CandidateRejected, Closed, TerminalListener};
+
+        assert_eq!(
+            unix_access_flow_accept_failure_disposition(true, UnixListenerAcceptError::Unavailable,),
+            Closed
+        );
+        assert_eq!(
+            unix_access_flow_accept_failure_disposition(false, UnixListenerAcceptError::Cancelled,),
+            Closed
+        );
+        assert_eq!(
+            unix_access_flow_accept_failure_disposition(
+                false,
+                UnixListenerAcceptError::PeerCredentialUnavailable,
+            ),
+            CandidateRejected
+        );
+        for error in [
+            UnixListenerAcceptError::UnsupportedPlatform,
+            UnixListenerAcceptError::Unavailable,
+            UnixListenerAcceptError::ResourceExhausted,
+            UnixListenerAcceptError::AdmissionDeadlineOverflow,
+        ] {
+            assert_eq!(
+                unix_access_flow_accept_failure_disposition(false, error),
+                TerminalListener
+            );
+        }
+    }
 
     fn prebound_listeners<const N: usize>() -> [TcpListener; N] {
         (0..N)
@@ -1705,7 +2420,10 @@ mod tests {
         };
 
         assert!(matches!(
-            prepared.into_runtime_inputs_with_transparent_support(false),
+            prepared.into_runtime_inputs_with_transparent_support(
+                false,
+                AccessFlowSecuritySubscription::closed_for_test(),
+            ),
             Err(SharedRuntimeError::InvalidInput)
         ));
     }
@@ -1746,6 +2464,7 @@ mod tests {
             .await
             .unwrap();
         let mut connections = tokio::task::JoinSet::new();
+        let (_security_guard, mut security) = AccessFlowSecuritySubscription::healthy_for_test();
         connections.spawn(async {
             tokio::task::yield_now().await;
             Err(listener_failure(
@@ -1758,6 +2477,7 @@ mod tests {
             Duration::from_secs(1),
             wait_for_access_flow_accept(
                 &adapter,
+                &mut security,
                 &cancellation,
                 &mut connections,
                 permit,

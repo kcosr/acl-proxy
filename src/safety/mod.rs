@@ -402,6 +402,7 @@ authorization_provider = "approval"
         let input = http_access_policy_acl::EvaluationInput::new(
             &facts,
             Ipv4Addr::new(192, 0, 2, 1).into(),
+            Some(Ipv4Addr::new(192, 0, 2, 1).into()),
             &header_facts,
             1,
             http_access_types::BodyRepresentation::PreservedContentCoded,

@@ -23,7 +23,7 @@ or WebSocket implementation.
 - Source repository: this `acl-proxy` repository
 - Destination repository: `access-runtime`
 - Accepted runtime commit:
-  `506cd67b6219b8f9fd7445e79dd2c820dae5f132`
+  `d07ee983dfb2ad09f1217e87ca1b179f9ba6ee01`
 - Dependency version: `0.1.0`
 - License: MIT
 - Material changes: product-specific inputs were replaced by versionless,
@@ -31,9 +31,10 @@ or WebSocket implementation.
   upgrade, URL, and redaction owners were deleted from the product as each moved
   owner was adopted. Credential, ACL, identity, and Access Flow foundations were
   independently authored as product-neutral contracts, with product behavior
-  oracles recorded where applicable. P13 modernized the runtime's private HTTP
-  transport family and retained the reviewed Hyper fork in the runtime
-  repository.
+  oracles recorded where applicable. The remote Access Flow extension adds the
+  independently authored product-neutral TLS/TCP adapter below unchanged AWAF
+  v1. P13 modernized the runtime's private HTTP transport family and retained
+  the reviewed Hyper fork in the runtime repository.
 
 The authoritative complete origin record is `access-runtime/PROVENANCE.md` at
 the accepted commit above. It identifies moved-source entries with immutable

@@ -740,6 +740,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn remote_access_flow_policy_decision_uses_the_non_source_client_sentinel() {
+        use http_access_types::{
+            DecisionAuditFactsInput, DecisionAuditSource, DecisionDisposition, DecisionReason,
+            StableId,
+        };
+
+        let identity = access_identity::authenticated_identity_context_fixture();
+        let projection = http_access_runtime::StandaloneIngressProjection::from_access_flow(
+            access_flow::AccessFlowIngressOrigin::RemoteAccessFlow,
+            &identity,
+        )
+        .unwrap();
+        let request_id = StableId::new("remote-decision").unwrap();
+        let source =
+            DecisionAuditSource::Local(DecisionReason::new(DecisionReasonCategory::Policy, 1));
+        let facts = DecisionAuditFacts::new(DecisionAuditFactsInput {
+            request_id: &request_id,
+            disposition: DecisionDisposition::Deny,
+            method: None,
+            url: None,
+            peer_ip: Some(projection.client().ip()),
+            source: &source,
+            sensitive_header_presence: &[],
+        })
+        .unwrap();
+
+        assert_eq!(
+            PolicyDecisionLogRecord::from_facts(&facts).client_ip,
+            "0.0.0.0"
+        );
+        assert_eq!(projection.policy_peer_ip(), None);
+    }
+
     struct RecordingSink {
         bytes: Arc<Mutex<Vec<u8>>>,
         flushed: Arc<AtomicBool>,

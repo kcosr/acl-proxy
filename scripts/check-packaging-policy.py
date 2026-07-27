@@ -24,8 +24,8 @@ ALLOWED_LICENSES = {
 }
 REGISTRY = "https://github.com/rust-lang/crates.io-index"
 PRODUCT_VERSION = "0.3.0-rc.1"
-RUNTIME_COMMIT = "506cd67b6219b8f9fd7445e79dd2c820dae5f132"
-RUNTIME_TREE = "67543e2f85f345da29a6df1cd04d3f76e0cb34a1"
+RUNTIME_COMMIT = "d07ee983dfb2ad09f1217e87ca1b179f9ba6ee01"
+RUNTIME_TREE = "5e99685d5d4771b05f5382a78970f3046b11bb00"
 PRODUCT_INITIAL_COMMIT = "a829f43552c7118d1f206b9e4112b3c747eecd50"
 PRIVATE_TRANSPORT_PACKAGES = {
     "h2",
@@ -40,6 +40,7 @@ EXPECTED_RUNTIME_COVERAGE = {
     "access-flow": "independently authored Access Flow foundation",
     "access-flow-conformance": "independently authored Access Flow foundation",
     "access-flow-relay": "independently authored Access Flow foundation",
+    "access-flow-tls": "independently authored Access Flow foundation",
     "access-flow-unix": "independently authored Access Flow foundation",
     "access-identity": "independently authored Access Flow foundation",
     "access-rpc-framing": "independently authored Access Flow foundation",

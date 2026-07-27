@@ -2,8 +2,9 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 const RUNTIME_PUBLISHED: u8 = 1 << 0;
 const INGRESS_STARTED: u8 = 1 << 1;
-const CLOSED: u8 = 1 << 2;
-const READY: u8 = RUNTIME_PUBLISHED | INGRESS_STARTED;
+const ACCESS_FLOW_SECURITY_HEALTHY: u8 = 1 << 2;
+const CLOSED: u8 = 1 << 3;
+const READY: u8 = RUNTIME_PUBLISHED | INGRESS_STARTED | ACCESS_FLOW_SECURITY_HEALTHY;
 
 /// Process-lifetime readiness shared by the runtime and static resources.
 /// Once shutdown closes the gate, no later publication can make it ready.
@@ -14,7 +15,7 @@ pub(crate) struct ServiceReadiness {
 impl ServiceReadiness {
     pub(crate) fn new() -> Self {
         Self {
-            state: AtomicU8::new(0),
+            state: AtomicU8::new(ACCESS_FLOW_SECURITY_HEALTHY),
         }
     }
 
@@ -30,6 +31,14 @@ impl ServiceReadiness {
         self.mark(INGRESS_STARTED);
     }
 
+    pub(crate) fn mark_access_flow_security_healthy(&self) {
+        self.mark(ACCESS_FLOW_SECURITY_HEALTHY);
+    }
+
+    pub(crate) fn mark_access_flow_security_unhealthy(&self) {
+        self.clear(ACCESS_FLOW_SECURITY_HEALTHY);
+    }
+
     fn mark(&self, bit: u8) {
         let mut state = self.state.load(Ordering::Acquire);
         loop {
@@ -39,6 +48,24 @@ impl ServiceReadiness {
             match self.state.compare_exchange_weak(
                 state,
                 state | bit,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(current) => state = current,
+            }
+        }
+    }
+
+    fn clear(&self, bit: u8) {
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            if state & CLOSED != 0 || state & bit == 0 {
+                return;
+            }
+            match self.state.compare_exchange_weak(
+                state,
+                state & !bit,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
@@ -88,5 +115,22 @@ mod tests {
         assert!(!ingress_first.is_ready());
         ingress_first.mark_runtime_published();
         assert!(ingress_first.is_ready());
+    }
+
+    #[test]
+    fn access_flow_security_health_is_reversible_until_shutdown() {
+        let readiness = ServiceReadiness::new();
+        readiness.mark_runtime_published();
+        readiness.mark_ingress_started();
+        assert!(readiness.is_ready());
+
+        readiness.mark_access_flow_security_unhealthy();
+        assert!(!readiness.is_ready());
+        readiness.mark_access_flow_security_healthy();
+        assert!(readiness.is_ready());
+
+        readiness.begin_shutdown();
+        readiness.mark_access_flow_security_healthy();
+        assert!(!readiness.is_ready());
     }
 }

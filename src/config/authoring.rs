@@ -447,7 +447,71 @@ pub(super) enum ListenerEndpointConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum AccessFlowTransportConfig {
-    Unix { path: PathBuf, mode: String },
+    Unix {
+        path: PathBuf,
+        mode: String,
+    },
+    TlsTcp {
+        bind: SocketAddr,
+        handshake_timeout: PositiveDuration,
+        server_identity: AccessFlowTlsServerIdentityConfig,
+        #[serde(default)]
+        abuse_control: AccessFlowTlsAbuseControlConfig,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AccessFlowTlsServerIdentityConfig {
+    pub certificate_chain: PathBuf,
+    pub private_key: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AccessFlowTlsAbuseControlConfig {
+    #[serde(default = "default_access_flow_tls_max_handshakes")]
+    pub max_handshakes: u16,
+    #[serde(default = "default_access_flow_tls_max_connections_per_source")]
+    pub max_connections_per_source: u16,
+    #[serde(default = "default_access_flow_tls_handshakes_per_second")]
+    pub handshakes_per_second: u16,
+    #[serde(default = "default_access_flow_tls_handshake_burst")]
+    pub handshake_burst: u16,
+    #[serde(default = "default_access_flow_tls_source_table_capacity")]
+    pub source_table_capacity: u32,
+}
+
+impl Default for AccessFlowTlsAbuseControlConfig {
+    fn default() -> Self {
+        Self {
+            max_handshakes: default_access_flow_tls_max_handshakes(),
+            max_connections_per_source: default_access_flow_tls_max_connections_per_source(),
+            handshakes_per_second: default_access_flow_tls_handshakes_per_second(),
+            handshake_burst: default_access_flow_tls_handshake_burst(),
+            source_table_capacity: default_access_flow_tls_source_table_capacity(),
+        }
+    }
+}
+
+fn default_access_flow_tls_max_handshakes() -> u16 {
+    access_flow_tls::DEFAULT_MAX_HANDSHAKES
+}
+
+fn default_access_flow_tls_max_connections_per_source() -> u16 {
+    access_flow_tls::DEFAULT_MAX_CONNECTIONS_PER_SOURCE
+}
+
+fn default_access_flow_tls_handshakes_per_second() -> u16 {
+    access_flow_tls::DEFAULT_HANDSHAKES_PER_SECOND
+}
+
+fn default_access_flow_tls_handshake_burst() -> u16 {
+    access_flow_tls::DEFAULT_HANDSHAKE_BURST
+}
+
+fn default_access_flow_tls_source_table_capacity() -> u32 {
+    access_flow_tls::DEFAULT_SOURCE_TABLE_CAPACITY
 }
 
 #[derive(Debug, Clone, Deserialize)]

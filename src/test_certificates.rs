@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use p256::ecdsa::{DerSignature, SigningKey};
@@ -38,6 +38,33 @@ pub(crate) struct TestTlsIdentity {
 
 impl TestTlsIdentity {
     pub(crate) fn new(host: &str) -> Self {
+        Self::new_between(
+            host,
+            UNIX_EPOCH
+                .checked_add(Duration::from_secs(NOT_BEFORE_UNIX_SECONDS))
+                .expect("test certificate not-before fits SystemTime"),
+            UNIX_EPOCH
+                .checked_add(Duration::from_secs(NOT_AFTER_UNIX_SECONDS))
+                .expect("test certificate not-after fits SystemTime"),
+        )
+    }
+
+    pub(crate) fn new_expiring_after(host: &str, lifetime: Duration) -> Self {
+        let now = SystemTime::now();
+        Self::new_between(
+            host,
+            now.checked_sub(Duration::from_secs(60))
+                .expect("short-lived test certificate not-before fits SystemTime"),
+            now.checked_add(lifetime)
+                .expect("short-lived test certificate not-after fits SystemTime"),
+        )
+    }
+
+    fn new_between(host: &str, not_before: SystemTime, not_after: SystemTime) -> Self {
+        let validity = || Validity {
+            not_before: Time::try_from(not_before).expect("encode test certificate not-before"),
+            not_after: Time::try_from(not_after).expect("encode test certificate not-after"),
+        };
         let root_key = SigningKey::random(&mut OsRng);
         let root_subject = name("acl-proxy test root");
         let root = CertificateBuilder::new(
@@ -184,19 +211,6 @@ fn name(common_name: &str) -> Name {
 fn subject_public_key_info(signing_key: &SigningKey) -> SubjectPublicKeyInfoOwned {
     SubjectPublicKeyInfoOwned::from_key(signing_key.verifying_key().to_owned())
         .expect("encode test certificate public key")
-}
-
-fn validity() -> Validity {
-    let not_before = UNIX_EPOCH
-        .checked_add(Duration::from_secs(NOT_BEFORE_UNIX_SECONDS))
-        .expect("test certificate not-before fits SystemTime");
-    let not_after = UNIX_EPOCH
-        .checked_add(Duration::from_secs(NOT_AFTER_UNIX_SECONDS))
-        .expect("test certificate not-after fits SystemTime");
-    Validity {
-        not_before: Time::try_from(not_before).expect("encode test certificate not-before"),
-        not_after: Time::try_from(not_after).expect("encode test certificate not-after"),
-    }
 }
 
 fn general_name(host: &str) -> GeneralName {

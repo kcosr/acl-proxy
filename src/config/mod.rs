@@ -5,7 +5,7 @@ mod facade;
 mod loader;
 mod policy_dump;
 mod provenance;
-mod source_snapshot;
+pub(crate) mod source_snapshot;
 mod template;
 
 pub(crate) use compiler::{

@@ -7,7 +7,7 @@ use std::{
         ffi::{OsStrExt, OsStringExt},
         io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle},
     },
-    path::Path,
+    path::{Component, Path, PrefixComponent},
     ptr,
 };
 
@@ -28,12 +28,13 @@ use windows_sys::Win32::{
         CreateFileW, FileBasicInfo, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo,
         FileIdInfo, FileStandardInfo, GetFileInformationByHandleEx, FILE_ATTRIBUTE_DEVICE,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_ID_BOTH_DIR_INFO, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, OPEN_EXISTING,
-        SYNCHRONIZE,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO, FILE_ID_INFO, FILE_LIST_DIRECTORY,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_STANDARD_INFO, FILE_TRAVERSE, OPEN_EXISTING, SYNCHRONIZE,
     },
     System::IO::IO_STATUS_BLOCK,
 };
+use zeroize::Zeroizing;
 
 use super::{MutationMetadata, ObjectIdentity, ObjectKind, ObjectMetadata};
 
@@ -58,15 +59,56 @@ impl FileHandle {
 }
 
 pub(super) fn open_parent(path: &Path) -> io::Result<DirectoryHandle> {
-    let wide = nul_terminated(path.as_os_str())?;
+    let mut components = path.components();
+    let prefix = match components.next() {
+        Some(Component::Prefix(prefix)) => prefix,
+        _ => return Err(invalid_absolute_path()),
+    };
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return Err(invalid_absolute_path());
+    }
+    let mut directory = open_root(prefix)?;
+    for component in components {
+        let Component::Normal(name) = component else {
+            return Err(invalid_absolute_path());
+        };
+        let (next, metadata) = open_ancestor_at(&directory, name)?;
+        if metadata.kind != ObjectKind::Directory {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "source ancestor is not a direct directory",
+            ));
+        }
+        directory = next;
+    }
+    Ok(directory)
+}
+
+fn open_root(prefix: PrefixComponent<'_>) -> io::Result<DirectoryHandle> {
+    use std::path::Prefix;
+
+    if !matches!(
+        prefix.kind(),
+        Prefix::Disk(_) | Prefix::VerbatimDisk(_) | Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _)
+    ) {
+        return Err(invalid_absolute_path());
+    }
+    let mut wide = prefix.as_os_str().encode_wide().collect::<Vec<_>>();
+    if wide.contains(&0) {
+        return Err(invalid_absolute_path());
+    }
+    if !matches!(wide.last(), Some(unit) if *unit == b'\\' as u16 || *unit == b'/' as u16) {
+        wide.push(b'\\' as u16);
+    }
+    wide.push(0);
     let raw = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             ptr::null(),
             OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
             ptr::null_mut(),
         )
     };
@@ -83,6 +125,21 @@ pub(super) fn open_parent(path: &Path) -> io::Result<DirectoryHandle> {
         ));
     }
     Ok(handle)
+}
+
+fn open_ancestor_at(
+    parent: &DirectoryHandle,
+    name: &OsStr,
+) -> io::Result<(DirectoryHandle, ObjectMetadata)> {
+    let handle = open_relative(
+        parent.raw(),
+        name,
+        FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+    )
+    .map_err(RelativeOpenError::into_io)?;
+    let metadata = metadata_by_handle(handle.as_raw_handle() as HANDLE)?;
+    Ok((DirectoryHandle(handle), metadata))
 }
 
 pub(super) fn probe_at(
@@ -264,6 +321,31 @@ pub(super) fn read_file_limited(
     Ok(output)
 }
 
+pub(super) fn read_sensitive_file_limited(
+    file: &mut FileHandle,
+    limit_plus_one: usize,
+) -> io::Result<Zeroizing<Vec<u8>>> {
+    let capacity = limit_plus_one.min(READ_BUFFER_BYTES);
+    let mut output = Zeroizing::new(Vec::new());
+    output
+        .try_reserve_exact(capacity)
+        .map_err(io::Error::other)?;
+    let mut buffer = Zeroizing::new([0_u8; READ_BUFFER_BYTES]);
+
+    while output.len() < limit_plus_one {
+        let remaining = limit_plus_one - output.len();
+        let read_limit = remaining.min(READ_BUFFER_BYTES);
+        let read = file.0.read(&mut buffer[..read_limit])?;
+        if read == 0 {
+            break;
+        }
+        output.try_reserve(read).map_err(io::Error::other)?;
+        output.extend_from_slice(&buffer[..read]);
+    }
+
+    Ok(output)
+}
+
 pub(super) fn metadata_file(file: &FileHandle) -> io::Result<ObjectMetadata> {
     metadata_by_handle(file.raw())
 }
@@ -422,16 +504,11 @@ fn windows_time_parts(value: i64) -> (i64, i64) {
     )
 }
 
-fn nul_terminated(value: &OsStr) -> io::Result<Vec<u16>> {
-    let mut wide = value.encode_wide().collect::<Vec<_>>();
-    if wide.contains(&0) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "path contains a NUL code unit",
-        ));
-    }
-    wide.push(0);
-    Ok(wide)
+fn invalid_absolute_path() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "source path is not an absolute normalized disk or UNC path",
+    )
 }
 
 fn relative_leaf(value: &OsStr) -> io::Result<Vec<u16>> {

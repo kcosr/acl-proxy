@@ -32,6 +32,10 @@ use crate::runtime::{BoxFuture, ServiceReadiness, StaticResourceBrand, StaticRes
 use crate::safety::WireBodyPool;
 use crate::tls_io_runtime::{TlsIoRuntime, TlsIoRuntimeError, TlsIoShutdownOutcome};
 
+use super::access_flow_security::{
+    AccessFlowSecurityMaterialError, AccessFlowSecurityMaterialRuntime,
+    AccessFlowSecuritySubscription,
+};
 use super::assets::{ProductIngressAssets, ProductIngressAssetsError};
 use super::listeners::{
     LocalAddressRefreshFailureObserver, PreparedProxyListeners, ProductListenerRuntime,
@@ -68,10 +72,12 @@ pub(crate) struct ProductStaticResources {
     >,
     listener_admission_closed: tokio::sync::OnceCell<()>,
     listener_shutdown: tokio::sync::OnceCell<()>,
+    access_flow_security_shutdown: tokio::sync::OnceCell<()>,
     local_addresses_shutdown: tokio::sync::OnceCell<()>,
     upgrade_shutdown: tokio::sync::OnceCell<()>,
     mitm_shutdown: tokio::sync::OnceCell<()>,
     ingress_assets: Arc<ProductIngressAssets>,
+    access_flow_security: Arc<AccessFlowSecurityMaterialRuntime>,
     ingress: Mutex<IngressOwnership>,
     control: Mutex<ControlOwnership>,
     wire_body_pool: Arc<WireBodyPool>,
@@ -413,8 +419,21 @@ impl ProductStaticResources {
                 }
             }
         }
+        let readiness = Arc::new(ServiceReadiness::new());
+        let access_flow_security = match AccessFlowSecurityMaterialRuntime::activate(
+            &static_config.listeners,
+            readiness.clone(),
+        )
+        .await
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                stages.shutdown().await;
+                return Err(error.into());
+            }
+        };
         let resources = Arc::new(Self {
-            readiness: Arc::new(ServiceReadiness::new()),
+            readiness,
             brand: StaticResourceBrand::new(),
             static_fingerprint,
             shutdown_drain_timeout: static_config.service.shutdown_drain_timeout,
@@ -432,10 +451,12 @@ impl ProductStaticResources {
             listener_shutdown_pause: Mutex::new(None),
             listener_admission_closed: tokio::sync::OnceCell::new(),
             listener_shutdown: tokio::sync::OnceCell::new(),
+            access_flow_security_shutdown: tokio::sync::OnceCell::new(),
             local_addresses_shutdown: tokio::sync::OnceCell::new(),
             upgrade_shutdown: tokio::sync::OnceCell::new(),
             mitm_shutdown: tokio::sync::OnceCell::new(),
             ingress_assets,
+            access_flow_security,
             ingress: Mutex::new(IngressOwnership {
                 config: static_config.listeners.clone(),
                 state: IngressState::Unprepared,
@@ -528,6 +549,16 @@ impl ProductStaticResources {
 
     pub(crate) fn identity_publisher(&self) -> Arc<IdentityPublisher> {
         Arc::clone(&self.identity_publisher)
+    }
+
+    pub(crate) fn access_flow_security_subscription(&self) -> AccessFlowSecuritySubscription {
+        self.access_flow_security.subscribe()
+    }
+
+    pub(crate) async fn reload_access_flow_security(
+        &self,
+    ) -> Result<(), AccessFlowSecurityMaterialError> {
+        self.access_flow_security.reload().await
     }
 
     pub(crate) fn ingress_assets(&self) -> &Arc<ProductIngressAssets> {
@@ -975,6 +1006,7 @@ impl StaticResources for ProductStaticResources {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = deadline;
         self.observation_runtime.begin_shutdown();
+        self.access_flow_security.begin_shutdown();
         self.credential_io_runtime.begin_shutdown();
         self.tls_io_runtime.begin_shutdown();
         self.authorization_runtime.begin_shutdown(deadline);
@@ -1077,6 +1109,9 @@ impl StaticResources for ProductStaticResources {
             self.listener_shutdown
                 .get_or_init(|| self.shutdown_listener_runtime())
                 .await;
+            self.access_flow_security_shutdown
+                .get_or_init(|| self.access_flow_security.shutdown())
+                .await;
             if let Some(local_addresses) = self.local_addresses.get() {
                 self.local_addresses_shutdown
                     .get_or_init(|| local_addresses.shutdown_and_join())
@@ -1127,6 +1162,8 @@ pub(crate) enum ProductStaticResourcesError {
     Observation(#[from] ProductObservationRuntimeStartError),
     #[error("static identity runtime construction failed")]
     Identity(#[from] IdentityActivationError),
+    #[error("static Access Flow TLS security material construction failed")]
+    AccessFlowSecurity(#[from] AccessFlowSecurityMaterialError),
     #[error("control server construction failed")]
     Control(#[from] ControlServerError),
     #[error(transparent)]

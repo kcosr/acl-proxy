@@ -236,6 +236,58 @@ path = "/Users/your-user/Library/Application Support/AW Gateway/runtime/transpar
 mode = "0600"
 ```
 
+The same Access Flow endpoint may use server-authenticated TLS/TCP for a relay
+on another host. Remote listeners require workload identity and use exact
+destination port 80 for transparent HTTP or 443 for transparent HTTPS:
+
+```toml
+[listeners.transparent_http]
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
+endpoint.allowed_destination_ports = [80]
+http_versions = ["http1"]
+max_connections = 1024
+
+[listeners.transparent_http.identity]
+mode = "required"
+
+[listeners.transparent_http.endpoint.transport]
+kind = "tls_tcp"
+bind = "0.0.0.0:7443"
+handshake_timeout = "5s"
+
+[listeners.transparent_http.endpoint.transport.server_identity]
+certificate_chain = "/etc/acl-proxy/access-flow-chain.pem"
+private_key = "/etc/acl-proxy/access-flow-key.pem"
+
+[listeners.transparent_http.endpoint.transport.abuse_control]
+max_handshakes = 128
+max_connections_per_source = 8
+handshakes_per_second = 4
+handshake_burst = 8
+source_table_capacity = 4096
+```
+
+TLS/TCP is TLS 1.3 only and requires ALPN `aw-access-flow/1`. The relay
+authenticates the proxy certificate with its configured name and PEM trust
+bundle; the proxy does not request a client certificate. The AWAF bearer is the
+sole workload authentication input. A remote socket source is used only for
+transport abuse control and is never exposed to ACLs, delegates, captures, or
+decision logs. Remote policy has no source-CIDR fact, and its fixed diagnostic
+client value is `0.0.0.0:0` (`0.0.0.0` in provider and decision-log fields).
+Wire-body quotas use the resolved authority-qualified principal.
+
+The certificate chain and private key are read from bounded, stable, direct,
+single-link files. Unix uses no-follow descriptor traversal and requires the
+private key to be owner-only. Windows uses the same handle-pinned, reparse-safe
+snapshot contract as configuration loading. `acl-proxy config validate`
+performs the same material validation as startup without binding the listener.
+
+One fixed listener coordinator continues accepting TCP candidates while
+handshake, preface, and bearer operations are in flight. Global, per-source,
+rate, and handshake capacity are acquired synchronously without waiting;
+overflow candidates are closed without spawning admission tasks.
+
 The workstation host path must be inside a user-writable runtime directory
 owned by the workstation user and protected with mode `0700`; the placeholder
 above must be replaced with that user's actual home path. Mode `0600` keeps the
@@ -912,11 +964,15 @@ acl-proxy config validate --config /etc/acl-proxy/acl-proxy.toml
 acl-proxy policy dump --format table --config /etc/acl-proxy/acl-proxy.toml
 ```
 
-`SIGHUP` compiles and activates a complete reloadable generation. Invalid TOML,
-an invalid schema, activation failure, or a rejected static change leaves the
-current generation published and readiness unchanged; a later corrected reload
-can publish normally. Static listener, control, filesystem ownership, and
-process-wide resource changes are rejected as static changes.
+`SIGHUP` independently reloads the policy/configuration generation and Access
+Flow TLS server identities from their unchanged static locators. A policy
+failure leaves the current policy generation published. A TLS identity failure
+closes every new Access Flow admission, including Unix listeners, and changes
+readiness to HTTP 503; existing admitted flows retain their generation and
+drain. A later valid TLS identity reload atomically reopens admission and
+readiness. Leaf expiry has the same fail-closed admission behavior. Static
+listener, control, filesystem ownership, and process-wide resource changes
+remain restart-required.
 
 `SIGINT` and `SIGTERM` initiate joined graceful shutdown and continue to be
 polled while admitted work drains within `service.shutdown_drain_timeout`.

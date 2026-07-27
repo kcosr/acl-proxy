@@ -5,9 +5,12 @@ use http_access_runtime::{
     OriginalDestinationProvider, StandaloneRequestFactory,
 };
 
+use super::access_flow_security::AccessFlowSecurityMaterialError;
 use crate::config::LoadedCompiledConfig;
 use crate::observation::ProductObservationRuntime;
-use crate::runtime::{GenerationId, Runtime, RuntimeError, StaticOwnership, StaticResources};
+use crate::runtime::{
+    GenerationId, ReloadTriggerResult, Runtime, RuntimeError, StaticOwnership, StaticResources,
+};
 
 use super::listeners::{
     AccessFlowListenerRuntime, PreparedProxyListeners, ProductListenerRuntime,
@@ -33,6 +36,11 @@ pub(crate) struct ProductRuntime {
 pub(crate) struct InitialActivationResult {
     pub(crate) generation: GenerationId,
     pub(crate) policy_source_summary: crate::config::PolicySourceSummary,
+}
+
+pub(crate) struct ProductReloadResult {
+    pub(crate) configuration: Result<ReloadTriggerResult, RuntimeError>,
+    pub(crate) access_flow_security: Result<(), AccessFlowSecurityMaterialError>,
 }
 
 struct ProductListenerFailureObserver {
@@ -289,14 +297,16 @@ impl ProductRuntime {
             return Err(ProductRuntimeError::InitialGenerationNotPublished);
         }
         let prepared = self.take_prepared_proxy_listeners_for_start()?;
-        let inputs =
-            match prepared.into_runtime_inputs_with_transparent_support(transparent_supported) {
-                Ok(bundle) => bundle,
-                Err(error) => {
-                    self.shutdown().await;
-                    return Err(error.into());
-                }
-            };
+        let inputs = match prepared.into_runtime_inputs_with_transparent_support(
+            transparent_supported,
+            self.static_resources.access_flow_security_subscription(),
+        ) {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                self.shutdown().await;
+                return Err(error.into());
+            }
+        };
         let assets = self.static_resources.ingress_assets();
         let tcp_tls = ListenerTlsAcceptors::new(
             assets.static_https(),
@@ -427,6 +437,17 @@ impl ProductRuntime {
         }
     }
 
+    pub(crate) async fn trigger_reload(&self) -> ProductReloadResult {
+        let (configuration, access_flow_security) = tokio::join!(
+            self.runtime.trigger_reload(),
+            self.static_resources.reload_access_flow_security(),
+        );
+        ProductReloadResult {
+            configuration,
+            access_flow_security,
+        }
+    }
+
     pub(crate) async fn shutdown(&self) {
         self.runtime.shutdown().await;
     }
@@ -461,10 +482,15 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    #[cfg(unix)]
+    use std::path::PathBuf;
     use std::time::Duration;
 
-    use access_flow::{write_access_flow_preface, AccessFlowDestination};
-    use access_identity::{IdentityPresentation, SensitiveBearer};
+    use access_flow::{write_access_flow_preface, AccessFlowDestination, AccessFlowPreface};
+    use access_identity::{
+        AuthorityId, IdentityPresentation, PrincipalId, PrincipalKind, PrincipalRef,
+        SensitiveBearer,
+    };
     use bytes::Bytes;
     use flate2::write::GzEncoder;
     use flate2::Compression;
@@ -568,6 +594,63 @@ default = "deny"
             message.extend_from_slice(&buffer[..count]);
         }
         message
+    }
+
+    #[cfg(unix)]
+    fn remote_tls_test_identity(
+        prefix: &str,
+    ) -> (tempfile::TempDir, TestTlsIdentity, PathBuf, PathBuf) {
+        let directory = tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(std::env::var_os("HOME").expect("HOME is configured"))
+            .unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let identity = TestTlsIdentity::new("localhost");
+        let certificate_path = directory.path().join("server-chain.pem");
+        let private_key_path = directory.path().join("server-key.pem");
+        crate::filesystem::write_public_file(&certificate_path, identity.certificate_chain_pem())
+            .unwrap();
+        crate::filesystem::write_private_file(&private_key_path, identity.private_key_pem())
+            .unwrap();
+        (directory, identity, certificate_path, private_key_path)
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_tls_adapter_snapshot(
+        adapter: &access_flow_tls::TlsAccessFlowServerAdapter,
+        predicate: impl Fn(access_flow_tls::TlsAccessFlowAdapterSnapshot) -> bool,
+    ) -> access_flow_tls::TlsAccessFlowAdapterSnapshot {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = adapter.snapshot();
+                if predicate(snapshot) {
+                    return snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("TLS Access Flow adapter did not reach the expected state")
+    }
+
+    #[cfg(unix)]
+    async fn assert_stream_closes_promptly(stream: &mut (impl AsyncRead + Unpin)) {
+        let mut byte = [0_u8; 1];
+        let closed = tokio::time::timeout(Duration::from_millis(250), stream.read(&mut byte))
+            .await
+            .expect("rejected TLS Access Flow remained open");
+        assert!(
+            matches!(closed, Ok(0))
+                || closed.is_err_and(|error| {
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::BrokenPipe
+                    )
+                }),
+            "rejected TLS Access Flow produced application bytes"
+        );
     }
 
     async fn h2_identity_request(
@@ -714,9 +797,11 @@ methods = ["POST"]
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
         let reservations = super::super::reserve_listeners::<2>(&_test);
         let addresses = reservations.addresses();
-        let origin = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
+        let origin = Arc::new(
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap(),
+        );
         let origin_address = origin.local_addr().unwrap();
         let extra = format!(
             r#"[[policy.rules]]
@@ -1378,7 +1463,7 @@ methods = ["GET"]
 "#,
             addresses[0], socket_path
         );
-        fs::write(&config_path, text).unwrap();
+        fs::write(&config_path, &text).unwrap();
         let loaded = load_and_compile_exact_config(&config_path).unwrap();
         unsafe {
             std::env::set_var(VARIABLE, BEARER);
@@ -1494,6 +1579,1726 @@ methods = ["GET"]
         product.shutdown().await;
         assert!(socket_path.exists());
         fs::remove_file(&socket_path).unwrap();
+        super::super::assert_listener_addresses_released(&_test, addresses);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_access_flow_security_change_closes_pending_admission_but_drains_active_flow() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let reservations = super::super::reserve_listeners::<1>(&_test);
+        let addresses = reservations.addresses();
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let socket_path = directory.path().join("unix-security-reload.sock");
+        let config_path = directory.path().join("acl-proxy.toml");
+        let origin = Arc::new(
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap(),
+        );
+        let origin_address = origin.local_addr().unwrap();
+        let (_identity_directory, _identity, certificate_path, private_key_path) =
+            remote_tls_test_identity(".acl-proxy-unix-security-reload-");
+        const VARIABLE: &str = "AW_UNIX_SECURITY_RELOAD_IDENTITY_TOKEN";
+        const BEARER: &str = "unix-security-reload-identity-bearer-00000000000";
+        let text = format!(
+            r#"schema_version = 4
+
+[service]
+request_timeout = "5s"
+shutdown_drain_timeout = "1s"
+
+[listeners.transparent_http]
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "5s"
+endpoint.allowed_destination_ports = [80]
+http_versions = ["http1"]
+max_connections = 4
+
+[listeners.transparent_http.identity]
+mode = "required"
+
+[listeners.transparent_http.endpoint.transport]
+kind = "unix"
+path = {:?}
+mode = "0600"
+
+[listeners.transparent_https]
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
+endpoint.allowed_destination_ports = [443]
+http_versions = ["http1"]
+handshake_timeout = "1s"
+max_connections = 2
+
+[listeners.transparent_https.identity]
+mode = "required"
+
+[listeners.transparent_https.endpoint.transport]
+kind = "tls_tcp"
+bind = "{}"
+handshake_timeout = "2s"
+
+[listeners.transparent_https.endpoint.transport.server_identity]
+certificate_chain = {:?}
+private_key = {:?}
+
+[listeners.transparent_https.endpoint.transport.abuse_control]
+max_handshakes = 2
+max_connections_per_source = 2
+handshakes_per_second = 100
+handshake_burst = 100
+source_table_capacity = 4
+
+[identity]
+max_pending_authentications = 4
+max_pending_authentications_per_connection = 1
+
+[identity.resolver]
+kind = "static"
+authority = "unix-security-reload"
+
+[[identity.resolver.principals]]
+id = "unix-workload"
+kind = "service_account"
+
+[[identity.resolver.tokens]]
+id = "unix-workload-primary"
+principal = "unix-workload"
+source = "environment"
+variable = "{VARIABLE}"
+
+[mitm]
+mode = "generated"
+directory = "mitm"
+
+[egress]
+route = "direct"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "unix-security-drain"
+decision = "allow"
+urls = ["http://origin.example.test/drain"]
+methods = ["GET"]
+"#,
+            socket_path, addresses[0], certificate_path, private_key_path
+        );
+        fs::write(&config_path, text).unwrap();
+        unsafe {
+            std::env::set_var(VARIABLE, BEARER);
+        }
+        let loaded = load_and_compile_exact_config(&config_path).unwrap();
+        let identity_sources = crate::identity::IdentitySourceRegistry::activate().unwrap();
+        identity_sources
+            .preload(&loaded.compiled.reloadable_plan)
+            .unwrap();
+        let origin_url =
+            http_access_url::canonicalize_http_url("http://origin.example.test/").unwrap();
+        let network = Arc::new(
+            http_access_runtime::ForwardingDevHarness::new(
+                http_access_runtime::ForwardingNetworkFacts::new(
+                    vec![addresses[0]],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .map_prebound(&origin_url, origin_address)
+            .unwrap()
+            .into_standalone_guard(),
+        );
+        let product =
+            ProductRuntime::prepare_from_prebound_with_forwarding_network_and_identity_sources(
+                loaded,
+                reservations.into_listeners(),
+                network,
+                identity_sources,
+            )
+            .await
+            .unwrap();
+        product.activate_initial().await.unwrap();
+        product.start_listeners().await.unwrap();
+
+        let (origin_active_send, origin_active_receive) = oneshot::channel();
+        let (origin_release_send, origin_release_receive) = oneshot::channel();
+        let active_origin = Arc::clone(&origin);
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = active_origin.accept().await.unwrap();
+            let request = read_http_message(&mut stream).await;
+            assert!(request.starts_with(b"GET /drain HTTP/1.1\r\n"));
+            origin_active_send.send(()).unwrap();
+            origin_release_receive.await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ndrained",
+                )
+                .await
+                .unwrap();
+        });
+
+        let presentation =
+            IdentityPresentation::Bearer(SensitiveBearer::new(BEARER.as_bytes()).unwrap());
+        let mut active = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        write_access_flow_preface(
+            &mut active,
+            AccessFlowDestination::new("203.0.113.8".parse().unwrap(), 80).unwrap(),
+            &presentation,
+        )
+        .await
+        .unwrap();
+        active
+            .write_all(
+                b"GET /drain HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), origin_active_receive)
+            .await
+            .expect("Unix Access Flow was not fully admitted before reload")
+            .unwrap();
+
+        let pending_preface = AccessFlowPreface::new(
+            AccessFlowDestination::new("203.0.113.9".parse().unwrap(), 80).unwrap(),
+            IdentityPresentation::Bearer(SensitiveBearer::new(BEARER.as_bytes()).unwrap()),
+        );
+        let partial_preface = pending_preface.expose_encoded(|encoded| {
+            assert!(encoded.len() > access_flow::ACCESS_FLOW_HEADER_LEN);
+            encoded[..encoded.len() - 1].to_vec()
+        });
+        let mut pending = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        pending.write_all(&partial_preface).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        fs::write(&private_key_path, b"invalid private key").unwrap();
+        let failed_reload = product.trigger_reload().await;
+        assert!(failed_reload.configuration.is_ok());
+        assert!(failed_reload.access_flow_security.is_err());
+        assert!(!product.runtime().is_ready());
+        assert_stream_closes_promptly(&mut pending).await;
+
+        let mut rejected = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        assert_stream_closes_promptly(&mut rejected).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), active.read_u8())
+                .await
+                .is_err(),
+            "fully admitted Unix Access Flow closed during security reload"
+        );
+
+        origin_release_send.send(()).unwrap();
+        let response = read_http_message(&mut active).await;
+        assert!(response.ends_with(b"\r\n\r\ndrained"));
+        origin_task.await.unwrap();
+
+        product.shutdown().await;
+        assert!(socket_path.exists());
+        fs::remove_file(&socket_path).unwrap();
+        super::super::assert_listener_addresses_released(&_test, addresses);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_tls_access_flow_requires_bearer_and_uses_the_http_pipeline() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let reservations = super::super::reserve_listeners::<1>(&_test);
+        let addresses = reservations.addresses();
+        let config_directory = tempdir().unwrap();
+        let identity_directory = tempfile::Builder::new()
+            .prefix(".acl-proxy-remote-tls-")
+            .tempdir_in(std::env::var_os("HOME").expect("HOME is configured"))
+            .unwrap();
+        fs::set_permissions(identity_directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let identity = TestTlsIdentity::new("localhost");
+        let certificate_path = identity_directory.path().join("server-chain.pem");
+        let private_key_path = identity_directory.path().join("server-key.pem");
+        crate::filesystem::write_public_file(&certificate_path, identity.certificate_chain_pem())
+            .unwrap();
+        crate::filesystem::write_private_file(&private_key_path, identity.private_key_pem())
+            .unwrap();
+        let config_path = config_directory.path().join("acl-proxy.toml");
+        let origin = Arc::new(
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap(),
+        );
+        let origin_address = origin.local_addr().unwrap();
+        const VARIABLE: &str = "AW_REMOTE_TLS_PRODUCT_IDENTITY_TOKEN";
+        const BEARER: &str = "remote-tls-product-identity-bearer-000000000000";
+        let text = format!(
+            r#"schema_version = 4
+
+[service]
+request_timeout = "5s"
+shutdown_drain_timeout = "1s"
+
+[listeners.transparent_http]
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
+endpoint.allowed_destination_ports = [80]
+http_versions = ["http1"]
+max_connections = 8
+
+[listeners.transparent_http.identity]
+mode = "required"
+
+[listeners.transparent_http.endpoint.transport]
+kind = "tls_tcp"
+bind = "{}"
+handshake_timeout = "2s"
+
+[listeners.transparent_http.endpoint.transport.server_identity]
+certificate_chain = {:?}
+private_key = {:?}
+
+[listeners.transparent_http.endpoint.transport.abuse_control]
+max_handshakes = 4
+max_connections_per_source = 8
+handshakes_per_second = 100
+handshake_burst = 100
+source_table_capacity = 16
+
+[identity]
+max_pending_authentications = 8
+max_pending_authentications_per_connection = 2
+
+[identity.resolver]
+kind = "static"
+authority = "remote-tls-product"
+
+[[identity.resolver.principals]]
+id = "test-workload"
+kind = "service_account"
+
+[[identity.resolver.tokens]]
+id = "test-workload-primary"
+principal = "test-workload"
+source = "environment"
+variable = "{VARIABLE}"
+
+[egress]
+route = "direct"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "remote-tls"
+decision = "allow"
+urls = ["http://origin.example.test/**"]
+methods = ["GET"]
+"#,
+            addresses[0], certificate_path, private_key_path
+        );
+        fs::write(&config_path, &text).unwrap();
+        let loaded = load_and_compile_exact_config(&config_path).unwrap();
+        unsafe {
+            std::env::set_var(VARIABLE, BEARER);
+        }
+        let identity_sources = crate::identity::IdentitySourceRegistry::activate().unwrap();
+        identity_sources
+            .preload(&loaded.compiled.reloadable_plan)
+            .unwrap();
+
+        let origin_url =
+            http_access_url::canonicalize_http_url("http://origin.example.test/").unwrap();
+        let network = Arc::new(
+            http_access_runtime::ForwardingDevHarness::new(
+                http_access_runtime::ForwardingNetworkFacts::new(
+                    vec![addresses[0]],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .map_prebound(&origin_url, origin_address)
+            .unwrap()
+            .into_standalone_guard(),
+        );
+        let product =
+            ProductRuntime::prepare_from_prebound_with_forwarding_network_and_identity_sources(
+                loaded,
+                reservations.into_listeners(),
+                network,
+                identity_sources,
+            )
+            .await
+            .unwrap();
+        product.activate_initial().await.unwrap();
+        product.start_listeners().await.unwrap();
+
+        let wrong_alpn = TlsConnector::from(Arc::new(client_config_for_roots(
+            [identity.root_certificate_der()],
+            &[b"wrong-access-flow/1"],
+        )));
+        let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        assert!(
+            wrong_alpn
+                .connect(ServerName::try_from("localhost").unwrap(), tcp)
+                .await
+                .is_err(),
+            "a TLS client without the exact Access Flow ALPN completed"
+        );
+
+        let connector = TlsConnector::from(Arc::new(client_config_for_roots(
+            [identity.root_certificate_der()],
+            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN],
+        )));
+        let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        let mut anonymous = connector
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .unwrap();
+        write_access_flow_preface(
+            &mut anonymous,
+            AccessFlowDestination::new("203.0.113.8".parse().unwrap(), 80).unwrap(),
+            &IdentityPresentation::Anonymous,
+        )
+        .await
+        .unwrap();
+        anonymous
+            .write_all(
+                b"GET /anonymous HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut rejected = [0_u8; 1];
+        let rejected = tokio::time::timeout(Duration::from_secs(1), anonymous.read(&mut rejected))
+            .await
+            .expect("anonymous remote Access Flow was not rejected");
+        assert!(
+            matches!(rejected, Ok(0))
+                || rejected.is_err_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof),
+            "anonymous remote Access Flow produced application bytes"
+        );
+
+        let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        let mut unknown_bearer = connector
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .unwrap();
+        write_access_flow_preface(
+            &mut unknown_bearer,
+            AccessFlowDestination::new("203.0.113.8".parse().unwrap(), 80).unwrap(),
+            &IdentityPresentation::Bearer(
+                SensitiveBearer::new(b"unknown-remote-tls-bearer-000000000000000000").unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        unknown_bearer
+            .write_all(
+                b"GET /unknown HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        assert_stream_closes_promptly(&mut unknown_bearer).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), origin.accept())
+                .await
+                .is_err(),
+            "an unknown bearer reached HTTP forwarding or the mapped upstream"
+        );
+
+        let request_origin = Arc::clone(&origin);
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = request_origin.accept().await.unwrap();
+            let request = read_http_message(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\naccepted",
+                )
+                .await
+                .unwrap();
+            request
+        });
+
+        let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        let mut channel = connector
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .unwrap();
+        assert_eq!(
+            channel.get_ref().1.protocol_version(),
+            Some(rustls::ProtocolVersion::TLSv1_3)
+        );
+        assert_eq!(
+            channel.get_ref().1.alpn_protocol(),
+            Some(access_flow_tls::ACCESS_FLOW_TLS_ALPN)
+        );
+        write_access_flow_preface(
+            &mut channel,
+            AccessFlowDestination::new("203.0.113.8".parse().unwrap(), 80).unwrap(),
+            &IdentityPresentation::Bearer(SensitiveBearer::new(BEARER.as_bytes()).unwrap()),
+        )
+        .await
+        .unwrap();
+        channel
+            .write_all(
+                b"GET /remote HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let response = read_http_message(&mut channel).await;
+        assert!(response.starts_with(b"HTTP/1.1 200 "));
+        assert!(response.ends_with(b"\r\n\r\naccepted"));
+        let request = String::from_utf8(origin_task.await.unwrap())
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(request.starts_with("get /remote http/1.1\r\n"));
+        assert!(!request.contains("x-aw-identity-token"));
+
+        let old_security = product
+            .static_resources
+            .access_flow_security_subscription()
+            .current_tls_route(
+                super::super::access_flow_security::AccessFlowTlsRouteId::TransparentHttp,
+            )
+            .unwrap();
+        let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        let mut active_before_rotation = connector
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .unwrap();
+        write_access_flow_preface(
+            &mut active_before_rotation,
+            AccessFlowDestination::new("203.0.113.8".parse().unwrap(), 80).unwrap(),
+            &IdentityPresentation::Bearer(SensitiveBearer::new(BEARER.as_bytes()).unwrap()),
+        )
+        .await
+        .unwrap();
+        wait_for_tls_adapter_snapshot(&old_security.adapter, |snapshot| {
+            snapshot.active_channels() == 1 && snapshot.held_source_permits() == 1
+        })
+        .await;
+        let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        let mut stale_candidate = connector
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .unwrap();
+        wait_for_tls_adapter_snapshot(&old_security.adapter, |snapshot| {
+            snapshot.held_preface_permits() == 1 && snapshot.held_global_permits() == 1
+        })
+        .await;
+
+        let rotated_identity = TestTlsIdentity::new("localhost");
+        fs::write(&certificate_path, rotated_identity.certificate_chain_pem()).unwrap();
+        fs::write(&private_key_path, rotated_identity.private_key_pem()).unwrap();
+        let successful_rotation = product.trigger_reload().await;
+        assert!(successful_rotation.configuration.is_ok());
+        assert!(successful_rotation.access_flow_security.is_ok());
+        assert!(product.runtime().is_ready());
+        assert_stream_closes_promptly(&mut stale_candidate).await;
+        wait_for_tls_adapter_snapshot(&old_security.adapter, |snapshot| {
+            snapshot.connecting_channels() == 0
+                && snapshot.active_channels() == 1
+                && snapshot.held_global_permits() == 0
+                && snapshot.held_handshake_permits() == 0
+                && snapshot.held_preface_permits() == 0
+                && snapshot.held_source_permits() == 1
+        })
+        .await;
+        let rotated_origin = Arc::clone(&origin);
+        let rotated_origin_task = tokio::spawn(async move {
+            let (mut stream, _) = rotated_origin.accept().await.unwrap();
+            let request = read_http_message(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nrotated",
+                )
+                .await
+                .unwrap();
+            request
+        });
+        active_before_rotation
+            .write_all(
+                b"GET /after-successful-rotation HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let response = read_http_message(&mut active_before_rotation).await;
+        assert!(response.ends_with(b"\r\n\r\nrotated"));
+        assert!(rotated_origin_task
+            .await
+            .unwrap()
+            .starts_with(b"GET /after-successful-rotation HTTP/1.1\r\n"));
+        drop(active_before_rotation);
+        wait_for_tls_adapter_snapshot(&old_security.adapter, |snapshot| {
+            snapshot.active_channels() == 0 && snapshot.held_source_permits() == 0
+        })
+        .await;
+
+        let new_security = product
+            .static_resources
+            .access_flow_security_subscription()
+            .current_tls_route(
+                super::super::access_flow_security::AccessFlowTlsRouteId::TransparentHttp,
+            )
+            .unwrap();
+        assert_ne!(new_security.generation, old_security.generation);
+        let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        assert!(
+            connector
+                .connect(ServerName::try_from("localhost").unwrap(), tcp)
+                .await
+                .is_err(),
+            "the old trust root authenticated the rotated server identity"
+        );
+        let rotated_connector = TlsConnector::from(Arc::new(client_config_for_roots(
+            [rotated_identity.root_certificate_der()],
+            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN],
+        )));
+        let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        let mut rotated_candidate = rotated_connector
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .unwrap();
+        write_access_flow_preface(
+            &mut rotated_candidate,
+            AccessFlowDestination::new("203.0.113.8".parse().unwrap(), 80).unwrap(),
+            &IdentityPresentation::Bearer(SensitiveBearer::new(BEARER.as_bytes()).unwrap()),
+        )
+        .await
+        .unwrap();
+        wait_for_tls_adapter_snapshot(&new_security.adapter, |snapshot| {
+            snapshot.active_channels() == 1
+                && snapshot.held_global_permits() == 0
+                && snapshot.held_preface_permits() == 0
+        })
+        .await;
+
+        fs::write(&private_key_path, b"invalid private key").unwrap();
+        let failed_material_reload = product.trigger_reload().await;
+        assert!(failed_material_reload.configuration.is_ok());
+        assert!(failed_material_reload.access_flow_security.is_err());
+        assert!(!product.runtime().is_ready());
+        let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        let rejected_after_failed_reload = tokio::time::timeout(
+            Duration::from_millis(500),
+            rotated_connector.connect(ServerName::try_from("localhost").unwrap(), tcp),
+        )
+        .await
+        .expect("new TLS admission stalled after a failed security-material reload");
+        assert!(
+            rejected_after_failed_reload.is_err(),
+            "new TLS admission completed after a failed security-material reload"
+        );
+        let failed_reload_origin = Arc::clone(&origin);
+        let failed_reload_origin_task = tokio::spawn(async move {
+            let (mut stream, _) = failed_reload_origin.accept().await.unwrap();
+            let request = read_http_message(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nretained",
+                )
+                .await
+                .unwrap();
+            request
+        });
+        rotated_candidate
+            .write_all(
+                b"GET /after-failed-rotation HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let response = read_http_message(&mut rotated_candidate).await;
+        assert!(response.ends_with(b"\r\n\r\nretained"));
+        assert!(failed_reload_origin_task
+            .await
+            .unwrap()
+            .starts_with(b"GET /after-failed-rotation HTTP/1.1\r\n"));
+        drop(rotated_candidate);
+        wait_for_tls_adapter_snapshot(&new_security.adapter, |snapshot| {
+            snapshot.active_channels() == 0 && snapshot.held_source_permits() == 0
+        })
+        .await;
+
+        let recovered_identity =
+            TestTlsIdentity::new_expiring_after("localhost", Duration::from_secs(2));
+        fs::write(
+            &certificate_path,
+            recovered_identity.certificate_chain_pem(),
+        )
+        .unwrap();
+        fs::write(&private_key_path, recovered_identity.private_key_pem()).unwrap();
+        fs::write(&config_path, b"not valid TOML").unwrap();
+        let failed_config_reload = product.trigger_reload().await;
+        assert!(failed_config_reload.configuration.is_err());
+        assert!(failed_config_reload.access_flow_security.is_ok());
+        assert!(product.runtime().is_ready());
+
+        let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        assert!(
+            rotated_connector
+                .connect(ServerName::try_from("localhost").unwrap(), tcp)
+                .await
+                .is_err(),
+            "rotation continued serving the previous TLS identity"
+        );
+        let recovered_connector = TlsConnector::from(Arc::new(client_config_for_roots(
+            [recovered_identity.root_certificate_der()],
+            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN],
+        )));
+        let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        recovered_connector
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .expect("rotated TLS identity was not published");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while product.runtime().is_ready() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("published TLS identity expiry did not close product readiness");
+        let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        let rejected_after_expiry = tokio::time::timeout(
+            Duration::from_millis(500),
+            recovered_connector.connect(ServerName::try_from("localhost").unwrap(), tcp),
+        )
+        .await
+        .expect("new TLS admission stalled after server-identity expiry");
+        assert!(
+            rejected_after_expiry.is_err(),
+            "new TLS admission completed after server-identity expiry"
+        );
+
+        product.shutdown().await;
+        super::super::assert_listener_addresses_released(&_test, addresses);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_tls_access_flow_projects_provider_client_and_principal_wire_quota() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let reservations = super::super::reserve_listeners::<1>(&_test);
+        let addresses = reservations.addresses();
+        let config_directory = tempdir().unwrap();
+        let (_identity_directory, identity, certificate_path, private_key_path) =
+            remote_tls_test_identity(".acl-proxy-remote-gate-a-");
+        let provider_script = config_directory.path().join("provider.py");
+        let provider_log = config_directory.path().join("provider.jsonl");
+        let provider_release = config_directory.path().join("provider.release");
+        fs::write(
+            &provider_script,
+            r#"import json, os, sys, time
+pending = []
+for line in sys.stdin:
+    request = json.loads(line)
+    pending.append(request)
+    with open(sys.argv[1], "a", encoding="utf-8") as output:
+        output.write(json.dumps(request, separators=(",", ":")) + "\n")
+    if len(pending) == 3:
+        while not os.path.exists(sys.argv[2]):
+            time.sleep(0.01)
+        for item in pending:
+            print(json.dumps({"id": item["id"], "type": "response", "decision": "allow"}, separators=(",", ":")), flush=True)
+        pending.clear()
+"#,
+        )
+        .unwrap();
+        let origin = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let config_path = config_directory.path().join("acl-proxy.toml");
+        const TOKEN_A: &str = "AW_REMOTE_TLS_GATE_A_IDENTITY_TOKEN";
+        const TOKEN_B: &str = "AW_REMOTE_TLS_GATE_B_IDENTITY_TOKEN";
+        const BEARER_A: &str = "remote-tls-gate-a-bearer-a-000000000000000";
+        const BEARER_B: &str = "remote-tls-gate-a-bearer-b-000000000000000";
+        let text = format!(
+            r#"schema_version = 4
+
+[service]
+request_timeout = "10s"
+shutdown_drain_timeout = "1s"
+
+[listeners.transparent_http]
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
+endpoint.allowed_destination_ports = [80]
+http_versions = ["http1"]
+max_connections = 8
+
+[listeners.transparent_http.identity]
+mode = "required"
+
+[listeners.transparent_http.endpoint.transport]
+kind = "tls_tcp"
+bind = "{}"
+handshake_timeout = "2s"
+
+[listeners.transparent_http.endpoint.transport.server_identity]
+certificate_chain = {:?}
+private_key = {:?}
+
+[listeners.transparent_http.endpoint.transport.abuse_control]
+max_handshakes = 4
+max_connections_per_source = 8
+handshakes_per_second = 100
+handshake_burst = 100
+source_table_capacity = 16
+
+[identity]
+max_pending_authentications = 8
+max_pending_authentications_per_connection = 2
+
+[identity.resolver]
+kind = "static"
+authority = "remote-tls-gate-a"
+
+[[identity.resolver.principals]]
+id = "principal-a"
+kind = "service_account"
+
+[[identity.resolver.principals]]
+id = "principal-b"
+kind = "service_account"
+
+[[identity.resolver.tokens]]
+id = "principal-a-token"
+principal = "principal-a"
+source = "environment"
+variable = "{TOKEN_A}"
+
+[[identity.resolver.tokens]]
+id = "principal-b-token"
+principal = "principal-b"
+source = "environment"
+variable = "{TOKEN_B}"
+
+[authorization.providers.audit]
+kind = "process"
+command = "/usr/bin/python3"
+args = [{:?}, {:?}, {:?}]
+timeout = "10s"
+include_identity = true
+include_request_body = true
+max_request_body_bytes = 1024
+max_decoded_request_body_bytes = 1024
+max_pending_requests = 8
+
+[egress]
+route = "direct"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "remote-gate-a"
+decision = "delegate"
+authorization_provider = "audit"
+urls = ["http://origin.example.test/**"]
+methods = ["POST"]
+"#,
+            addresses[0],
+            certificate_path,
+            private_key_path,
+            provider_script,
+            provider_log,
+            provider_release,
+        );
+        fs::write(&config_path, text).unwrap();
+        let loaded = load_and_compile_exact_config(&config_path).unwrap();
+        unsafe {
+            std::env::set_var(TOKEN_A, BEARER_A);
+            std::env::set_var(TOKEN_B, BEARER_B);
+        }
+        let identity_sources = crate::identity::IdentitySourceRegistry::activate().unwrap();
+        identity_sources
+            .preload(&loaded.compiled.reloadable_plan)
+            .unwrap();
+
+        let origin_url =
+            http_access_url::canonicalize_http_url("http://origin.example.test/").unwrap();
+        let network = Arc::new(
+            http_access_runtime::ForwardingDevHarness::new(
+                http_access_runtime::ForwardingNetworkFacts::new(
+                    vec![addresses[0]],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .map_prebound(&origin_url, origin_address)
+            .unwrap()
+            .into_standalone_guard(),
+        );
+        let product =
+            ProductRuntime::prepare_from_prebound_with_forwarding_network_and_identity_sources(
+                loaded,
+                reservations.into_listeners(),
+                network,
+                identity_sources,
+            )
+            .await
+            .unwrap();
+        product.activate_initial().await.unwrap();
+        product.start_listeners().await.unwrap();
+
+        let origin_task = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut stream, _) = origin.accept().await.unwrap();
+                let request = read_http_message(&mut stream).await;
+                assert!(request.ends_with(b"\r\n\r\ndata"));
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let connector = TlsConnector::from(Arc::new(client_config_for_roots(
+            [identity.root_certificate_der()],
+            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN],
+        )));
+        let send = |bearer: &'static str| {
+            let connector = connector.clone();
+            async move {
+                let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+                let mut channel = connector
+                    .connect(ServerName::try_from("localhost").unwrap(), tcp)
+                    .await
+                    .unwrap();
+                write_access_flow_preface(
+                    &mut channel,
+                    AccessFlowDestination::new("203.0.113.8".parse().unwrap(), 80).unwrap(),
+                    &IdentityPresentation::Bearer(SensitiveBearer::new(bearer.as_bytes()).unwrap()),
+                )
+                .await
+                .unwrap();
+                channel
+                    .write_all(
+                        b"POST /quota HTTP/1.1\r\nHost: origin.example.test\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata",
+                    )
+                    .await
+                    .unwrap();
+                read_http_message(&mut channel).await
+            }
+        };
+        let request_a1 = tokio::spawn(send(BEARER_A));
+        let request_a2 = tokio::spawn(send(BEARER_A));
+        let request_b = tokio::spawn(send(BEARER_B));
+
+        let provider_records = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let records = fs::read_to_string(&provider_log).unwrap_or_default();
+                let records = records
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .collect::<Vec<_>>();
+                if records.len() == 3 {
+                    break records;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("three provider requests were not dispatched");
+        assert!(provider_records
+            .iter()
+            .all(|record| record["clientIp"] == "0.0.0.0"));
+
+        let principal = |authority: &str, id: &str| {
+            PrincipalRef::new(
+                AuthorityId::new(authority).unwrap(),
+                PrincipalId::new(id).unwrap(),
+                PrincipalKind::ServiceAccount,
+            )
+        };
+        let principal_a = crate::safety::WireBodyQuotaKey::Principal(principal(
+            "remote-tls-gate-a",
+            "principal-a",
+        ));
+        let principal_b = crate::safety::WireBodyQuotaKey::Principal(principal(
+            "remote-tls-gate-a",
+            "principal-b",
+        ));
+        let other_authority =
+            crate::safety::WireBodyQuotaKey::Principal(principal("other-authority", "principal-a"));
+        let pool = product.wire_body_pool();
+        let charge_a = pool.quota_charge(&principal_a);
+        let charge_b = pool.quota_charge(&principal_b);
+        assert!(charge_a > charge_b, "{charge_a} must include two requests");
+        assert!(charge_b > 0, "principal B must have an independent charge");
+        assert_eq!(pool.quota_charge(&other_authority), 0);
+
+        fs::write(&provider_release, b"release").unwrap();
+        for request in [request_a1, request_a2, request_b] {
+            let response = request.await.unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 200 "));
+        }
+        origin_task.await.unwrap();
+        assert_eq!(pool.quota_charge(&principal_a), 0);
+        assert_eq!(pool.quota_charge(&principal_b), 0);
+
+        product.shutdown().await;
+        super::super::assert_listener_addresses_released(&_test, addresses);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_tls_access_flow_transparent_https_uses_the_nested_mitm_pipeline() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let reservations = super::super::reserve_listeners::<1>(&_test);
+        let addresses = reservations.addresses();
+        let config_directory = tempdir().unwrap();
+        let (_identity_directory, outer_identity, certificate_path, private_key_path) =
+            remote_tls_test_identity(".acl-proxy-remote-https-");
+        let config_path = config_directory.path().join("acl-proxy.toml");
+        let origin = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let origin_identity = TestTlsIdentity::new("origin.example.test");
+        let origin_acceptor =
+            TlsAcceptor::from(Arc::new(origin_identity.server_config(&[b"http/1.1"])));
+        const VARIABLE: &str = "AW_REMOTE_TLS_HTTPS_IDENTITY_TOKEN";
+        const BEARER: &str = "remote-tls-https-identity-bearer-0000000000000";
+        let text = format!(
+            r#"schema_version = 4
+
+[service]
+request_timeout = "5s"
+shutdown_drain_timeout = "1s"
+
+[listeners.transparent_https]
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
+endpoint.allowed_destination_ports = [443]
+http_versions = ["http1"]
+handshake_timeout = "1s"
+max_connections = 4
+
+[listeners.transparent_https.identity]
+mode = "required"
+
+[listeners.transparent_https.endpoint.transport]
+kind = "tls_tcp"
+bind = "{}"
+handshake_timeout = "2s"
+
+[listeners.transparent_https.endpoint.transport.server_identity]
+certificate_chain = {:?}
+private_key = {:?}
+
+[listeners.transparent_https.endpoint.transport.abuse_control]
+max_handshakes = 2
+max_connections_per_source = 4
+handshakes_per_second = 100
+handshake_burst = 100
+source_table_capacity = 8
+
+[identity]
+max_pending_authentications = 4
+max_pending_authentications_per_connection = 1
+
+[identity.resolver]
+kind = "static"
+authority = "remote-tls-https"
+
+[[identity.resolver.principals]]
+id = "https-workload"
+kind = "service_account"
+
+[[identity.resolver.tokens]]
+id = "https-workload-primary"
+principal = "https-workload"
+source = "environment"
+variable = "{VARIABLE}"
+
+[mitm]
+mode = "generated"
+directory = "mitm"
+
+[egress]
+route = "direct"
+
+[egress.origin_tls]
+trust = "insecure"
+http_versions = ["http1"]
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "remote-tls-transparent-https"
+decision = "allow"
+methods = ["GET"]
+urls = ["https://origin.example.test/**"]
+"#,
+            addresses[0], certificate_path, private_key_path
+        );
+        fs::write(&config_path, text).unwrap();
+        let loaded = load_and_compile_exact_config(&config_path).unwrap();
+        unsafe {
+            std::env::set_var(VARIABLE, BEARER);
+        }
+        let identity_sources = crate::identity::IdentitySourceRegistry::activate().unwrap();
+        identity_sources
+            .preload(&loaded.compiled.reloadable_plan)
+            .unwrap();
+
+        let ca_root =
+            PrivateStorageRoot::open_or_create(&config_directory.path().join("mitm")).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let generated =
+            GeneratedCertificateAuthority::open_or_generate(ca_root, i64::try_from(now).unwrap())
+                .unwrap();
+        let mitm_ca_chain = generated.public_ca_chain_der();
+        drop(generated);
+
+        let origin_url =
+            http_access_url::canonicalize_http_url("https://origin.example.test/").unwrap();
+        let network = Arc::new(
+            http_access_runtime::ForwardingDevHarness::new(
+                http_access_runtime::ForwardingNetworkFacts::new(
+                    vec![addresses[0]],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .map_prebound(&origin_url, origin_address)
+            .unwrap()
+            .into_standalone_guard(),
+        );
+        let product =
+            ProductRuntime::prepare_from_prebound_with_forwarding_network_and_identity_sources(
+                loaded,
+                reservations.into_listeners(),
+                network,
+                identity_sources,
+            )
+            .await
+            .unwrap();
+        product.activate_initial().await.unwrap();
+        product.start_listeners().await.unwrap();
+
+        let origin_task = tokio::spawn(async move {
+            let (stream, _) = origin.accept().await.unwrap();
+            let mut stream = origin_acceptor.accept(stream).await.unwrap();
+            let request = read_http_message(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\nnested mitm accepted",
+                )
+                .await
+                .unwrap();
+            request
+        });
+
+        let outer_connector = TlsConnector::from(Arc::new(client_config_for_roots(
+            [outer_identity.root_certificate_der()],
+            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN],
+        )));
+        let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        let mut outer = outer_connector
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .unwrap();
+        write_access_flow_preface(
+            &mut outer,
+            AccessFlowDestination::new("203.0.113.8".parse().unwrap(), 443).unwrap(),
+            &IdentityPresentation::Bearer(SensitiveBearer::new(BEARER.as_bytes()).unwrap()),
+        )
+        .await
+        .unwrap();
+
+        let inner_connector = TlsConnector::from(Arc::new(client_config_for_roots(
+            mitm_ca_chain,
+            &[b"http/1.1"],
+        )));
+        let mut client = inner_connector
+            .connect(ServerName::try_from("origin.example.test").unwrap(), outer)
+            .await
+            .unwrap();
+        client
+            .write_all(
+                b"GET /outer-tls-mitm HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let response = read_http_message(&mut client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200 "));
+        assert!(response.ends_with(b"\r\n\r\nnested mitm accepted"));
+
+        let request = String::from_utf8(origin_task.await.unwrap())
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(request.starts_with("get /outer-tls-mitm http/1.1\r\n"));
+        assert!(!request.contains("x-aw-identity-token"));
+
+        product.shutdown().await;
+        super::super::assert_listener_addresses_released(&_test, addresses);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_tls_access_flow_accept_coordinator_closes_at_handshake_capacity() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let reservations = super::super::reserve_listeners::<1>(&_test);
+        let addresses = reservations.addresses();
+        let config_directory = tempdir().unwrap();
+        let (_identity_directory, _identity, certificate_path, private_key_path) =
+            remote_tls_test_identity(".acl-proxy-remote-overflow-");
+        let config_path = config_directory.path().join("acl-proxy.toml");
+        const VARIABLE: &str = "AW_REMOTE_TLS_OVERFLOW_IDENTITY_TOKEN";
+        const BEARER: &str = "remote-tls-overflow-identity-bearer-00000000000";
+        let text = format!(
+            r#"schema_version = 4
+
+[service]
+shutdown_drain_timeout = "1s"
+
+[listeners.transparent_http]
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
+endpoint.allowed_destination_ports = [80]
+http_versions = ["http1"]
+max_connections = 2
+
+[listeners.transparent_http.identity]
+mode = "required"
+
+[listeners.transparent_http.endpoint.transport]
+kind = "tls_tcp"
+bind = "{}"
+handshake_timeout = "2s"
+
+[listeners.transparent_http.endpoint.transport.server_identity]
+certificate_chain = {:?}
+private_key = {:?}
+
+[listeners.transparent_http.endpoint.transport.abuse_control]
+max_handshakes = 2
+max_connections_per_source = 3
+handshakes_per_second = 100
+handshake_burst = 100
+source_table_capacity = 4
+
+[identity]
+max_pending_authentications = 2
+max_pending_authentications_per_connection = 1
+
+[identity.resolver]
+kind = "static"
+authority = "remote-overflow"
+
+[[identity.resolver.principals]]
+id = "overflow-workload"
+kind = "service_account"
+
+[[identity.resolver.tokens]]
+id = "overflow-workload-primary"
+principal = "overflow-workload"
+source = "environment"
+variable = "{VARIABLE}"
+
+[egress]
+route = "direct"
+
+[policy]
+default = "deny"
+"#,
+            addresses[0], certificate_path, private_key_path
+        );
+        fs::write(&config_path, text).unwrap();
+        unsafe {
+            std::env::set_var(VARIABLE, BEARER);
+        }
+        let loaded = load_and_compile_exact_config(&config_path).unwrap();
+        let identity_sources = crate::identity::IdentitySourceRegistry::activate().unwrap();
+        identity_sources
+            .preload(&loaded.compiled.reloadable_plan)
+            .unwrap();
+        let network = Arc::new(
+            http_access_runtime::ForwardingDevHarness::new(
+                http_access_runtime::ForwardingNetworkFacts::new(
+                    vec![addresses[0]],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .into_standalone_guard(),
+        );
+        let product =
+            ProductRuntime::prepare_from_prebound_with_forwarding_network_and_identity_sources(
+                loaded,
+                reservations.into_listeners(),
+                network,
+                identity_sources,
+            )
+            .await
+            .unwrap();
+        product.activate_initial().await.unwrap();
+        product.start_listeners().await.unwrap();
+
+        let security = product.static_resources.access_flow_security_subscription();
+        let adapter = security
+            .current_tls_route(
+                super::super::access_flow_security::AccessFlowTlsRouteId::TransparentHttp,
+            )
+            .unwrap()
+            .adapter;
+
+        let first = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        wait_for_tls_adapter_snapshot(&adapter, |snapshot| snapshot.held_handshake_permits() == 1)
+            .await;
+        let second = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        let saturated = wait_for_tls_adapter_snapshot(&adapter, |snapshot| {
+            snapshot.held_handshake_permits() == 2
+        })
+        .await;
+        assert_eq!(saturated.held_global_permits(), 2);
+        assert_eq!(saturated.connecting_channels(), 2);
+
+        let mut overflow = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        assert_stream_closes_promptly(&mut overflow).await;
+        let still_saturated = adapter.snapshot();
+        assert_eq!(still_saturated.held_handshake_permits(), 2);
+        assert_eq!(still_saturated.connecting_channels(), 2);
+
+        drop(first);
+        drop(second);
+        wait_for_tls_adapter_snapshot(&adapter, |snapshot| {
+            snapshot.held_handshake_permits() == 0
+                && snapshot.held_global_permits() == 0
+                && snapshot.connecting_channels() == 0
+        })
+        .await;
+
+        product.shutdown().await;
+        super::super::assert_listener_addresses_released(&_test, addresses);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_tls_access_flow_enforces_source_rate_table_and_admission_timeout() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let reservations = super::super::reserve_listeners::<1>(&_test);
+        let addresses = reservations.addresses();
+        let config_directory = tempdir().unwrap();
+        let (_identity_directory, identity, certificate_path, private_key_path) =
+            remote_tls_test_identity(".acl-proxy-remote-source-limits-");
+        let config_path = config_directory.path().join("acl-proxy.toml");
+        const VARIABLE: &str = "AW_REMOTE_TLS_LIMITS_IDENTITY_TOKEN";
+        const BEARER: &str = "remote-tls-limits-identity-bearer-0000000000000";
+        let text = format!(
+            r#"schema_version = 4
+
+[service]
+request_timeout = "5s"
+shutdown_drain_timeout = "1s"
+
+[listeners.transparent_http]
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "100ms"
+endpoint.allowed_destination_ports = [80]
+http_versions = ["http1"]
+max_connections = 4
+
+[listeners.transparent_http.identity]
+mode = "required"
+
+[listeners.transparent_http.endpoint.transport]
+kind = "tls_tcp"
+bind = "{}"
+handshake_timeout = "2s"
+
+[listeners.transparent_http.endpoint.transport.server_identity]
+certificate_chain = {:?}
+private_key = {:?}
+
+[listeners.transparent_http.endpoint.transport.abuse_control]
+max_handshakes = 4
+max_connections_per_source = 2
+handshakes_per_second = 1
+handshake_burst = 1
+source_table_capacity = 1
+
+[identity]
+max_pending_authentications = 4
+max_pending_authentications_per_connection = 1
+
+[identity.resolver]
+kind = "static"
+authority = "remote-limits"
+
+[[identity.resolver.principals]]
+id = "limits-workload"
+kind = "service_account"
+
+[[identity.resolver.tokens]]
+id = "limits-workload-primary"
+principal = "limits-workload"
+source = "environment"
+variable = "{VARIABLE}"
+
+[egress]
+route = "direct"
+
+[policy]
+default = "deny"
+"#,
+            addresses[0], certificate_path, private_key_path
+        );
+        fs::write(&config_path, text).unwrap();
+        unsafe {
+            std::env::set_var(VARIABLE, BEARER);
+        }
+        let loaded = load_and_compile_exact_config(&config_path).unwrap();
+        let identity_sources = crate::identity::IdentitySourceRegistry::activate().unwrap();
+        identity_sources
+            .preload(&loaded.compiled.reloadable_plan)
+            .unwrap();
+        let network = Arc::new(
+            http_access_runtime::ForwardingDevHarness::new(
+                http_access_runtime::ForwardingNetworkFacts::new(
+                    vec![addresses[0]],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .into_standalone_guard(),
+        );
+        let product =
+            ProductRuntime::prepare_from_prebound_with_forwarding_network_and_identity_sources(
+                loaded,
+                reservations.into_listeners(),
+                network,
+                identity_sources,
+            )
+            .await
+            .unwrap();
+        product.activate_initial().await.unwrap();
+        product.start_listeners().await.unwrap();
+
+        let security = product.static_resources.access_flow_security_subscription();
+        let adapter = security
+            .current_tls_route(
+                super::super::access_flow_security::AccessFlowTlsRouteId::TransparentHttp,
+            )
+            .unwrap()
+            .adapter;
+        let connector = TlsConnector::from(Arc::new(client_config_for_roots(
+            [identity.root_certificate_der()],
+            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN],
+        )));
+
+        let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        let mut active = connector
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .unwrap();
+        write_access_flow_preface(
+            &mut active,
+            AccessFlowDestination::new("203.0.113.8".parse().unwrap(), 80).unwrap(),
+            &IdentityPresentation::Bearer(SensitiveBearer::new(BEARER.as_bytes()).unwrap()),
+        )
+        .await
+        .unwrap();
+        wait_for_tls_adapter_snapshot(&adapter, |snapshot| {
+            snapshot.active_channels() == 1 && snapshot.held_source_permits() == 1
+        })
+        .await;
+
+        let mut rate_limited = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        assert_stream_closes_promptly(&mut rate_limited).await;
+        let snapshot = adapter.snapshot();
+        assert_eq!(snapshot.active_channels(), 1);
+        assert_eq!(snapshot.held_source_permits(), 1);
+
+        let alternate = tokio::net::TcpSocket::new_v4().unwrap();
+        alternate
+            .bind((std::net::Ipv4Addr::new(127, 0, 0, 2), 0).into())
+            .unwrap();
+        let mut source_table_limited = alternate.connect(addresses[0]).await.unwrap();
+        assert_stream_closes_promptly(&mut source_table_limited).await;
+        let snapshot = adapter.snapshot();
+        assert_eq!(snapshot.active_channels(), 1);
+        assert_eq!(snapshot.held_source_permits(), 1);
+
+        drop(active);
+        wait_for_tls_adapter_snapshot(&adapter, |snapshot| {
+            snapshot.active_channels() == 0 && snapshot.held_source_permits() == 0
+        })
+        .await;
+
+        let alternate = tokio::net::TcpSocket::new_v4().unwrap();
+        alternate
+            .bind((std::net::Ipv4Addr::new(127, 0, 0, 2), 0).into())
+            .unwrap();
+        let tcp = alternate.connect(addresses[0]).await.unwrap();
+        let mut preface_timeout = connector
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .unwrap();
+        wait_for_tls_adapter_snapshot(&adapter, |snapshot| {
+            snapshot.held_preface_permits() == 1 && snapshot.held_source_permits() == 1
+        })
+        .await;
+        assert_stream_closes_promptly(&mut preface_timeout).await;
+        wait_for_tls_adapter_snapshot(&adapter, |snapshot| {
+            snapshot.connecting_channels() == 0
+                && snapshot.active_channels() == 0
+                && snapshot.held_global_permits() == 0
+                && snapshot.held_handshake_permits() == 0
+                && snapshot.held_preface_permits() == 0
+                && snapshot.held_source_permits() == 0
+        })
+        .await;
+
+        product.shutdown().await;
+        super::super::assert_listener_addresses_released(&_test, addresses);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_tls_access_flow_active_capacity_is_no_wait_and_shutdown_is_deadline_bound() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let reservations = super::super::reserve_listeners::<1>(&_test);
+        let addresses = reservations.addresses();
+        let config_directory = tempdir().unwrap();
+        let (_identity_directory, identity, certificate_path, private_key_path) =
+            remote_tls_test_identity(".acl-proxy-remote-active-");
+        let config_path = config_directory.path().join("acl-proxy.toml");
+        let origin = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        const VARIABLE: &str = "AW_REMOTE_TLS_ACTIVE_IDENTITY_TOKEN";
+        const BEARER: &str = "remote-tls-active-identity-bearer-000000000000";
+        let text = format!(
+            r#"schema_version = 4
+
+[service]
+request_timeout = "5s"
+shutdown_drain_timeout = "1s"
+
+[listeners.transparent_http]
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
+endpoint.allowed_destination_ports = [80]
+http_versions = ["http1"]
+max_connections = 1
+
+[listeners.transparent_http.identity]
+mode = "required"
+
+[listeners.transparent_http.endpoint.transport]
+kind = "tls_tcp"
+bind = "{}"
+handshake_timeout = "2s"
+
+[listeners.transparent_http.endpoint.transport.server_identity]
+certificate_chain = {:?}
+private_key = {:?}
+
+[listeners.transparent_http.endpoint.transport.abuse_control]
+max_handshakes = 2
+max_connections_per_source = 3
+handshakes_per_second = 100
+handshake_burst = 100
+source_table_capacity = 4
+
+[identity]
+max_pending_authentications = 2
+max_pending_authentications_per_connection = 1
+
+[identity.resolver]
+kind = "static"
+authority = "remote-active"
+
+[[identity.resolver.principals]]
+id = "active-workload"
+kind = "service_account"
+
+[[identity.resolver.tokens]]
+id = "active-workload-primary"
+principal = "active-workload"
+source = "environment"
+variable = "{VARIABLE}"
+
+[egress]
+route = "direct"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "remote-active"
+decision = "allow"
+urls = ["http://origin.example.test/stalled"]
+methods = ["GET"]
+"#,
+            addresses[0], certificate_path, private_key_path
+        );
+        fs::write(&config_path, text).unwrap();
+        let loaded = load_and_compile_exact_config(&config_path).unwrap();
+        unsafe {
+            std::env::set_var(VARIABLE, BEARER);
+        }
+        let identity_sources = crate::identity::IdentitySourceRegistry::activate().unwrap();
+        identity_sources
+            .preload(&loaded.compiled.reloadable_plan)
+            .unwrap();
+        let origin_url =
+            http_access_url::canonicalize_http_url("http://origin.example.test/").unwrap();
+        let network = Arc::new(
+            http_access_runtime::ForwardingDevHarness::new(
+                http_access_runtime::ForwardingNetworkFacts::new(
+                    vec![addresses[0]],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .map_prebound(&origin_url, origin_address)
+            .unwrap()
+            .into_standalone_guard(),
+        );
+        let product =
+            ProductRuntime::prepare_from_prebound_with_forwarding_network_and_identity_sources(
+                loaded,
+                reservations.into_listeners(),
+                network,
+                identity_sources,
+            )
+            .await
+            .unwrap();
+        product.activate_initial().await.unwrap();
+        product.start_listeners().await.unwrap();
+
+        let security = product.static_resources.access_flow_security_subscription();
+        let adapter = security
+            .current_tls_route(
+                super::super::access_flow_security::AccessFlowTlsRouteId::TransparentHttp,
+            )
+            .unwrap()
+            .adapter;
+        let connector = TlsConnector::from(Arc::new(client_config_for_roots(
+            [identity.root_certificate_der()],
+            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN],
+        )));
+
+        let (origin_active_send, origin_active_receive) = oneshot::channel();
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let request = read_http_message(&mut stream).await;
+            assert!(request.starts_with(b"GET /stalled HTTP/1.1\r\n"));
+            origin_active_send.send(()).unwrap();
+            let mut byte = [0_u8; 1];
+            stream.read(&mut byte).await.unwrap_or(0)
+        });
+
+        let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        let mut active = connector
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .unwrap();
+        write_access_flow_preface(
+            &mut active,
+            AccessFlowDestination::new("203.0.113.8".parse().unwrap(), 80).unwrap(),
+            &IdentityPresentation::Bearer(SensitiveBearer::new(BEARER.as_bytes()).unwrap()),
+        )
+        .await
+        .unwrap();
+        active
+            .write_all(
+                b"GET /stalled HTTP/1.1\r\nHost: origin.example.test\r\nConnection: keep-alive\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), origin_active_receive)
+            .await
+            .expect("remote TLS Access Flow request did not reach the stalled origin")
+            .unwrap();
+        let admitted = wait_for_tls_adapter_snapshot(&adapter, |snapshot| {
+            snapshot.active_channels() == 1
+                && snapshot.held_global_permits() == 0
+                && snapshot.held_preface_permits() == 0
+        })
+        .await;
+        assert_eq!(admitted.held_source_permits(), 1);
+
+        let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        let mut overflow = connector
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .unwrap();
+        write_access_flow_preface(
+            &mut overflow,
+            AccessFlowDestination::new("203.0.113.9".parse().unwrap(), 80).unwrap(),
+            &IdentityPresentation::Bearer(SensitiveBearer::new(BEARER.as_bytes()).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_stream_closes_promptly(&mut overflow).await;
+        let after_overflow = wait_for_tls_adapter_snapshot(&adapter, |snapshot| {
+            snapshot.active_channels() == 1
+                && snapshot.held_global_permits() == 0
+                && snapshot.held_preface_permits() == 0
+        })
+        .await;
+        assert_eq!(after_overflow.held_source_permits(), 1);
+        assert!(
+            !origin_task.is_finished(),
+            "active flow ended when an overflow flow was rejected"
+        );
+
+        let runtime = product.static_resources.listener_runtime_for_test();
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            runtime.stop_admission_and_wait_closed(),
+        )
+        .await
+        .expect("remote TLS Access Flow admission closure waited for the active flow");
+        assert!(
+            tokio::net::TcpStream::connect(addresses[0]).await.is_err(),
+            "remote TLS Access Flow listener still admitted TCP after closure"
+        );
+        assert!(
+            !origin_task.is_finished(),
+            "active flow ended while only listener admission was closed"
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(150);
+        let shutdown = tokio::spawn(async move {
+            runtime.shutdown_and_wait(Some(deadline)).await;
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !shutdown.is_finished(),
+            "active remote TLS Access Flow drained before the caller deadline"
+        );
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("remote TLS Access Flow join exceeded its caller deadline")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), origin_task)
+            .await
+            .expect("forced remote TLS Access Flow cancellation did not close the origin")
+            .unwrap();
+        assert_stream_closes_promptly(&mut active).await;
+
+        product.shutdown().await;
         super::super::assert_listener_addresses_released(&_test, addresses);
     }
 
