@@ -14784,6 +14784,84 @@ mode = "0606"
     }
 
     #[test]
+    #[ignore = "RT06 product resource gate invokes this projection probe explicitly"]
+    fn rt06_product_projection_probe() {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+
+        const LISTENER_COUNT: u64 = 2;
+        const MAX_CONNECTIONS: usize = 64;
+        const CHUNK_BYTES: usize = 64 * 1024;
+
+        let output = std::env::var_os("ACL_PROXY_RT06_PROJECTION_OUTPUT")
+            .map(PathBuf::from)
+            .expect("ACL_PROXY_RT06_PROJECTION_OUTPUT must name a new absolute output file");
+        assert!(
+            output.is_absolute() && output.file_name().is_some(),
+            "ACL_PROXY_RT06_PROJECTION_OUTPUT must name a new absolute output file"
+        );
+
+        let abuse_control = super::super::authoring::AccessFlowTlsAbuseControlConfig {
+            max_handshakes: 64,
+            max_connections_per_source: 64,
+            handshakes_per_second: 100,
+            handshake_burst: 200,
+            source_table_capacity: 128,
+        };
+        let limits = checked_access_flow_tls_abuse_control(
+            &abuse_control,
+            "listeners.transparent_http.endpoint.transport.abuse_control",
+        )
+        .expect("the RT06 abuse-control limits must be valid");
+        let listener_bytes = project_access_flow_tls_listener(
+            &abuse_control,
+            MAX_CONNECTIONS,
+            CHUNK_BYTES,
+            "listeners.transparent_http",
+        )
+        .expect("the RT06 measurement configuration must have a valid resource projection");
+        let identity = access_flow_tls::TlsAccessFlowServerIdentity::new(
+            access_flow_tls::TlsAccessFlowGeneration::new(1).unwrap(),
+            access_flow_tls::TlsAccessFlowCertificateChain::new(vec![vec![0x30]]).unwrap(),
+            access_flow_tls::TlsAccessFlowPrivateKey::new(vec![0x30]).unwrap(),
+        );
+        let tls_projection = access_flow_tls::project_tls_server_resources(
+            &identity,
+            limits,
+            u32::try_from(MAX_CONNECTIONS).unwrap(),
+        )
+        .expect("the RT06 TLS server resource projection must be valid");
+        let projected_bytes = listener_bytes
+            .checked_mul(LISTENER_COUNT)
+            .expect("the RT06 projection must fit u64");
+        // Each admitted TLS flow also owns one Proxy upstream socket.
+        let projected_descriptors = tls_projection
+            .descriptors()
+            .checked_add(u64::try_from(MAX_CONNECTIONS).unwrap())
+            .and_then(|value| value.checked_mul(LISTENER_COUNT))
+            .expect("the RT06 descriptor projection must fit u64");
+        let minimum_active_bytes_per_flow = ACTIVE_CHANNEL_BYTES
+            .checked_add(CHANNEL_TASK_BYTES)
+            .and_then(|value| value.checked_add(CHUNK_BYTES as u64))
+            .expect("the RT06 active-flow projection must fit u64");
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output)
+            .expect("the RT06 projection output must not already exist");
+        writeln!(
+            file,
+            "name\tvalue\nproxy_projected_bytes\t{projected_bytes}\n\
+             proxy_projected_descriptors\t{projected_descriptors}\n\
+             proxy_minimum_active_bytes_per_flow\t{minimum_active_bytes_per_flow}"
+        )
+        .expect("the RT06 projection output must be writable");
+        file.sync_all()
+            .expect("the RT06 projection output must be durable");
+    }
+
+    #[test]
     fn tls_tcp_access_flow_feature_budget_is_global_across_listeners() {
         let baseline = tls_access_flow_config("transparent_http", 80)
             .replace("max_connections = 256", "max_connections = 1024");

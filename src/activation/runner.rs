@@ -2266,11 +2266,29 @@ methods = ["GET"]
             [recovered_identity.root_certificate_der()],
             &[access_flow_tls::ACCESS_FLOW_TLS_ALPN],
         )));
+        let recovered_security = product
+            .static_resources
+            .access_flow_security_subscription()
+            .current_tls_route(
+                super::super::access_flow_security::AccessFlowTlsRouteId::TransparentHttp,
+            )
+            .unwrap();
         let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
-        recovered_connector
+        let mut active_at_expiry = recovered_connector
             .connect(ServerName::try_from("localhost").unwrap(), tcp)
             .await
             .expect("rotated TLS identity was not published");
+        write_access_flow_preface(
+            &mut active_at_expiry,
+            AccessFlowDestination::new("203.0.113.8".parse().unwrap(), 80).unwrap(),
+            &IdentityPresentation::Bearer(SensitiveBearer::new(BEARER.as_bytes()).unwrap()),
+        )
+        .await
+        .unwrap();
+        wait_for_tls_adapter_snapshot(&recovered_security.adapter, |snapshot| {
+            snapshot.active_channels() == 1 && snapshot.held_source_permits() == 1
+        })
+        .await;
         tokio::time::timeout(Duration::from_secs(5), async {
             while product.runtime().is_ready() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2289,6 +2307,36 @@ methods = ["GET"]
             rejected_after_expiry.is_err(),
             "new TLS admission completed after server-identity expiry"
         );
+
+        let expiry_origin = Arc::clone(&origin);
+        let expiry_origin_task = tokio::spawn(async move {
+            let (mut stream, _) = expiry_origin.accept().await.unwrap();
+            let request = read_http_message(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ndrained",
+                )
+                .await
+                .unwrap();
+            request
+        });
+        active_at_expiry
+            .write_all(
+                b"GET /after-expiry HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let response = read_http_message(&mut active_at_expiry).await;
+        assert!(response.ends_with(b"\r\n\r\ndrained"));
+        assert!(expiry_origin_task
+            .await
+            .unwrap()
+            .starts_with(b"GET /after-expiry HTTP/1.1\r\n"));
+        drop(active_at_expiry);
+        wait_for_tls_adapter_snapshot(&recovered_security.adapter, |snapshot| {
+            snapshot.active_channels() == 0 && snapshot.held_source_permits() == 0
+        })
+        .await;
 
         product.shutdown().await;
         super::super::assert_listener_addresses_released(&_test, addresses);
@@ -2560,6 +2608,311 @@ methods = ["POST"]
         origin_task.await.unwrap();
         assert_eq!(pool.quota_charge(&principal_a), 0);
         assert_eq!(pool.quota_charge(&principal_b), 0);
+
+        product.shutdown().await;
+        super::super::assert_listener_addresses_released(&_test, addresses);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_tls_access_flow_enforces_response_admission_quotas_by_principal() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let reservations = super::super::reserve_listeners::<1>(&_test);
+        let addresses = reservations.addresses();
+        let config_directory = tempdir().unwrap();
+        let (_identity_directory, identity, certificate_path, private_key_path) =
+            remote_tls_test_identity(".acl-proxy-remote-response-quota-");
+        let origin = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let config_path = config_directory.path().join("acl-proxy.toml");
+        const TOKEN_A: &str = "AW_REMOTE_TLS_RESPONSE_QUOTA_A_IDENTITY_TOKEN";
+        const TOKEN_B: &str = "AW_REMOTE_TLS_RESPONSE_QUOTA_B_IDENTITY_TOKEN";
+        const BEARER_A: &str = "remote-tls-response-quota-a-0000000000000000";
+        const BEARER_B: &str = "remote-tls-response-quota-b-0000000000000000";
+        let text = format!(
+            r#"schema_version = 4
+
+[service]
+request_timeout = "10s"
+shutdown_drain_timeout = "1s"
+
+[service.forwarding]
+max_request_wire_bytes = 1024
+max_request_decoded_bytes = 1024
+max_response_wire_bytes = 1024
+max_response_decoded_bytes = 1024
+chunk_bytes = 1024
+preserve_request_trailers = false
+max_trailer_count = 4
+max_trailer_bytes = 256
+
+[listeners.transparent_http]
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
+endpoint.allowed_destination_ports = [80]
+http_versions = ["http1"]
+max_connections = 16
+
+[listeners.transparent_http.identity]
+mode = "required"
+
+[listeners.transparent_http.endpoint.transport]
+kind = "tls_tcp"
+bind = "{}"
+handshake_timeout = "2s"
+
+[listeners.transparent_http.endpoint.transport.server_identity]
+certificate_chain = {:?}
+private_key = {:?}
+
+[listeners.transparent_http.endpoint.transport.abuse_control]
+max_handshakes = 8
+max_connections_per_source = 16
+handshakes_per_second = 100
+handshake_burst = 100
+source_table_capacity = 16
+
+[identity]
+max_pending_authentications = 8
+max_pending_authentications_per_connection = 1
+
+[identity.resolver]
+kind = "static"
+authority = "remote-tls-response-quota"
+
+[[identity.resolver.principals]]
+id = "principal-a"
+kind = "service_account"
+
+[[identity.resolver.principals]]
+id = "principal-b"
+kind = "service_account"
+
+[[identity.resolver.tokens]]
+id = "principal-a-token"
+principal = "principal-a"
+source = "environment"
+variable = "{TOKEN_A}"
+
+[[identity.resolver.tokens]]
+id = "principal-b-token"
+principal = "principal-b"
+source = "environment"
+variable = "{TOKEN_B}"
+
+[egress]
+route = "direct"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "bounded-response"
+decision = "allow"
+methods = ["GET"]
+urls = ["http://origin.example.test/**"]
+"#,
+            addresses[0], certificate_path, private_key_path
+        );
+        fs::write(&config_path, &text).unwrap();
+        let sizing = load_and_compile_exact_config(&config_path).unwrap();
+        let resources = &sizing.compiled.reloadable_plan.resource_plan;
+        let response_peak = resources.forward_response_peak_bytes;
+        let exchange_peak = resources.max_reachable_http_exchange_peak_bytes;
+        assert!(response_peak > 0);
+        assert!(exchange_peak >= response_peak);
+        let global_peak = exchange_peak.checked_mul(4).unwrap();
+        let text = text.replacen(
+            "shutdown_drain_timeout = \"1s\"",
+            &format!(
+                "shutdown_drain_timeout = \"1s\"\nmax_inflight_wire_body_bytes = {global_peak}\nmax_inflight_wire_body_bytes_per_quota_key = {exchange_peak}\nmin_wire_body_concurrency = 4"
+            ),
+            1,
+        );
+        fs::write(&config_path, text).unwrap();
+        let loaded = load_and_compile_exact_config(&config_path).unwrap();
+        unsafe {
+            std::env::set_var(TOKEN_A, BEARER_A);
+            std::env::set_var(TOKEN_B, BEARER_B);
+        }
+        let identity_sources = crate::identity::IdentitySourceRegistry::activate().unwrap();
+        identity_sources
+            .preload(&loaded.compiled.reloadable_plan)
+            .unwrap();
+        let origin_url =
+            http_access_url::canonicalize_http_url("http://origin.example.test/").unwrap();
+        let network = Arc::new(
+            http_access_runtime::ForwardingDevHarness::new(
+                http_access_runtime::ForwardingNetworkFacts::new(
+                    vec![addresses[0]],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+            .map_prebound(&origin_url, origin_address)
+            .unwrap()
+            .into_standalone_guard(),
+        );
+        let product =
+            ProductRuntime::prepare_from_prebound_with_forwarding_network_and_identity_sources(
+                loaded,
+                reservations.into_listeners(),
+                network,
+                identity_sources,
+            )
+            .await
+            .unwrap();
+        product.activate_initial().await.unwrap();
+        product.start_listeners().await.unwrap();
+
+        let (check_tx, check_rx) = tokio::sync::oneshot::channel();
+        let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let origin_task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            for expected in ["/held-a", "/held-b"] {
+                let (mut stream, _) = tokio::time::timeout(Duration::from_secs(2), origin.accept())
+                    .await
+                    .expect("admitted remote TLS request did not reach the origin")
+                    .unwrap();
+                let request = read_http_message(&mut stream).await;
+                assert!(
+                    request.starts_with(format!("GET {expected} HTTP/1.1\r\n").as_bytes()),
+                    "unexpected origin request: {}",
+                    String::from_utf8_lossy(&request)
+                );
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                held.push(stream);
+            }
+            check_rx.await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), origin.accept())
+                    .await
+                    .is_err(),
+                "a quota-rejected remote TLS request reached the origin"
+            );
+            checked_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            for mut stream in held {
+                stream.write_all(b"x").await.unwrap();
+            }
+            let (mut recovered, _) = tokio::time::timeout(Duration::from_secs(2), origin.accept())
+                .await
+                .expect("released quota did not permit a recovery request")
+                .unwrap();
+            let request = read_http_message(&mut recovered).await;
+            assert!(request.starts_with(b"GET /recovered-a HTTP/1.1\r\n"));
+            recovered
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nr")
+                .await
+                .unwrap();
+        });
+
+        let connector = TlsConnector::from(Arc::new(client_config_for_roots(
+            [identity.root_certificate_der()],
+            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN],
+        )));
+        let open = |bearer: &'static str, path: &'static str| {
+            let connector = connector.clone();
+            async move {
+                let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+                let mut channel = connector
+                    .connect(ServerName::try_from("localhost").unwrap(), tcp)
+                    .await
+                    .unwrap();
+                write_access_flow_preface(
+                    &mut channel,
+                    AccessFlowDestination::new("203.0.113.8".parse().unwrap(), 80).unwrap(),
+                    &IdentityPresentation::Bearer(SensitiveBearer::new(bearer.as_bytes()).unwrap()),
+                )
+                .await
+                .unwrap();
+                channel
+                    .write_all(
+                        format!(
+                            "GET {path} HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                channel
+            }
+        };
+        let quota_key = |id: &str| {
+            crate::safety::WireBodyQuotaKey::Principal(PrincipalRef::new(
+                AuthorityId::new("remote-tls-response-quota").unwrap(),
+                PrincipalId::new(id).unwrap(),
+                PrincipalKind::ServiceAccount,
+            ))
+        };
+        let principal_a = quota_key("principal-a");
+        let principal_b = quota_key("principal-b");
+        let pool = product.wire_body_pool();
+
+        let mut held = Vec::new();
+        let mut first = open(BEARER_A, "/held-a").await;
+        assert!(read_http_head(&mut first)
+            .await
+            .starts_with(b"HTTP/1.1 200 "));
+        assert!(pool.quota_charge(&principal_a) >= response_peak);
+        held.push(first);
+
+        let mut same_principal = open(BEARER_A, "/same-principal").await;
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_http_message(&mut same_principal),
+        )
+        .await
+        .expect("same-principal rejection timed out");
+        assert!(
+            response.starts_with(b"HTTP/1.1 503 "),
+            "same-principal saturation was not rejected: {}",
+            String::from_utf8_lossy(&response)
+        );
+
+        let mut independent = open(BEARER_B, "/held-b").await;
+        assert!(read_http_head(&mut independent)
+            .await
+            .starts_with(b"HTTP/1.1 200 "));
+        assert!(
+            pool.quota_charge(&principal_b) >= response_peak,
+            "principal B did not retain its independent reservation"
+        );
+        held.push(independent);
+        check_tx.send(()).unwrap();
+        checked_rx.await.unwrap();
+
+        release_tx.send(()).unwrap();
+        for mut channel in held {
+            let mut body = [0_u8; 1];
+            channel.read_exact(&mut body).await.unwrap();
+            assert_eq!(&body, b"x");
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pool.global_charge() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed remote TLS responses retained wire-body quota");
+        for key in [&principal_a, &principal_b] {
+            assert_eq!(pool.quota_charge(key), 0);
+        }
+
+        let mut recovered = open(BEARER_A, "/recovered-a").await;
+        let response = read_http_message(&mut recovered).await;
+        assert!(response.starts_with(b"HTTP/1.1 200 "));
+        assert!(response.ends_with(b"\r\n\r\nr"));
+        origin_task.await.unwrap();
+        assert_eq!(pool.global_charge(), 0);
 
         product.shutdown().await;
         super::super::assert_listener_addresses_released(&_test, addresses);
