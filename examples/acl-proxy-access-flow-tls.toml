@@ -24,6 +24,8 @@ mode = "required"
 
 [listeners.transparent_http.endpoint.transport]
 kind = "tls_tcp"
+# A wildcard bind requires a host firewall that permits only the intended
+# relay network. It is not a general-purpose explicit proxy listener.
 bind = "0.0.0.0:7443"
 handshake_timeout = "5s"
 
@@ -50,6 +52,8 @@ mode = "required"
 
 [listeners.transparent_https.endpoint.transport]
 kind = "tls_tcp"
+# Keep this port scoped to the intended relay network as well. Transparent
+# clients still require an original-destination redirect at the workload.
 bind = "0.0.0.0:7444"
 handshake_timeout = "5s"
 

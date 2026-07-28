@@ -283,6 +283,15 @@ private key to be owner-only. Windows uses the same handle-pinned, reparse-safe
 snapshot contract as configuration loading. `acl-proxy config validate`
 performs the same material validation as startup without binding the listener.
 
+Use a dedicated or otherwise narrowly constrained issuing CA for Access Flow.
+The relay sends its reusable AWAF bearer after standard WebPKI validation, so
+any server key that chains to the configured bundle and satisfies the
+configured `server_name` can receive that bearer. Keep the server private key
+only on the ACL Proxy host; neither the Gateway, workload container, nor an
+intermediate TLS terminator needs it. Access Flow performs no online OCSP or
+CRL retrieval. Operational revocation therefore uses short-lived server
+certificates plus explicit replacement of the relay trust generation.
+
 One fixed listener coordinator continues accepting TCP candidates while
 handshake, preface, and bearer operations are in flight. Global, per-source,
 rate, and handshake capacity are acquired synchronously without waiting;
@@ -963,6 +972,57 @@ Validate and inspect before startup:
 acl-proxy config validate --config /etc/acl-proxy/acl-proxy.toml
 acl-proxy policy dump --format table --config /etc/acl-proxy/acl-proxy.toml
 ```
+
+### Remote Access Flow Cutover
+
+Unix and TLS/TCP are strict physical transport alternatives for each route.
+There is no cleartext, opportunistic TLS, downgrade, endpoint fallback, or
+automatic return to Unix after a remote failure. A controlled Unix-to-TLS
+cutover is:
+
+1. Add the workload principal, groups, and bearer to the Proxy resolver and
+   validate policy before exposing a remote listener.
+2. Provision a dedicated CA and a `serverAuth` leaf whose SAN matches the
+   Gateway route's exact `server_name`. Install the owner-only private key only
+   on the Proxy host.
+3. Install the minimal CA bundle on the Gateway host, configure one exact
+   Proxy address and port per route, and validate both product configurations.
+4. Permit container egress only to those Proxy endpoints, permit Proxy-host
+   ingress only from the intended relay network, and retain only the DNS
+   access required to resolve configured names. TLS transport does not itself
+   provide no-NAT isolation.
+5. Start the Proxy listener and verify readiness, then activate the Gateway
+   route and transparent redirect. Prove real HTTP and nested HTTPS policy,
+   identity, and denial behavior before removing the old Unix route.
+
+Rollback restores the previous Unix route and its redirect as one coordinated
+configuration change after stopping new TLS admission. Do not configure a
+fallback route. Keep the old socket and deployment material until the real-flow
+check passes, and remove the remote firewall allowance only after the remote
+route has drained.
+
+### Certificate And Bearer Rotation
+
+Rotate a CA or server identity with a bounded trust overlap:
+
+1. Add the new CA to the existing bounded Gateway PEM bundle and send `SIGHUP`
+   to `aw-container-agent`. Verify relay readiness.
+2. Atomically replace the Proxy leaf chain and owner-only key at their unchanged
+   paths, then send `SIGHUP` to ACL Proxy.
+3. Verify both readiness endpoints and a real bearer-authenticated Access Flow.
+4. Remove the old CA from the Gateway bundle, send `SIGHUP` to the agent, and
+   verify the real flow again.
+
+If the Gateway trust reload fails, repair the bundle and send another `SIGHUP`;
+new relay admission remains closed while established flows drain. If the Proxy
+identity reload fails, restore the prior matching leaf/key pair and reload it
+while the old CA is still trusted. Do not proceed to trust removal until the
+new generation has carried a real flow.
+
+Bearer rotation is a separate disruptive transaction. `SIGHUP` does not reload
+the Gateway bearer or static resolver configuration. Close new admission,
+drain existing flows, update the Proxy resolver and Gateway environment
+together, then restart the affected processes and verify authorization.
 
 `SIGHUP` independently reloads the policy/configuration generation and Access
 Flow TLS server identities from their unchanged static locators. A policy
