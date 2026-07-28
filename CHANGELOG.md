@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Require Windows Access Flow server private keys to be owned by the process
+  user and have a protected, owner-restricted DACL, matching the Unix
+  owner-only custody requirement.
+
 ### Breaking Changes
 
 - Replaced scalar data-listener `bind` fields with the closed typed `endpoint`

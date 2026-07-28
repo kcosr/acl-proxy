@@ -70,9 +70,17 @@ pub(crate) enum ProtectedFileSnapshotError {
 }
 
 #[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProtectedFilePolicy {
+    Stable,
+    OwnerRestricted,
+}
+
+#[cfg(windows)]
 pub(crate) fn load_protected_file_snapshot(
     path: &Path,
     maximum_bytes: usize,
+    policy: ProtectedFilePolicy,
 ) -> Result<ProtectedFileSnapshot, ProtectedFileSnapshotError> {
     let parent_path = path.parent().ok_or(ProtectedFileSnapshotError::Untrusted)?;
     let name = path
@@ -90,9 +98,19 @@ pub(crate) fn load_protected_file_snapshot(
     if probed.size > maximum_bytes as u64 {
         return Err(ProtectedFileSnapshotError::ResourceLimit);
     }
-    let (mut file, opened) = platform::open_file_at(&parent, name)
-        .map_err(|_| ProtectedFileSnapshotError::Unavailable)?;
+    let (mut file, opened) = platform::open_protected_file_at(
+        &parent,
+        name,
+        policy == ProtectedFilePolicy::OwnerRestricted,
+    )
+    .map_err(|_| ProtectedFileSnapshotError::Unavailable)?;
     if opened != probed {
+        return Err(ProtectedFileSnapshotError::Untrusted);
+    }
+    if policy == ProtectedFilePolicy::OwnerRestricted
+        && !platform::has_owner_restricted_dacl(&file)
+            .map_err(|_| ProtectedFileSnapshotError::Unavailable)?
+    {
         return Err(ProtectedFileSnapshotError::Untrusted);
     }
     let read_limit = maximum_bytes
@@ -107,7 +125,14 @@ pub(crate) fn load_protected_file_snapshot(
         platform::metadata_file(&file).map_err(|_| ProtectedFileSnapshotError::Unavailable)?;
     let final_probe =
         platform::probe_at(&parent, name).map_err(|_| ProtectedFileSnapshotError::Unavailable)?;
-    if post != probed || final_probe != Some(probed) || bytes.len() as u64 != probed.size {
+    let custody_is_stable = policy != ProtectedFilePolicy::OwnerRestricted
+        || platform::has_owner_restricted_dacl(&file)
+            .map_err(|_| ProtectedFileSnapshotError::Unavailable)?;
+    if post != probed
+        || final_probe != Some(probed)
+        || bytes.len() as u64 != probed.size
+        || !custody_is_stable
+    {
         return Err(ProtectedFileSnapshotError::Untrusted);
     }
     Ok(ProtectedFileSnapshot {

@@ -304,8 +304,12 @@ key logging is disabled.
 The certificate chain and private key are read from bounded, stable, direct,
 single-link files. Unix uses no-follow descriptor traversal and requires the
 private key to be owner-only. Windows uses the same handle-pinned, reparse-safe
-snapshot contract as configuration loading. `acl-proxy config validate`
-performs the same material validation as startup without binding the listener.
+snapshot contract as configuration loading and requires the private key to
+be owned by the process user with a protected DACL whose allow entries name
+only that owner. Missing, inherited, null, malformed, or non-owner-granting
+DACLs fail closed.
+`acl-proxy config validate` performs the same material validation as startup
+without binding the listener.
 
 Use a dedicated or otherwise narrowly constrained issuing CA for Access Flow.
 The relay sends its reusable AWAF bearer after standard WebPKI validation, so

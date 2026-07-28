@@ -318,18 +318,21 @@ impl OpenedMaterialFile {
     #[cfg(windows)]
     fn open(path: &Path, policy: MaterialPolicy) -> Result<Self, AccessFlowTlsIdentityError> {
         use crate::config::source_snapshot::{
-            load_protected_file_snapshot, ProtectedFileSnapshotError,
+            load_protected_file_snapshot, ProtectedFilePolicy, ProtectedFileSnapshotError,
         };
 
-        let snapshot = load_protected_file_snapshot(path, policy.maximum_bytes()).map_err(
-            |error| match error {
+        let snapshot_policy = match policy {
+            MaterialPolicy::Certificate => ProtectedFilePolicy::Stable,
+            MaterialPolicy::PrivateKey => ProtectedFilePolicy::OwnerRestricted,
+        };
+        let snapshot = load_protected_file_snapshot(path, policy.maximum_bytes(), snapshot_policy)
+            .map_err(|error| match error {
                 ProtectedFileSnapshotError::Unavailable => AccessFlowTlsIdentityError::Unavailable,
                 ProtectedFileSnapshotError::Untrusted => AccessFlowTlsIdentityError::Untrusted,
                 ProtectedFileSnapshotError::ResourceLimit => {
                     AccessFlowTlsIdentityError::ResourceLimit
                 }
-            },
-        )?;
+            })?;
         let identity = ObjectIdentity(snapshot.identity());
         Ok(Self {
             bytes: snapshot.into_bytes(),
