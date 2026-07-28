@@ -23,7 +23,7 @@ struct ActivationCancellationInner {
 }
 
 impl ActivationCancellation {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: Arc::new(ActivationCancellationInner {
                 cancelled: AtomicBool::new(false),

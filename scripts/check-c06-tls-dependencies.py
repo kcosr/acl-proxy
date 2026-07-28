@@ -30,9 +30,10 @@ TLS_SPECS: dict[str, object] = {
         "features": ["ring", "tls12"],
     },
 }
-RUNTIME_TLS_SPECS = {
+ACL_TLS_SPECS = {
     name: spec for name, spec in TLS_SPECS.items() if name != "rustls-native-certs"
 }
+RUNTIME_TLS_SPECS = TLS_SPECS
 RUNTIME_CONSUMER_SURFACE_TLS_SPECS = {
     **TLS_SPECS,
     "rustls": {
@@ -271,14 +272,34 @@ def check_advisory_policy(root: Path) -> None:
             fail(f"{path}: repository file must not ignore RustSec IDs")
 
 
-def check_runtime_native_root_ownership(runtime_root: Path) -> None:
+def check_native_root_ownership(acl_root: Path, runtime_root: Path) -> None:
     forbidden = (b"rustls_native_certs", b"load_native_certs")
-    for path in repository_regular_files(runtime_root):
-        if path.suffix != ".rs":
+    for root in (acl_root, runtime_root):
+        for path in repository_regular_files(root):
+            if path.suffix != ".rs":
+                continue
+            contents = read_contents(path)
+            if not any(token in contents for token in forbidden):
+                continue
+            if root == runtime_root and path.is_relative_to(
+                runtime_root / "crates" / "access-tls-trust"
+            ):
+                continue
+            fail(f"{path}: native root discovery belongs to access-tls-trust")
+    allowed_manifests = {
+        runtime_root / "Cargo.toml",
+        runtime_root / "crates" / "access-tls-trust" / "Cargo.toml",
+    }
+    for manifest in repository_files(runtime_root, "Cargo.toml"):
+        if manifest in allowed_manifests:
             continue
-        contents = read_contents(path)
-        if any(token in contents for token in forbidden):
-            fail(f"{path}: native root discovery must remain product-owned")
+        for _, dependencies in dependency_tables(load_toml(manifest)):
+            for name, spec in dependencies.items():
+                package = spec.get("package") if isinstance(spec, dict) else None
+                if name == "rustls-native-certs" or package == "rustls-native-certs":
+                    fail(
+                        f"{manifest}: native root dependency belongs to access-tls-trust"
+                    )
 
 
 def check_repository(acl_root: Path, runtime_root: Path) -> None:
@@ -290,16 +311,31 @@ def check_repository(acl_root: Path, runtime_root: Path) -> None:
     acl_manifest = roots[0] / "Cargo.toml"
     runtime_manifest = roots[1] / "Cargo.toml"
     repository_policies = (
-        (roots[0], acl_manifest, "dependencies", TLS_SPECS, set()),
+        (
+            roots[0],
+            acl_manifest,
+            "dependencies",
+            ACL_TLS_SPECS,
+            {"rustls-native-certs"},
+            set(),
+        ),
         (
             roots[1],
             runtime_manifest,
             "workspace.dependencies",
             RUNTIME_TLS_SPECS,
-            {"rustls-native-certs"},
+            set(),
+            set(),
         ),
     )
-    for root, authority_manifest, authority_section, authority_specs, forbidden_tls in repository_policies:
+    for (
+        root,
+        authority_manifest,
+        authority_section,
+        authority_specs,
+        manifest_forbidden_tls,
+        lock_forbidden_tls,
+    ) in repository_policies:
         for manifest in repository_files(root, "Cargo.toml"):
             authority = None
             if manifest == authority_manifest:
@@ -313,7 +349,7 @@ def check_repository(acl_root: Path, runtime_root: Path) -> None:
                 manifest,
                 authority,
                 authority_specs,
-                forbidden_tls,
+                manifest_forbidden_tls,
                 exact_specs,
             )
 
@@ -322,9 +358,9 @@ def check_repository(acl_root: Path, runtime_root: Path) -> None:
             fail(f"missing repository lockfile: {main_lock}")
         for lock in repository_files(root, "Cargo.lock"):
             required_family = authority_specs if lock == main_lock else None
-            check_lock(lock, required_family, forbidden_tls)
+            check_lock(lock, required_family, lock_forbidden_tls)
         check_advisory_policy(root)
-    check_runtime_native_root_ownership(roots[1])
+    check_native_root_ownership(*roots)
 
 
 def main() -> int:

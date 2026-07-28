@@ -7,6 +7,7 @@ use super::compiler::{
 };
 use super::loader;
 use super::provenance::{PolicyProvenance, PolicySourceSummary};
+use super::tls_trust_preflight::TlsTrustSourceSpec;
 
 pub(crate) use super::loader::ConfigPathSource;
 
@@ -35,6 +36,7 @@ pub(crate) struct CompiledConfig {
     pub(crate) reloadable_plan: ReloadableProductPlan,
     pub(crate) policy_provenance: PolicyProvenance,
     pub(crate) policy_source_summary: PolicySourceSummary,
+    pub(crate) tls_trust_sources: Vec<TlsTrustSourceSpec>,
 }
 
 impl fmt::Debug for CompiledConfig {
@@ -45,6 +47,7 @@ impl fmt::Debug for CompiledConfig {
             .field("reloadable_plan", &self.reloadable_plan)
             .field("rule_source_count", &self.policy_provenance.rules().len())
             .field("source_summary", &self.policy_source_summary)
+            .field("tls_trust_source_count", &self.tls_trust_sources.len())
             .finish_non_exhaustive()
     }
 }
@@ -198,6 +201,7 @@ fn compile_authored(
     policy_source_summary: PolicySourceSummary,
     config_root: &Path,
 ) -> Result<CompiledConfig, ConfigFacadeError> {
+    let authored_tls_sources = collect_authored_tls_sources(&authored);
     let compiled =
         compile_config(authored, config_root).map_err(|source| ConfigFacadeError::Compile {
             message: format_compile_error(&source, &policy_provenance),
@@ -211,7 +215,46 @@ fn compile_authored(
         compiled,
         policy_provenance,
         policy_source_summary,
+        authored_tls_sources,
     ))
+}
+
+fn collect_authored_tls_sources(
+    authored: &super::authoring::AuthoringConfig,
+) -> Vec<(String, PathBuf)> {
+    use super::authoring::AuthorizationProviderConfig;
+
+    let mut sources = Vec::new();
+    if let Some(path) = &authored.egress.origin_tls.ca_certificate {
+        sources.push(("egress.origin_tls.ca_certificate".to_owned(), path.clone()));
+    }
+    if let Some(path) = authored
+        .egress
+        .parent_proxy
+        .as_ref()
+        .and_then(|parent| parent.tls.as_ref())
+        .and_then(|tls| tls.ca_certificate.as_ref())
+    {
+        sources.push((
+            "egress.parent_proxy.tls.ca_certificate".to_owned(),
+            path.clone(),
+        ));
+    }
+    for (name, provider) in &authored.authorization.providers {
+        if let AuthorizationProviderConfig::Webhook(webhook) = provider {
+            if let Some(path) = webhook
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.ca_certificate.as_ref())
+            {
+                sources.push((
+                    format!("authorization.providers.{name}.tls.ca_certificate"),
+                    path.clone(),
+                ));
+            }
+        }
+    }
+    sources
 }
 
 fn format_compile_error(
@@ -284,13 +327,58 @@ fn split_compiled(
     compiled: CompiledProductConfig,
     policy_provenance: PolicyProvenance,
     policy_source_summary: PolicySourceSummary,
+    authored_tls_sources: Vec<(String, PathBuf)>,
 ) -> CompiledConfig {
+    use super::compiler::AuthorizationProviderPlan;
+
+    let mut resolved = std::collections::BTreeMap::new();
+    if let Some(path) = &compiled.reloadable_plan.egress.origin_tls.ca_certificate {
+        resolved.insert("egress.origin_tls.ca_certificate".to_owned(), path.clone());
+    }
+    if let Some(path) = compiled
+        .reloadable_plan
+        .egress
+        .parent_proxy
+        .as_ref()
+        .and_then(|parent| parent.tls.as_ref())
+        .and_then(|tls| tls.ca_certificate.as_ref())
+    {
+        resolved.insert(
+            "egress.parent_proxy.tls.ca_certificate".to_owned(),
+            path.clone(),
+        );
+    }
+    for (name, provider) in &compiled.reloadable_plan.authorization.providers {
+        if let AuthorizationProviderPlan::Webhook(webhook) = provider {
+            if let Some(path) = webhook
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.ca_certificate.as_ref())
+            {
+                resolved.insert(
+                    format!("authorization.providers.{name}.tls.ca_certificate"),
+                    path.clone(),
+                );
+            }
+        }
+    }
+    let tls_trust_sources = authored_tls_sources
+        .into_iter()
+        .map(|(scope, authored)| {
+            let resolved = resolved
+                .remove(&scope)
+                .expect("compiled TLS trust source corresponds to authored source");
+            TlsTrustSourceSpec::new(scope, authored, resolved)
+        })
+        .collect();
+    debug_assert!(resolved.is_empty());
     CompiledConfig {
         static_config: compiled.static_config,
         static_fingerprint: compiled.static_fingerprint,
         reloadable_plan: compiled.reloadable_plan,
         policy_provenance,
         policy_source_summary,
+        tls_trust_sources,
     }
 }
 

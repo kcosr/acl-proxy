@@ -384,7 +384,7 @@ mod tests {
     use crate::authorization::webhook::pool::WebhookTransportArena;
     use crate::authorization::webhook::provider::WebhookProvider;
     use crate::config::compiler::{
-        CompiledProviderFailureMode, CompiledTlsTrust, WebhookProviderPlan, WebhookTlsPlan,
+        CompiledProviderFailureMode, TlsClientTrustMode, WebhookProviderPlan, WebhookTlsPlan,
     };
     use crate::safety::{HttpWireBodyGuard, WireBodyPool, WireBodyQuotaKey};
     use crate::test_certificates::TestTlsIdentity;
@@ -449,7 +449,16 @@ mod tests {
     }
 
     fn tls_fixture(hostname: &str) -> TlsFixture {
-        let directory = TempDir::new().unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix(".acl-proxy-webhook-tls-")
+            .tempdir_in(std::env::var_os("HOME").expect("HOME is configured"))
+            .unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            directory.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let identity = TestTlsIdentity::new(hostname);
         let ca_certificate = directory.path().join("ca.pem");
         crate::filesystem::write_public_file(&ca_certificate, identity.root_certificate_pem())
@@ -465,14 +474,19 @@ mod tests {
     async fn tls_provider(
         host: &str,
         port: u16,
-        trust: CompiledTlsTrust,
+        trust: TlsClientTrustMode,
         ca_certificate: Option<PathBuf>,
     ) -> Arc<WebhookProvider> {
         let tls_io = crate::tls_io_runtime::TlsIoRuntime::new().unwrap();
-        let mut tls_resolver = crate::candidate_tls::CandidateTlsResolver::activate(
+        let mut plans = crate::candidate_tls::CandidateTlsPlanSet::new();
+        plans
+            .register(trust, ca_certificate.as_deref())
+            .expect("test webhook trust plan is valid");
+        let mut tls_resolver = crate::candidate_tls::CandidateTlsResolver::activate_with_plans(
             Arc::clone(&tls_io),
             crate::runtime::ActivationCancellation::new_for_test(),
             http_access_types::PolicyGeneration::new(7).unwrap(),
+            plans,
         )
         .await
         .expect("test host system roots load");
@@ -590,7 +604,7 @@ mod tests {
         let provider = tls_provider(
             "localhost",
             endpoint.port(),
-            CompiledTlsTrust::Custom,
+            TlsClientTrustMode::Custom,
             Some(fixture.ca_certificate.clone()),
         )
         .await;
@@ -621,7 +635,7 @@ mod tests {
         let provider = tls_provider(
             "localhost",
             endpoint.port(),
-            CompiledTlsTrust::Custom,
+            TlsClientTrustMode::Custom,
             Some(trusted.ca_certificate.clone()),
         )
         .await;
@@ -649,7 +663,7 @@ mod tests {
         let provider = tls_provider(
             "localhost",
             endpoint.port(),
-            CompiledTlsTrust::Insecure,
+            TlsClientTrustMode::Insecure,
             None,
         )
         .await;
@@ -672,7 +686,7 @@ mod tests {
         let provider = tls_provider(
             "localhost",
             endpoint.port(),
-            CompiledTlsTrust::Custom,
+            TlsClientTrustMode::Custom,
             Some(wrong_trust.ca_certificate.clone()),
         )
         .await;
@@ -690,7 +704,7 @@ mod tests {
         let provider = tls_provider(
             "wrong-name.invalid",
             endpoint.port(),
-            CompiledTlsTrust::Custom,
+            TlsClientTrustMode::Custom,
             Some(trusted.ca_certificate.clone()),
         )
         .await;
@@ -719,7 +733,7 @@ mod tests {
         let provider = tls_provider(
             "localhost",
             endpoint.port(),
-            CompiledTlsTrust::Insecure,
+            TlsClientTrustMode::Insecure,
             None,
         )
         .await;

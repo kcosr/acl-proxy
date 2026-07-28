@@ -50,7 +50,6 @@ httparse = "1.10.1"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 http = "=1.4.2"
 rustls = { version = "=0.23.42", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-native-certs = "=0.8.3"
 rustls-pki-types = "=1.15.0"
 rustls-webpki = { version = "=0.103.13", default-features = false, features = ["alloc", "ring", "std"] }
 tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
@@ -63,6 +62,7 @@ access-flow-tls = { path = "../access-runtime/crates/access-flow-tls", version =
 access-flow-unix = { path = "../access-runtime/crates/access-flow-unix", version = "=0.1.0" }
 access-identity = { path = "../access-runtime/crates/access-identity", version = "=0.1.0" }
 access-rpc-framing = { path = "../access-runtime/crates/access-rpc-framing", version = "=0.1.0" }
+access-tls-trust = { path = "../access-runtime/crates/access-tls-trust", version = "=0.1.0" }
 http-access-types = { path = "../access-runtime/crates/http-access-types", version = "=0.1.0" }
 http-access-url = { path = "../access-runtime/crates/http-access-url", version = "=0.1.0" }
 http-access-runtime = { path = "../access-runtime/crates/http-access-runtime", version = "=0.1.0" }
@@ -90,6 +90,7 @@ windows-sys = { version = "=0.61.2", features = [
 ] }
 
 [dev-dependencies]
+access-tls-trust = { path = "../access-runtime/crates/access-tls-trust", version = "=0.1.0", features = ["conformance-fixtures"] }
 assert_cmd = "2.0"
 predicates = "3.1"
 tempfile = "3.10"

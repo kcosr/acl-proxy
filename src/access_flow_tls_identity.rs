@@ -494,10 +494,13 @@ mod tests {
 
     fn private_test_directory() -> TempDir {
         let home = std::env::var_os("HOME").expect("tests require a home directory");
-        tempfile::Builder::new()
+        let directory = tempfile::Builder::new()
             .prefix("acl-proxy-access-flow-tls-")
             .tempdir_in(home)
-            .expect("create private identity test directory")
+            .expect("create private identity test directory");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("secure private identity test directory");
+        directory
     }
 
     fn write_file(path: &Path, mode: u32, bytes: &[u8]) {
@@ -508,6 +511,15 @@ mod tests {
             .open(path)
             .expect("create identity source");
         file.write_all(bytes).expect("write identity source");
+    }
+
+    #[test]
+    fn private_test_directory_has_explicit_mode_independent_of_umask() {
+        let directory = private_test_directory();
+        assert_eq!(
+            fs::metadata(directory.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 
     fn write_identity(

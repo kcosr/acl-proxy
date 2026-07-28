@@ -13,7 +13,7 @@ use http_access_runtime::{
 };
 use http_access_url::canonicalize_http_url;
 use rustls::pki_types::ServerName;
-use tempfile::{tempdir, TempDir};
+use tempfile::TempDir;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -23,6 +23,20 @@ use crate::test_certificates::{client_config_for_pem_roots, TestTlsIdentity};
 
 const PARENT_HOST: &str = "parent.test";
 const ORIGIN_HOST: &str = "localhost";
+
+fn trusted_tls_tempdir() -> TempDir {
+    let directory = tempfile::Builder::new()
+        .prefix("acl-proxy-parent-tls-")
+        .tempdir_in(std::env::var_os("HOME").expect("HOME is configured"))
+        .unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        directory.path(),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+    )
+    .unwrap();
+    directory
+}
 
 struct TestIdentity {
     certificate_path: PathBuf,
@@ -102,7 +116,7 @@ fn initialize_generated_ca(directory: &Path, public_chain_path: &Path) {
         }
         pem.push_str("-----END CERTIFICATE-----\n");
     }
-    fs::write(public_chain_path, pem).unwrap();
+    crate::filesystem::write_public_file(public_chain_path, pem).unwrap();
 }
 
 async fn read_http_head(stream: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
@@ -413,13 +427,25 @@ async fn start_child(
 }
 
 async fn topology(protected: bool) -> ParentTopology {
-    let root = tempdir().unwrap();
+    let root = trusted_tls_tempdir();
     let origin_directory = root.path().join("origin");
     let parent_directory = root.path().join("parent");
     let child_directory = root.path().join("child");
     fs::create_dir_all(&origin_directory).unwrap();
     fs::create_dir_all(&parent_directory).unwrap();
     fs::create_dir_all(&child_directory).unwrap();
+    #[cfg(unix)]
+    for directory in [
+        &origin_directory,
+        &parent_directory,
+        &child_directory,
+    ] {
+        fs::set_permissions(
+            directory,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
+    }
 
     let origin_identity = write_identity(&origin_directory, "origin", ORIGIN_HOST);
     let parent_identity = write_identity(&parent_directory, "parent", PARENT_HOST);
@@ -607,11 +633,19 @@ async fn production_compressed_telemetry_body_compatibility() {
         Some(52_428_800)
     );
 
-    let root = tempdir().unwrap();
+    let root = trusted_tls_tempdir();
     let origin_directory = root.path().join("origin");
     let product_directory = root.path().join("product");
     fs::create_dir_all(&origin_directory).unwrap();
     fs::create_dir_all(&product_directory).unwrap();
+    #[cfg(unix)]
+    for directory in [&origin_directory, &product_directory] {
+        fs::set_permissions(
+            directory,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
+    }
     let origin_identity = write_identity(&origin_directory, "origin", "ingest.sentry.io");
     let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await

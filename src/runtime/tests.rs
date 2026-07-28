@@ -132,7 +132,7 @@ fn test_forwarding_executor(
         http_access_runtime::ForwardingExecutor::activate(
             network,
             protocols,
-            http_access_types::TlsTrust::Insecure,
+            http_access_types::TlsTrust::SystemRoots,
             http_access_types::Route::Direct,
             None,
             standalone.snapshot_lease(),

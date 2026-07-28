@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use access_tls_trust::TlsClientTrustMode;
 use ipnet::IpNet;
 use serde::de;
 use serde::{Deserialize, Deserializer};
@@ -700,8 +701,8 @@ pub(super) enum EgressRoute {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct TransportTlsConfig {
-    #[serde(default)]
-    pub trust: TlsTrust,
+    #[serde(default = "default_tls_client_trust_mode")]
+    pub trust: TlsClientTrustMode,
 
     #[serde(default)]
     pub ca_certificate: Option<PathBuf>,
@@ -713,7 +714,7 @@ pub(super) struct TransportTlsConfig {
 impl Default for TransportTlsConfig {
     fn default() -> Self {
         Self {
-            trust: TlsTrust::System,
+            trust: TlsClientTrustMode::System,
             ca_certificate: None,
             http_versions: default_http_versions(),
         }
@@ -724,14 +725,8 @@ fn default_http_versions() -> Vec<HttpVersion> {
     vec![HttpVersion::Http1, HttpVersion::Http2]
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum TlsTrust {
-    #[default]
-    System,
-    Custom,
-    SystemPlusCustom,
-    Insecure,
+const fn default_tls_client_trust_mode() -> TlsClientTrustMode {
+    TlsClientTrustMode::System
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -764,8 +759,8 @@ pub(super) enum ParentProxyKind {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ParentProxyTlsConfig {
-    #[serde(default)]
-    pub trust: TlsTrust,
+    #[serde(default = "default_tls_client_trust_mode")]
+    pub trust: TlsClientTrustMode,
 
     #[serde(default)]
     pub ca_certificate: Option<PathBuf>,
@@ -999,8 +994,8 @@ pub(super) struct WebhookProviderConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WebhookTlsConfig {
-    #[serde(default)]
-    pub trust: TlsTrust,
+    #[serde(default = "default_tls_client_trust_mode")]
+    pub trust: TlsClientTrustMode,
 
     #[serde(default)]
     pub ca_certificate: Option<PathBuf>,

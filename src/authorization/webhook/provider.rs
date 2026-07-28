@@ -10,9 +10,9 @@ use rustls::ClientConfig;
 use crate::authorization::protocol::ProviderOutputRegistry;
 use crate::candidate_tls::CandidateTlsResolver;
 use crate::config::compiler::{
-    CompiledProviderFailureMode, CompiledTlsTrust, WebhookProviderPlan, WebhookTlsPlan,
+    CompiledProviderFailureMode, TlsClientTrustMode, WebhookProviderPlan, WebhookTlsPlan,
 };
-use crate::tls::{build_client_config, load_client_trust_from_der, ClientAlpn, TlsActivationError};
+use crate::tls::{build_client_config, ClientAlpn, TlsActivationError};
 
 pub(crate) struct WebhookProvider {
     url: CanonicalUrl,
@@ -48,44 +48,23 @@ impl WebhookProvider {
                 trust,
                 ca_certificate,
             } = plan.tls.unwrap_or(WebhookTlsPlan {
-                trust: CompiledTlsTrust::System,
+                trust: TlsClientTrustMode::System,
                 ca_certificate: None,
             });
-            if trust == CompiledTlsTrust::Insecure {
+            if trust == TlsClientTrustMode::Insecure {
                 tracing::warn!("webhook TLS certificate verification is disabled");
             }
-            let custom_ca_der = match trust {
-                CompiledTlsTrust::Custom | CompiledTlsTrust::SystemPlusCustom => Some(
-                    tls_resolver
-                        .resolve(&ca_certificate.ok_or(WebhookActivationError::Tls(
-                            TlsActivationError::CaUnavailable,
-                        ))?)
-                        .await
-                        .map_err(|error| {
-                            if error == TlsActivationError::ActivationCancelled {
-                                WebhookActivationError::Cancelled
-                            } else {
-                                WebhookActivationError::Tls(error)
-                            }
-                        })?,
-                ),
-                CompiledTlsTrust::System | CompiledTlsTrust::Insecure => None,
-            };
-            let trust = load_client_trust_from_der(
-                trust,
-                tls_resolver.system_material(),
-                custom_ca_der.as_deref(),
-                &mut || tls_resolver.cancellation().is_cancelled(),
-            )
-            .map_err(|error| {
-                if error == TlsActivationError::ActivationCancelled {
-                    WebhookActivationError::Cancelled
-                } else {
-                    WebhookActivationError::Tls(error)
-                }
-            })?;
+            let prepared = tls_resolver
+                .prepared(trust, ca_certificate.as_deref())
+                .map_err(|error| {
+                    if error == TlsActivationError::ActivationCancelled {
+                        WebhookActivationError::Cancelled
+                    } else {
+                        WebhookActivationError::Tls(error)
+                    }
+                })?;
             Some(Arc::new(
-                build_client_config(&trust, ClientAlpn::Http1, true)
+                build_client_config(&prepared, ClientAlpn::Http1, true)
                     .map_err(WebhookActivationError::Tls)?,
             ))
         } else {
@@ -119,7 +98,7 @@ impl WebhookProvider {
             plan.url.scheme() != HttpScheme::Https
                 || matches!(
                     plan.tls.as_ref().map(|tls| tls.trust),
-                    Some(CompiledTlsTrust::Insecure)
+                    Some(TlsClientTrustMode::Insecure)
                 ),
             "file-loading webhook plans must use async production activation"
         );
@@ -130,17 +109,20 @@ impl WebhookProvider {
         let tls = if url.scheme() == HttpScheme::Https {
             let WebhookTlsPlan {
                 trust,
-                ca_certificate,
+                ca_certificate: _,
             } = plan.tls.unwrap_or(WebhookTlsPlan {
-                trust: CompiledTlsTrust::System,
+                trust: TlsClientTrustMode::System,
                 ca_certificate: None,
             });
-            let trust = crate::tls::load_client_trust(
+            let trust = access_tls_trust::prepare_tls_client_trust_from_conformance_der(
                 trust,
-                ca_certificate.as_deref(),
-                generation,
-                &mut is_cancelled,
+                access_tls_trust::TlsTrustGeneration::new(generation.get())
+                    .map_err(TlsActivationError::from)
+                    .map_err(WebhookActivationError::Tls)?,
+                &[],
+                &[],
             )
+            .map_err(TlsActivationError::from)
             .map_err(|error| {
                 if error == TlsActivationError::ActivationCancelled {
                     WebhookActivationError::Cancelled
@@ -217,6 +199,7 @@ mod tests {
     use http_access_url::canonicalize_http_url;
 
     use super::*;
+    use crate::candidate_tls::CandidateTlsPlanSet;
     use crate::runtime::ActivationCancellation;
     use crate::tls_io_runtime::TlsIoRuntime;
 
@@ -224,10 +207,14 @@ mod tests {
         tls_io: &Arc<TlsIoRuntime>,
         cancellation: ActivationCancellation,
     ) -> CandidateTlsResolver {
-        CandidateTlsResolver::activate(
+        let mut plans = CandidateTlsPlanSet::new();
+        plans.register(TlsClientTrustMode::System, None).unwrap();
+        plans.register(TlsClientTrustMode::Insecure, None).unwrap();
+        CandidateTlsResolver::activate_with_plans(
             Arc::clone(tls_io),
             cancellation,
             http_access_types::PolicyGeneration::new(7).unwrap(),
+            plans,
         )
         .await
         .expect("test host system roots load")
@@ -275,7 +262,7 @@ mod tests {
             plan(
                 "https://provider.test/authorize",
                 Some(WebhookTlsPlan {
-                    trust: CompiledTlsTrust::Insecure,
+                    trust: TlsClientTrustMode::Insecure,
                     ca_certificate: None,
                 }),
             ),
@@ -295,7 +282,7 @@ mod tests {
                 plan(
                     "https://provider.test/authorize",
                     Some(WebhookTlsPlan {
-                        trust: CompiledTlsTrust::Custom,
+                        trust: TlsClientTrustMode::Custom,
                         ca_certificate: Some(PathBuf::from("unused.pem")),
                     }),
                 ),

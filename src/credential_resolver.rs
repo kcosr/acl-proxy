@@ -512,8 +512,16 @@ mod tests {
             )
             .unwrap(),
             managed_network_policies: Vec::new(),
-            tls_roots: Vec::new(),
-            system_tls_roots: None,
+            tls_trust: vec![http_access_runtime::TlsTrustRegistration::insecure(
+                access_tls_trust::prepare_tls_client_trust_from_conformance_der(
+                    access_tls_trust::TlsClientTrustMode::Insecure,
+                    access_tls_trust::TlsTrustGeneration::new(generation.get()).unwrap(),
+                    &[],
+                    &[],
+                )
+                .unwrap(),
+            )
+            .unwrap()],
             resource_limits: RuntimeResourceLimits::new(1024 * 1024, 1024 * 1024, 0).unwrap(),
             templates: Vec::new(),
             handles: Vec::new(),

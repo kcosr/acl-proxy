@@ -177,6 +177,25 @@ fn run_inner() -> Result<ExitCode, CliError> {
                     &loaded.compiled.static_config.listeners,
                 )
                 .map_err(|error| CliError::Product(error.to_string()))?;
+                let validation_runtime = tokio::runtime::Runtime::new()
+                    .map_err(|error| CliError::Runtime(error.to_string()))?;
+                validation_runtime.block_on(async {
+                    let tls_io = crate::tls_io_runtime::TlsIoRuntime::new()
+                        .map_err(|error| CliError::Runtime(error.to_string()))?;
+                    let result = crate::config::validate_tls_trust_sources(
+                        &loaded.compiled,
+                        std::sync::Arc::clone(&tls_io),
+                        &crate::runtime::ActivationCancellation::new(),
+                    )
+                    .await
+                    .map_err(|error| CliError::Product(error.to_string()));
+                    let _ = tls_io
+                        .shutdown_and_wait(Some(
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                        ))
+                        .await;
+                    result
+                })?;
                 println!("Configuration is valid");
                 Ok(ExitCode::SUCCESS)
             }
