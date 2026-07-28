@@ -20,12 +20,11 @@ import sys
 
 root = Path(sys.argv[1])
 tls = '''rustls = { version = "=0.23.42", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-native-certs = "=0.8.3"
 rustls-pki-types = "=1.15.0"
 rustls-webpki = { version = "=0.103.13", default-features = false, features = ["alloc", "ring", "std"] }
 tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
 '''
-runtime_tls = tls.replace('rustls-native-certs = "=0.8.3"\n', '')
+runtime_tls = tls + 'rustls-native-certs = "=0.8.3"\n'
 (root / "acl-proxy/Cargo.toml").write_text(
     '[package]\nname = "acl-proxy"\nversion = "0.3.0-rc.1"\n\n[dependencies]\n' + tls,
     encoding="utf-8",
@@ -76,7 +75,7 @@ def lock(root_package, include_native):
 
 (root / "acl-proxy/Cargo.lock").write_text(lock("acl-proxy", True), encoding="utf-8")
 (root / "access-runtime/Cargo.lock").write_text(
-    lock("access-runtime", False), encoding="utf-8"
+    lock("access-runtime", True), encoding="utf-8"
 )
 (root / "acl-proxy/fixtures/empty/Cargo.lock").write_text(
     'version = 4\n\n[[package]]\nname = "empty"\nversion = "0.1.0"\n',
@@ -130,7 +129,7 @@ def force_track(repo, path):
 if mode == "acl-missing-rustls":
     replace(acl, 'rustls = { version = "=0.23.42", default-features = false, features = ["ring", "std", "tls12"] }\n', '')
 elif mode == "acl-missing-native":
-    replace(acl, 'rustls-native-certs = "=0.8.3"\n', '')
+    append(acl, 'rustls-native-certs = "=0.8.3"\n')
 elif mode == "acl-rustls-version":
     replace(acl, '=0.23.42', '=0.23.41')
 elif mode == "acl-rustls-default-features":
@@ -148,7 +147,7 @@ elif mode == "acl-tokio-default-features":
 elif mode == "acl-tokio-extra-feature":
     replace(acl, 'features = ["ring", "tls12"]', 'features = ["logging", "ring", "tls12"]')
 elif mode == "acl-native-version":
-    replace(acl, 'rustls-native-certs = "=0.8.3"', 'rustls-native-certs = "=0.8.2"')
+    append(acl, 'rustls-native-certs = "=0.8.2"\n')
 elif mode == "acl-pki-version":
     replace(acl, 'rustls-pki-types = "=1.15.0"', 'rustls-pki-types = "=1.14.0"')
 elif mode == "acl-webpki-version":
@@ -174,9 +173,13 @@ elif mode == "runtime-webpki-alias":
 elif mode == "runtime-rustls-feature":
     replace(runtime, '["ring", "std", "tls12"]', '["std", "tls12"]')
 elif mode == "runtime-native-dependency":
-    append(runtime, 'rustls-native-certs = "=0.8.3"\n')
+    replace(runtime, 'rustls-native-certs = "=0.8.3"\n', '')
 elif mode == "runtime-native-alias":
-    append(runtime, 'native-certs = { package = "rustls-native-certs", version = "=0.8.3" }\n')
+    replace(
+        runtime,
+        'rustls-native-certs = "=0.8.3"',
+        'native-certs = { package = "rustls-native-certs", version = "=0.8.3" }',
+    )
 elif mode == "runtime-member-native":
     append(
         root / "access-runtime/crates/example/Cargo.toml",
@@ -229,7 +232,7 @@ elif mode == "runtime-lock-native":
 elif mode == "runtime-nested-lock-native":
     nested = root / "access-runtime/crates/example/Cargo.lock"
     nested.write_text(
-        'version = 4\n\n[[package]]\nname = "rustls-native-certs"\nversion = "0.8.3"\n',
+        'version = 4\n\n[[package]]\nname = "rustls-native-certs"\nversion = "0.8.2"\n',
         encoding="utf-8",
     )
 elif mode == "nested-lock-rcgen":

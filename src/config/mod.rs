@@ -7,6 +7,7 @@ mod policy_dump;
 mod provenance;
 pub(crate) mod source_snapshot;
 mod template;
+mod tls_trust_preflight;
 
 pub(crate) use compiler::{
     ReloadableProductPlan, StaticFingerprint, StaticFingerprintError, StaticProductConfig,
@@ -21,3 +22,4 @@ pub(crate) use facade::{
 };
 pub(crate) use policy_dump::PolicyDump;
 pub(crate) use provenance::PolicySourceSummary;
+pub(crate) use tls_trust_preflight::{validate_tls_trust_sources, TlsTrustSourcePreflightError};

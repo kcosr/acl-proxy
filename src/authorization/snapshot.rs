@@ -820,10 +820,13 @@ mod tests {
     fn webhook_activation_error_preserves_sanitized_ca_classification() {
         let cancellation = cancellation();
         for (reason, expected) in [
-            (crate::tls::TlsActivationError::CaInvalid, "invalid"),
             (
-                crate::tls::TlsActivationError::CaLimit,
-                "shared TLS root limits",
+                crate::tls::TlsActivationError::InvalidMaterial,
+                "TLS trust material",
+            ),
+            (
+                crate::tls::TlsActivationError::ResourceLimit,
+                "resource limit",
             ),
         ] {
             let error = map_webhook_activation_error(
@@ -862,7 +865,7 @@ mod tests {
                         max_response_bytes: 1024,
                         outputs: BTreeMap::new(),
                         tls: Some(crate::config::compiler::WebhookTlsPlan {
-                            trust: crate::config::compiler::CompiledTlsTrust::Custom,
+                            trust: crate::config::compiler::TlsClientTrustMode::Custom,
                             ca_certificate: Some(path.into()),
                         }),
                     }),
@@ -871,61 +874,48 @@ mod tests {
         }
 
         let missing = plan("/sensitive/missing/provider-ca.pem");
-        let registry = ProviderRegistry::from_names(missing.providers.keys().cloned());
         let tls_io = crate::tls_io_runtime::TlsIoRuntime::new().unwrap();
-        let mut resolver = CandidateTlsResolver::activate(
+        let mut plans = crate::candidate_tls::CandidateTlsPlanSet::new();
+        plans
+            .register(
+                crate::config::compiler::TlsClientTrustMode::Custom,
+                Some(Path::new("/sensitive/missing/provider-ca.pem")),
+            )
+            .unwrap();
+        let error = CandidateTlsResolver::activate_with_plans(
             Arc::clone(&tls_io),
             cancellation(),
             http_access_types::PolicyGeneration::new(7).unwrap(),
-        )
-        .await
-        .expect("test host system roots load");
-        let error = ProductAuthorizationSnapshot::activate(
-            missing,
-            registry,
-            WebhookAuthorizationRuntime::for_test(Some(
-                "http://127.0.0.1:8888/_acl/external-auth/callback",
-            )),
-            &mut resolver,
+            plans,
         )
         .await
         .err()
         .expect("missing custom CA must reject the candidate");
-        assert!(matches!(
-            error,
-            AuthorizationActivationError::WebhookActivation {
-                ref provider,
-                reason: crate::tls::TlsActivationError::CaUnavailable,
-            } if provider == "safe-provider"
-        ));
+        assert_eq!(error, crate::tls::TlsActivationError::UntrustedSource);
         assert!(!error.to_string().contains("/sensitive/"));
+        drop(missing);
         tls_io.shutdown_and_wait(None).await;
 
         let cancellation = cancellation();
-        let cancelled = plan("/sensitive/missing/provider-ca.pem");
-        let registry = ProviderRegistry::from_names(cancelled.providers.keys().cloned());
         let tls_io = crate::tls_io_runtime::TlsIoRuntime::new().unwrap();
-        let mut resolver = CandidateTlsResolver::activate(
+        let mut plans = crate::candidate_tls::CandidateTlsPlanSet::new();
+        plans
+            .register(
+                crate::config::compiler::TlsClientTrustMode::Custom,
+                Some(Path::new("/sensitive/missing/provider-ca.pem")),
+            )
+            .unwrap();
+        cancellation.cancel_for_test();
+        let error = CandidateTlsResolver::activate_with_plans(
             Arc::clone(&tls_io),
             cancellation.clone(),
             http_access_types::PolicyGeneration::new(7).unwrap(),
-        )
-        .await
-        .expect("test host system roots load");
-        cancellation.cancel_for_test();
-        let error = ProductAuthorizationSnapshot::activate(
-            cancelled,
-            registry,
-            WebhookAuthorizationRuntime::for_test(Some(
-                "http://127.0.0.1:8888/_acl/external-auth/callback",
-            )),
-            &mut resolver,
+            plans,
         )
         .await
         .err()
         .expect("cancelled candidate must not load custom CA material");
-        assert!(matches!(error, AuthorizationActivationError::Cancelled));
-        assert_eq!(resolver.file_reads(), 0);
+        assert_eq!(error, crate::tls::TlsActivationError::ActivationCancelled);
         tls_io.shutdown_and_wait(None).await;
     }
 

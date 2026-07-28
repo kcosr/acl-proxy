@@ -169,6 +169,17 @@ impl ProductRuntime {
         )
         .await?;
         let observation_runtime = static_resources.observation_runtime();
+        let tls_io_runtime = static_resources.tls_io_runtime();
+        if let Err(error) = crate::config::validate_tls_trust_sources(
+            &compiled,
+            Arc::clone(&tls_io_runtime),
+            &crate::runtime::ActivationCancellation::new(),
+        )
+        .await
+        {
+            StaticResources::shutdown(static_resources.as_ref()).await;
+            return Err(error.into());
+        }
 
         #[cfg(test)]
         let prepared = match prebound {
@@ -461,6 +472,8 @@ impl ProductRuntime {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ProductRuntimeError {
     #[error(transparent)]
+    TlsTrustSourcePreflight(#[from] crate::config::TlsTrustSourcePreflightError),
+    #[error(transparent)]
     StaticResources(#[from] ProductStaticResourcesError),
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
@@ -565,6 +578,28 @@ default = "deny"
             Some(expected)
         );
         product.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn startup_preflights_custom_tls_trust_before_ingress_preparation() {
+        let (_directory, loaded) = loaded(&config(
+            "127.0.0.1:8881".parse().unwrap(),
+            "127.0.0.1:8891".parse().unwrap(),
+            "[egress.origin_tls]\ntrust = \"custom\"\nca_certificate = \"missing-ca.pem\"",
+        ));
+
+        let error = ProductRuntime::prepare_from_prebound(loaded, Vec::new())
+            .await
+            .err()
+            .expect("missing TLS trust source must fail startup");
+        assert!(matches!(
+            error,
+            ProductRuntimeError::TlsTrustSourcePreflight(_)
+        ));
+        let message = error.to_string();
+        assert!(message.contains("egress.origin_tls.ca_certificate"));
+        assert!(message.contains("missing-ca.pem"));
+        assert!(message.contains("tls_trust_source_custody"));
     }
 
     async fn read_http_message(stream: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
@@ -4119,7 +4154,16 @@ default = "allow"
             .unwrap();
         let parent_address = parent.local_addr().unwrap();
         let parent_identity = TestTlsIdentity::new("parent.test");
-        let parent_identity_directory = tempdir().unwrap();
+        let parent_identity_directory = tempfile::Builder::new()
+            .prefix("acl-proxy-parent-ca-")
+            .tempdir_in(std::env::var_os("HOME").expect("HOME is configured"))
+            .unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(
+            parent_identity_directory.path(),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         let parent_ca_path = parent_identity_directory.path().join("parent-ca.pem");
         crate::filesystem::write_public_file(
             &parent_ca_path,

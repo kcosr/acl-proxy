@@ -3,8 +3,10 @@ use std::sync::Arc;
 use crate::authorization::{
     AuthorizationActivation, AuthorizationActivationError, ProductAuthorizationSnapshot,
 };
-use crate::candidate_tls::CandidateTlsResolver;
-use crate::config::compiler::ReloadableProductPlan;
+use crate::candidate_tls::{CandidateTlsPlanSet, CandidateTlsResolver};
+use crate::config::compiler::{
+    AuthorizationPlan, AuthorizationProviderPlan, EgressPlan, ReloadableProductPlan,
+};
 use crate::config::StaticFingerprint;
 use crate::credentials::CredentialActivation;
 use crate::egress::{EgressActivation, EgressActivationError};
@@ -25,11 +27,27 @@ use super::static_resources::ProductStaticResources;
 /// generation. Every other handle returned by activation is generation-owned.
 pub(crate) struct ProductActivator {
     static_resources: Arc<ProductStaticResources>,
+    tls_io_runtime: Arc<crate::tls_io_runtime::TlsIoRuntime>,
 }
 
 impl ProductActivator {
     pub(super) fn new(static_resources: Arc<ProductStaticResources>) -> Self {
-        Self { static_resources }
+        let tls_io_runtime = static_resources.tls_io_runtime();
+        Self {
+            static_resources,
+            tls_io_runtime,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_tls_io_runtime_for_test(
+        static_resources: Arc<ProductStaticResources>,
+        tls_io_runtime: Arc<crate::tls_io_runtime::TlsIoRuntime>,
+    ) -> Self {
+        Self {
+            static_resources,
+            tls_io_runtime,
+        }
     }
 
     #[cfg(test)]
@@ -137,6 +155,20 @@ impl ProductActivator {
             safety,
             resource_plan,
         } = plan;
+        let generation = http_access_types::PolicyGeneration::new(standalone.version())
+            .map_err(|_| RuntimeError::CandidateActivation("invalid generation".to_owned()))?;
+        let tls_plans = collect_tls_plans(&egress, &authorization)
+            .map_err(|error| map_egress_error(error.into(), &cancellation))?;
+        let mut tls_resolver = CandidateTlsResolver::activate_with_plans(
+            Arc::clone(&self.tls_io_runtime),
+            cancellation.clone(),
+            generation,
+            tls_plans,
+        )
+        .await
+        .map_err(|error| map_egress_error(error.into(), &cancellation))?;
+        cancellation.check()?;
+
         let parent_presentation_source = egress
             .parent_proxy
             .as_ref()
@@ -192,15 +224,6 @@ impl ProductActivator {
             .map_err(|error| candidate_error(&cancellation, "observation", error.to_string()))?;
         cancellation.check()?;
 
-        let generation = http_access_types::PolicyGeneration::new(standalone.version())
-            .map_err(|_| RuntimeError::CandidateActivation("invalid generation".to_owned()))?;
-        let mut tls_resolver = CandidateTlsResolver::activate(
-            self.static_resources.tls_io_runtime(),
-            cancellation.clone(),
-            generation,
-        )
-        .await
-        .map_err(|error| map_egress_error(error.into(), &cancellation))?;
         let egress = EgressActivation::activate(egress, standalone.identity(), &mut tls_resolver)
             .await
             .map_err(|error| map_egress_error(error, &cancellation))?;
@@ -254,11 +277,14 @@ impl ProductActivator {
         let (authorization, provider_registry, provider_owners) = authorization.into_parts();
         let (observation, observation_owner) = observation.into_parts();
         let (credentials, credential_sources) = credentials.into_parts();
+        let tls_trust_owner: Arc<dyn GenerationOwner> =
+            Arc::new(tls_resolver.into_generation_owner());
 
-        let owners = provider_owners
-            .into_vec()
-            .into_iter()
-            .chain([observation_owner, logging_level_owner]);
+        let owners = provider_owners.into_vec().into_iter().chain([
+            observation_owner,
+            logging_level_owner,
+            tls_trust_owner,
+        ]);
         let product_owner: Arc<dyn GenerationOwner> = Arc::new(ProductGenerationOwner::new(owners));
         let owner: Arc<dyn GenerationOwner> = Arc::new(IdentityBoundGenerationOwner::new(
             product_owner,
@@ -301,6 +327,35 @@ impl ProductActivator {
             owner,
         })
     }
+}
+
+fn collect_tls_plans(
+    egress: &EgressPlan,
+    authorization: &AuthorizationPlan,
+) -> Result<CandidateTlsPlanSet, crate::tls::TlsActivationError> {
+    let mut plans = CandidateTlsPlanSet::new();
+    plans.register(
+        egress.origin_tls.trust,
+        egress.origin_tls.ca_certificate.as_deref(),
+    )?;
+    if let Some(tls) = egress
+        .parent_proxy
+        .as_ref()
+        .and_then(|parent| parent.tls.as_ref())
+    {
+        plans.register(tls.trust, tls.ca_certificate.as_deref())?;
+    }
+    for provider in authorization.providers.values() {
+        if let AuthorizationProviderPlan::Webhook(webhook) = provider {
+            if webhook.url.scheme() == http_access_types::HttpScheme::Https {
+                match webhook.tls.as_ref() {
+                    Some(tls) => plans.register(tls.trust, tls.ca_certificate.as_deref())?,
+                    None => plans.register(access_tls_trust::TlsClientTrustMode::System, None)?,
+                }
+            }
+        }
+    }
+    Ok(plans)
 }
 
 impl CandidateActivator for ProductActivator {
@@ -510,6 +565,59 @@ redaction_profile = "environment"
         (runtime, source)
     }
 
+    async fn product_runtime_with_tls_accounting(
+        initial: &crate::config::CompiledConfig,
+    ) -> (
+        Arc<crate::runtime::Runtime>,
+        Arc<ProductCandidateSource>,
+        Arc<crate::tls_io_runtime::TlsIoRuntime>,
+    ) {
+        let resources = ProductStaticResources::try_new(&initial.static_config)
+            .await
+            .unwrap();
+        let tls_io = resources.tls_io_runtime();
+        let activator = resources.activator();
+        let source = Arc::new(ProductCandidateSource::default());
+        let ownership = crate::runtime::StaticOwnership::new(
+            initial.static_config.clone(),
+            initial.static_fingerprint.clone(),
+            resources,
+        );
+        let runtime = crate::runtime::Runtime::new(ownership, source.clone(), activator)
+            .await
+            .unwrap();
+        (runtime, source, tls_io)
+    }
+
+    async fn product_runtime_with_system_trust_failure(
+        initial: &crate::config::CompiledConfig,
+        failure: crate::tls::TlsActivationError,
+    ) -> (
+        Arc<crate::runtime::Runtime>,
+        Arc<ProductCandidateSource>,
+        Arc<crate::tls_io_runtime::TlsIoRuntime>,
+    ) {
+        let resources = ProductStaticResources::try_new(&initial.static_config)
+            .await
+            .unwrap();
+        let tls_io =
+            crate::tls_io_runtime::TlsIoRuntime::new_with_system_failure_for_test(failure).unwrap();
+        let activator = Arc::new(ProductActivator::new_with_tls_io_runtime_for_test(
+            Arc::clone(&resources),
+            Arc::clone(&tls_io),
+        ));
+        let source = Arc::new(ProductCandidateSource::default());
+        let ownership = crate::runtime::StaticOwnership::new(
+            initial.static_config.clone(),
+            initial.static_fingerprint.clone(),
+            resources,
+        );
+        let runtime = crate::runtime::Runtime::new(ownership, source.clone(), activator)
+            .await
+            .unwrap();
+        (runtime, source, tls_io)
+    }
+
     #[tokio::test]
     async fn invalid_standalone_candidate_fails_before_egress_ca_io() {
         let mut compiled = compile(MINIMAL);
@@ -519,7 +627,7 @@ redaction_profile = "environment"
             .http_body_resources_by_cursor[0]
             .combined_peak_bytes += 1;
         compiled.reloadable_plan.egress.origin_tls.trust =
-            crate::config::compiler::CompiledTlsTrust::Custom;
+            crate::config::compiler::TlsClientTrustMode::Custom;
         compiled.reloadable_plan.egress.origin_tls.ca_certificate =
             Some("/sensitive/missing/ca.pem".into());
         let activator = product_activator(&compiled.static_config).await;
@@ -614,6 +722,170 @@ redaction_profile = "environment"
         drop(old_lease);
         drop(new_lease);
         runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tls_trust_generation_limit_preserves_active_then_recovers_after_retirement() {
+        let text = format!(
+            "{}\n[egress]\nroute = \"direct\"\n\n[egress.origin_tls]\ntrust = \"insecure\"\n",
+            MINIMAL.replace(
+                "max_retiring_generations = 2",
+                "max_retiring_generations = 8"
+            )
+        );
+        let initial = compile(&text);
+        let (runtime, source, tls_io) = product_runtime_with_tls_accounting(&initial).await;
+        runtime
+            .start(initial.into_runtime_candidate())
+            .await
+            .unwrap();
+        let mut retained = Vec::new();
+        for _ in 0..7 {
+            retained.push(runtime.lease().await.unwrap());
+            source.push(compile(&text));
+            runtime.trigger_reload().await.unwrap();
+        }
+        assert_eq!(tls_io.retained_for_test().1, 8);
+        let active = runtime.active_generation_id();
+        let readiness = runtime.is_ready();
+
+        source.push(compile(&text));
+        assert!(matches!(
+            runtime.trigger_reload().await,
+            Err(RuntimeError::CandidateActivation(message))
+                if message.contains("TLS trust generation limit")
+        ));
+        assert_eq!(runtime.active_generation_id(), active);
+        assert_eq!(runtime.is_ready(), readiness);
+
+        drop(retained.remove(0));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if tls_io.retained_for_test().1 == 7 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retired TLS trust generation did not release");
+
+        source.push(compile(&text));
+        runtime.trigger_reload().await.unwrap();
+        assert_ne!(runtime.active_generation_id(), active);
+        drop(retained);
+        runtime.shutdown().await;
+        assert_eq!(tls_io.retained_for_test(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn reload_tls_trust_failure_is_fixed_category_path_free_and_atomic() {
+        let initial = compile(MINIMAL);
+        let failed = compile(&format!(
+            "{MINIMAL}\n[egress.origin_tls]\ntrust = \"custom\"\nca_certificate = \"/sensitive/missing/reload-ca.pem\"\n"
+        ));
+        let (runtime, source) = product_runtime(&initial).await;
+        let active = runtime
+            .start(initial.into_runtime_candidate())
+            .await
+            .unwrap();
+        let readiness = runtime.is_ready();
+        source.push(failed);
+
+        let error = runtime.trigger_reload().await.unwrap_err();
+        let message = error.to_string();
+        assert!(matches!(error, RuntimeError::CandidateActivation(_)));
+        assert!(message.contains("custom TLS trust source is untrusted"));
+        assert!(!message.contains("reload-ca.pem"));
+        assert!(!message.contains("/sensitive/"));
+        assert_eq!(runtime.active_generation_id(), Some(active));
+        assert_eq!(runtime.is_ready(), readiness);
+        runtime.shutdown().await;
+    }
+
+    async fn assert_system_trust_reload_failure_is_atomic(
+        failure: crate::tls::TlsActivationError,
+        category: &str,
+    ) {
+        let initial = compile(&format!(
+            "{MINIMAL}\n[egress.origin_tls]\ntrust = \"insecure\"\n"
+        ));
+        let failed = compile(MINIMAL);
+        let (runtime, source, tls_io) =
+            product_runtime_with_system_trust_failure(&initial, failure).await;
+        let active = runtime
+            .start(initial.into_runtime_candidate())
+            .await
+            .unwrap();
+        let readiness = runtime.is_ready();
+        source.push(failed);
+
+        let error = runtime.trigger_reload().await.unwrap_err();
+        let message = error.to_string();
+        assert!(matches!(error, RuntimeError::CandidateActivation(_)));
+        assert!(message.contains(category));
+        assert_eq!(runtime.active_generation_id(), Some(active));
+        assert_eq!(runtime.is_ready(), readiness);
+        runtime.shutdown().await;
+        assert_eq!(
+            tls_io.shutdown_and_wait(None).await,
+            crate::tls_io_runtime::TlsIoShutdownOutcome::Drained
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_empty_system_trust_preserves_the_active_generation() {
+        assert_system_trust_reload_failure_is_atomic(
+            crate::tls::TlsActivationError::SystemStoreEmpty,
+            "system TLS trust store is empty",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reload_unavailable_system_trust_preserves_the_active_generation() {
+        assert_system_trust_reload_failure_is_atomic(
+            crate::tls::TlsActivationError::SystemStoreUnavailable,
+            "system TLS trust store is unavailable",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn full_candidate_deduplicates_shared_global_origin_and_parent_trust() {
+        for trust in ["system", "insecure"] {
+            let compiled = compile(&format!(
+                r#"{MINIMAL}
+
+[egress]
+route = "parent_proxy"
+
+[egress.origin_tls]
+trust = "{trust}"
+
+[egress.parent_proxy]
+kind = "generic"
+url = "https://parent.example.test:8443"
+
+[egress.parent_proxy.tls]
+trust = "{trust}"
+"#
+            ));
+            let activator = product_activator(&compiled.static_config).await;
+            let activated = activator
+                .activate_generation(
+                    compiled.reloadable_plan,
+                    ActivationCancellation::new_for_test(),
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{trust} origin and parent trust must activate: {error}")
+                });
+            activated
+                .owner
+                .cleanup(crate::runtime::CleanupReason::CandidateRejected)
+                .await;
+        }
     }
 
     #[tokio::test]

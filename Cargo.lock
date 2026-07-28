@@ -26,6 +26,7 @@ dependencies = [
  "access-flow-tls",
  "access-flow-unix",
  "access-identity",
+ "access-tls-trust",
  "base64",
  "serde",
  "serde_json",
@@ -50,6 +51,7 @@ dependencies = [
  "access-async-contracts",
  "access-flow",
  "access-flow-relay",
+ "access-tls-trust",
  "idna",
  "rustix",
  "rustls",
@@ -94,6 +96,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "access-tls-trust"
+version = "0.1.0"
+dependencies = [
+ "access-async-contracts",
+ "access-tls-trust-windows",
+ "pem-rfc7468",
+ "rustix",
+ "rustls",
+ "rustls-native-certs",
+ "serde",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "access-tls-trust-windows"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "acl-proxy"
 version = "0.3.0-rc.1"
 dependencies = [
@@ -103,6 +127,7 @@ dependencies = [
  "access-flow-unix",
  "access-identity",
  "access-rpc-framing",
+ "access-tls-trust",
  "allocator-api2",
  "arc-swap",
  "assert_cmd",
@@ -138,7 +163,6 @@ dependencies = [
  "regex",
  "rustix",
  "rustls",
- "rustls-native-certs",
  "rustls-pki-types",
  "rustls-webpki",
  "serde",
@@ -887,6 +911,7 @@ dependencies = [
  "access-async-contracts",
  "access-flow",
  "access-identity",
+ "access-tls-trust",
  "allocator-api2",
  "bytes",
  "credential-core",

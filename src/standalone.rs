@@ -341,8 +341,7 @@ impl UnboundStandaloneGenerationPlan {
         mut self,
         neutral_egress: NeutralEgressBindings,
     ) -> Result<Self, StandaloneCompileError> {
-        let (origin_protocols, origin_https_trust, route, tls_roots, system_tls_roots) =
-            neutral_egress.into_parts();
+        let (origin_protocols, origin_https_trust, route, tls_trust) = neutral_egress.into_parts();
         let registries =
             self.core
                 .pending_registries
@@ -356,8 +355,7 @@ impl UnboundStandaloneGenerationPlan {
             sensitive_headers: self.core.sensitive_headers.to_vec(),
             registries,
             managed_network_policies: Vec::new(),
-            tls_roots,
-            system_tls_roots: Some(system_tls_roots),
+            tls_trust,
             resource_limits: self.core.resource_limits,
             templates: Vec::new(),
             handles: Vec::new(),
@@ -1649,17 +1647,15 @@ fn stable_id(value: &str) -> Result<StableId, StandaloneCompileError> {
 mod tests {
     use std::path::Path;
 
-    use http_access_types::{CredentialMutationKind, HeaderField, PolicyHeaderFacts};
-    use tempfile::TempDir;
-
     use super::*;
     use crate::config::compiler::{
-        CompiledEgressRoute, CompiledParentProxyKind, CompiledTlsTrust, ParentProxyPlan,
-        ParentProxyTlsPlan,
+        CompiledEgressRoute, CompiledParentProxyKind, ParentProxyPlan, ParentProxyTlsPlan,
+        TlsClientTrustMode,
     };
     use crate::config::{compile_config_text, ConfigTextInput};
     use crate::egress::EgressActivation;
     use crate::test_certificates::TestTlsIdentity;
+    use http_access_types::{CredentialMutationKind, HeaderField, PolicyHeaderFacts};
 
     const PLAN: &str = r#"schema_version = 4
 
@@ -1806,14 +1802,23 @@ header = "x-acl-proxy-request-id"
         plan: &ReloadableProductPlan,
         id: GenerationId,
     ) -> UnboundStandaloneGenerationPlan {
-        let directory = TempDir::new().unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("acl-proxy-standalone-tls-")
+            .tempdir_in(std::env::var_os("HOME").expect("HOME is configured"))
+            .unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            directory.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let certificate = TestTlsIdentity::new("standalone-root.example");
         let ca = directory.path().join("root.pem");
         crate::filesystem::write_public_file(&ca, certificate.root_certificate_pem()).unwrap();
         let mut egress = plan.egress.clone();
         if matches!(
             egress.origin_tls.trust,
-            CompiledTlsTrust::Custom | CompiledTlsTrust::SystemPlusCustom
+            TlsClientTrustMode::Custom | TlsClientTrustMode::SystemPlusCustom
         ) {
             egress.origin_tls.ca_certificate = Some(ca.clone());
         }
@@ -1824,17 +1829,34 @@ header = "x-acl-proxy-request-id"
         {
             if matches!(
                 parent_tls.trust,
-                CompiledTlsTrust::Custom | CompiledTlsTrust::SystemPlusCustom
+                TlsClientTrustMode::Custom | TlsClientTrustMode::SystemPlusCustom
             ) {
                 parent_tls.ca_certificate = Some(ca);
             }
         }
         let draft = UnboundStandaloneGenerationPlan::compile(plan, id).unwrap();
         let tls_io = crate::tls_io_runtime::TlsIoRuntime::new().unwrap();
-        let mut tls_resolver = crate::candidate_tls::CandidateTlsResolver::activate(
+        let mut tls_plans = crate::candidate_tls::CandidateTlsPlanSet::new();
+        tls_plans
+            .register(
+                egress.origin_tls.trust,
+                egress.origin_tls.ca_certificate.as_deref(),
+            )
+            .unwrap();
+        if let Some(parent_tls) = egress
+            .parent_proxy
+            .as_ref()
+            .and_then(|parent| parent.tls.as_ref())
+        {
+            tls_plans
+                .register(parent_tls.trust, parent_tls.ca_certificate.as_deref())
+                .unwrap();
+        }
+        let mut tls_resolver = crate::candidate_tls::CandidateTlsResolver::activate_with_plans(
             std::sync::Arc::clone(&tls_io),
             crate::runtime::ActivationCancellation::new_for_test(),
             PolicyGeneration::new(draft.version()).unwrap(),
+            tls_plans,
         )
         .await
         .expect("test host system roots load");
@@ -2147,7 +2169,7 @@ header = "x-acl-proxy-request-id"
             target: http_access_url::canonicalize_http_url("https://parent.example.test:8443/")
                 .unwrap(),
             tls: Some(ParentProxyTlsPlan {
-                trust: CompiledTlsTrust::Custom,
+                trust: TlsClientTrustMode::Custom,
                 ca_certificate: Some("parent-root.pem".into()),
                 server_name: "parent.example.test".to_owned(),
             }),

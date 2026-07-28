@@ -79,7 +79,7 @@ fn initialize_generated_ca(directory: &Path, public_chain_path: &Path) {
         }
         pem.push_str("-----END CERTIFICATE-----\n");
     }
-    fs::write(public_chain_path, pem).unwrap();
+    crate::filesystem::write_public_file(public_chain_path, pem).unwrap();
 }
 
 fn explicit_http_config(bind: SocketAddr, extra: &str) -> String {

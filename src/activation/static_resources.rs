@@ -1549,15 +1549,22 @@ header = "x-acl-proxy-request-id"
 
         StaticResources::begin_shutdown(resources.as_ref());
         let sensitive_path = directory.path().join("closed-sensitive-ca.pem");
+        let generation = access_tls_trust::TlsTrustGeneration::new(7).unwrap();
+        let plan = access_tls_trust::TlsClientTrustPlan::new(
+            access_tls_trust::TlsClientTrustMode::Insecure,
+            None,
+        )
+        .unwrap();
         let error = tls_io
-            .load_custom_ca(
-                sensitive_path.clone(),
-                http_access_types::PolicyGeneration::new(7).unwrap(),
+            .prepare_candidate(
+                generation,
+                vec![plan],
+                Vec::new(),
                 &crate::runtime::ActivationCancellation::new_for_test(),
             )
             .await
             .expect_err("static shutdown must close TLS I/O admission");
-        assert_eq!(error, crate::tls::TlsActivationError::CaLoaderUnavailable);
+        assert_eq!(error, crate::tls::TlsActivationError::LoaderUnavailable);
         assert!(!error.to_string().contains(sensitive_path.to_str().unwrap()));
 
         tokio::time::timeout(

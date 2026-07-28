@@ -468,12 +468,24 @@ trust = "system" # system | custom | system_plus_custom | insecure
 http_versions = ["http1", "http2"]
 ```
 
-Every candidate activation loads and validates one bounded snapshot of the
-native system trust store, then binds that exact typed root set into the shared
-runtime snapshot. This is deliberate even when the candidate's configured
-routes currently use only custom trust, insecure TLS, or cleartext: activation
-fails if the native trust store cannot be loaded, and request paths never
-reload or reinterpret it.
+Candidate activation declares every origin, parent-proxy, and HTTPS webhook
+trust requirement before performing TLS trust I/O. It then loads each distinct
+required source once through the shared Access Runtime trust implementation and
+binds the prepared, generation-scoped values into the complete candidate.
+System roots are loaded only when at least one configured trust scope requires
+them; an all-custom, all-insecure, or cleartext candidate does not depend on the
+native trust store. Custom CA paths must be absolute regular files beneath
+stable, owned, non-writable parent directories. Reload rejects link, custody,
+mutation, size, or certificate validation failures and leaves the prior
+generation active. Request paths never reload or reinterpret trust sources.
+System acquisition, each custom-source acquisition, and each final source
+revalidation run as separately supervised blocking operations with a 30-second
+operation deadline inside the scaled candidate deadline. A timed-out
+non-interruptible operation keeps reload admission closed until its watcher
+observes exit. Published and retiring trust generations plus an unpublished
+candidate share a 256 MiB overlap budget and an eight-generation ceiling;
+resource rejection preserves the current generation and a later reload can
+proceed after retired request leases drain.
 
 For a parent proxy:
 

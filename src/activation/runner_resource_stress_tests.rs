@@ -995,12 +995,38 @@ async fn run_stress_batch(proxy: SocketAddr, origins: &StressOrigins, batch: usi
     .unwrap_or_else(|_| panic!("stress batch {batch} exceeded {BATCH_TIMEOUT:?}"));
 }
 
-async fn wait_for_quiescence(origins: &StressOrigins, product: Option<&ProductRuntime>) {
+fn terminal_outcome_total(counts: crate::observation::ForwardingTerminalCounts) -> usize {
+    counts
+        .completed
+        .checked_add(counts.failed)
+        .and_then(|total| total.checked_add(counts.cancelled))
+        .and_then(|total| total.checked_add(counts.abandoned))
+        .expect("forwarding terminal outcome count overflowed")
+}
+
+struct ExpectedProductQuiescence<'a> {
+    product: &'a ProductRuntime,
+    terminal_completions: usize,
+    terminal_outcomes: usize,
+}
+
+async fn wait_for_quiescence(
+    origins: &StressOrigins,
+    product: Option<ExpectedProductQuiescence<'_>>,
+) {
     let result = tokio::time::timeout(QUIESCENCE_TIMEOUT, async {
         loop {
-            let pool_is_empty =
-                product.is_none_or(|product| product.wire_body_pool().global_charge() == 0);
-            if origins.active_count() == 0 && pool_is_empty {
+            let product_is_quiescent = product.as_ref().is_none_or(|expected| {
+                expected.product.wire_body_pool().global_charge() == 0
+                    && expected
+                        .product
+                        .forwarding_terminal_completions_for_test()
+                        == expected.terminal_completions
+                    && terminal_outcome_total(
+                        expected.product.forwarding_terminal_outcomes_for_test(),
+                    ) == expected.terminal_outcomes
+            });
+            if origins.active_count() == 0 && product_is_quiescent {
                 break;
             }
             tokio::task::yield_now().await;
@@ -1010,9 +1036,23 @@ async fn wait_for_quiescence(origins: &StressOrigins, product: Option<&ProductRu
     .await;
     assert!(
         result.is_ok(),
-        "stress resources did not quiesce: active origin sockets={:?} (request, response, H2, WebSocket), wire body charge={}",
+        "stress resources did not quiesce: active origin sockets={:?} (request, response, H2, WebSocket), wire body charge={}, terminal completions={}/{}, terminal outcomes={}/{}",
         origins.active_counts(),
-        product.map_or(0, |product| product.wire_body_pool().global_charge())
+        product
+            .as_ref()
+            .map_or(0, |expected| expected.product.wire_body_pool().global_charge()),
+        product.as_ref().map_or(0, |expected| expected
+            .product
+            .forwarding_terminal_completions_for_test()),
+        product
+            .as_ref()
+            .map_or(0, |expected| expected.terminal_completions),
+        product.as_ref().map_or(0, |expected| terminal_outcome_total(
+            expected.product.forwarding_terminal_outcomes_for_test()
+        )),
+        product
+            .as_ref()
+            .map_or(0, |expected| expected.terminal_outcomes),
     );
 }
 
@@ -1403,13 +1443,22 @@ async fn in_process_resource_stress_releases_body_and_origin_ownership() {
     for batch in 0..batch_count {
         let completions_before = product.forwarding_terminal_completions_for_test();
         let outcomes_before = product.forwarding_terminal_outcomes_for_test();
+        let terminal_count = 2 * H1_STREAMS_PER_SHAPE + H2_STREAMS + WEBSOCKET_RELAYS;
         run_stress_batch(proxy, &origins, batch).await;
-        wait_for_quiescence(&origins, Some(&product)).await;
+        wait_for_quiescence(
+            &origins,
+            Some(ExpectedProductQuiescence {
+                product: &product,
+                terminal_completions: completions_before + terminal_count,
+                terminal_outcomes: terminal_outcome_total(outcomes_before) + terminal_count,
+            }),
+        )
+        .await;
         assert_eq!(pool.global_charge(), 0);
         assert!(pool.peak_global_charge() > 0);
         assert_eq!(
             product.forwarding_terminal_completions_for_test() - completions_before,
-            2 * H1_STREAMS_PER_SHAPE + H2_STREAMS + WEBSOCKET_RELAYS,
+            terminal_count,
             "stress batch {batch} did not complete every forwarding terminal owner"
         );
         let outcomes = product.forwarding_terminal_outcomes_for_test();

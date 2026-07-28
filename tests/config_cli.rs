@@ -104,6 +104,28 @@ fn wait_for_file_text(path: &std::path::Path, expected: &str) {
 }
 
 #[cfg(unix)]
+fn wait_for_file_text_while_running(path: &Path, expected: &str, child: &mut Child) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let contents = fs::read_to_string(path).unwrap_or_default();
+        if contents.contains(expected) {
+            return;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "acl-proxy exited before {} contained {expected:?}:\n{contents}",
+            path.display()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "{} never contained {expected:?}:\n{contents}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(unix)]
 struct ChildGuard(Child);
 
 #[cfg(unix)]
@@ -226,6 +248,12 @@ console = false
 
 #[cfg(unix)]
 fn proxy_get(proxy: SocketAddr, url: &str, timeout: Duration) -> std::io::Result<Vec<u8>> {
+    let stream = begin_proxy_get(proxy, url, timeout)?;
+    finish_proxy_get(stream, timeout)
+}
+
+#[cfg(unix)]
+fn begin_proxy_get(proxy: SocketAddr, url: &str, timeout: Duration) -> std::io::Result<TcpStream> {
     let authority = url
         .strip_prefix("http://")
         .expect("HTTP fixture URL")
@@ -233,12 +261,17 @@ fn proxy_get(proxy: SocketAddr, url: &str, timeout: Duration) -> std::io::Result
         .next()
         .unwrap();
     let mut stream = TcpStream::connect_timeout(&proxy, timeout)?;
-    stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     write!(
         stream,
         "GET {url} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
     )?;
+    Ok(stream)
+}
+
+#[cfg(unix)]
+fn finish_proxy_get(mut stream: TcpStream, timeout: Duration) -> std::io::Result<Vec<u8>> {
+    stream.set_read_timeout(Some(timeout))?;
     let mut response = Vec::new();
     stream.read_to_end(&mut response)?;
     Ok(response)
@@ -377,6 +410,21 @@ fn config_validate_accepts_strict_schema_four() {
         .assert()
         .success()
         .stdout(contains("Configuration is valid"));
+}
+
+#[test]
+fn config_validate_reports_authored_custom_trust_scope_and_value() {
+    let file = config_file(&format!(
+        "{MINIMAL}\n[egress.origin_tls]\ntrust = \"custom\"\nca_certificate = \"/sensitive/missing/validate-ca.pem\"\n"
+    ));
+    command()
+        .args(["config", "validate", "--config"])
+        .arg(file.path())
+        .assert()
+        .failure()
+        .stderr(contains("egress.origin_tls.ca_certificate"))
+        .stderr(contains("/sensitive/missing/validate-ca.pem"))
+        .stderr(contains("tls_trust_source_custody"));
 }
 
 #[test]
@@ -1258,34 +1306,20 @@ fn first_termination_signal_drains_an_inflight_request_to_completion() {
     let mut child = ChildGuard::spawn(&config);
     wait_for_ready(&mut child, control);
 
-    let client = thread::spawn(move || {
-        proxy_get(proxy, "http://192.0.2.1/drain", Duration::from_secs(5))
-            .expect("draining request completed")
-    });
-    let admitted_deadline = Instant::now() + Duration::from_secs(5);
-    while !marker.is_file() {
-        if client.is_finished() {
-            let logs =
-                fs::read_to_string(directory.path().join("logs/acl-proxy.log")).unwrap_or_default();
-            panic!(
-                "request completed before provider admission: {:?}; logs: {logs}",
-                client.join().unwrap(),
-            );
-        }
-        assert!(
-            Instant::now() < admitted_deadline,
-            "provider did not admit the request"
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
+    let client = begin_proxy_get(proxy, "http://192.0.2.1/drain", Duration::from_secs(5))
+        .expect("send draining request");
+    wait_for_file(&marker, &mut child);
+
     child.signal(libc::SIGTERM);
-    thread::sleep(Duration::from_millis(150));
-    assert!(
-        child.try_wait().unwrap().is_none(),
-        "first termination signal aborted the in-flight request"
+    wait_for_file_text_while_running(
+        &directory.path().join("logs/acl-proxy.log"),
+        "received SIGTERM; initiating graceful shutdown",
+        &mut child,
     );
+
     fs::write(&release, b"release").unwrap();
-    let response = client.join().unwrap();
+    let response = finish_proxy_get(client, Duration::from_secs(5))
+        .expect("draining request completed after provider release");
     assert!(response.starts_with(b"HTTP/1.1 403"), "{response:?}");
     let status = child.wait_for_exit(
         Duration::from_secs(5),

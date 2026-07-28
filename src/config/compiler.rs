@@ -16,6 +16,7 @@ use access_identity::{
     IdentitySubject, PrincipalId, PrincipalKind, StaticGroup, StaticPrincipal, TokenId,
 };
 use access_rpc_framing::{FrameBodyLimit, FrameKind, FrameProtocol};
+pub(crate) use access_tls_trust::TlsClientTrustMode;
 use base64::encoded_len as base64_encoded_len;
 use credential_core::{
     project_credential_resources, CredentialDescriptor, CredentialLimits, CredentialProfile,
@@ -75,8 +76,7 @@ use super::authoring::{
     ListenerEndpointConfig, ListenerIdentityModeConfig, ListenersConfig, MitmConfig,
     ObservationConfig, ParentProxyKind, ParentProxyPresentationConfig, PolicyConfig,
     PolicyRuleConfig, RedactionConfig, RedactionPayloads, RuleDecision, SafetyConfig,
-    StaticTlsIdentityConfig, TlsTrust, TransportSecurity, TransportTlsConfig,
-    UnsupportedExtensions,
+    StaticTlsIdentityConfig, TransportSecurity, TransportTlsConfig, UnsupportedExtensions,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -530,17 +530,9 @@ pub(crate) enum CompiledEgressRoute {
 
 #[derive(Clone)]
 pub(crate) struct TransportTlsPlan {
-    pub(crate) trust: CompiledTlsTrust,
+    pub(crate) trust: TlsClientTrustMode,
     pub(crate) ca_certificate: Option<PathBuf>,
     pub(crate) http_versions: Vec<CompiledHttpVersion>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CompiledTlsTrust {
-    System,
-    Custom,
-    SystemPlusCustom,
-    Insecure,
 }
 
 #[derive(Clone)]
@@ -559,7 +551,7 @@ pub(crate) enum CompiledParentProxyKind {
 
 #[derive(Clone)]
 pub(crate) struct ParentProxyTlsPlan {
-    pub(crate) trust: CompiledTlsTrust,
+    pub(crate) trust: TlsClientTrustMode,
     pub(crate) ca_certificate: Option<PathBuf>,
     pub(crate) server_name: String,
 }
@@ -794,7 +786,7 @@ pub(crate) struct WebhookProviderPlan {
 
 #[derive(Clone)]
 pub(crate) struct WebhookTlsPlan {
-    pub(crate) trust: CompiledTlsTrust,
+    pub(crate) trust: TlsClientTrustMode,
     pub(crate) ca_certificate: Option<PathBuf>,
 }
 
@@ -3845,11 +3837,14 @@ fn validate_transport_tls(
 }
 
 fn validate_trust_matrix(
-    trust: TlsTrust,
+    trust: TlsClientTrustMode,
     ca: Option<&Path>,
     prefix: &str,
 ) -> Result<(), ConfigCompileError> {
-    let requires_ca = matches!(trust, TlsTrust::Custom | TlsTrust::SystemPlusCustom);
+    let requires_ca = matches!(
+        trust,
+        TlsClientTrustMode::Custom | TlsClientTrustMode::SystemPlusCustom
+    );
     if requires_ca != ca.is_some() {
         return Err(ConfigCompileError::at(
             format!("{prefix}.ca_certificate"),
@@ -7879,18 +7874,9 @@ fn compile_egress_plan(
 
 fn compile_transport_tls_plan(value: &TransportTlsConfig) -> TransportTlsPlan {
     TransportTlsPlan {
-        trust: compile_tls_trust(value.trust),
+        trust: value.trust,
         ca_certificate: value.ca_certificate.clone(),
         http_versions: compile_http_versions(&value.http_versions),
-    }
-}
-
-fn compile_tls_trust(value: TlsTrust) -> CompiledTlsTrust {
-    match value {
-        TlsTrust::System => CompiledTlsTrust::System,
-        TlsTrust::Custom => CompiledTlsTrust::Custom,
-        TlsTrust::SystemPlusCustom => CompiledTlsTrust::SystemPlusCustom,
-        TlsTrust::Insecure => CompiledTlsTrust::Insecure,
     }
 }
 
@@ -7905,7 +7891,7 @@ fn compile_parent_proxy_plan(
         },
         target: target.clone(),
         tls: value.tls.as_ref().map(|tls| ParentProxyTlsPlan {
-            trust: compile_tls_trust(tls.trust),
+            trust: tls.trust,
             ca_certificate: tls.ca_certificate.clone(),
             server_name: tls
                 .server_name
@@ -8297,7 +8283,7 @@ fn compile_provider_plan(
                 max_response_bytes: value.max_response_bytes,
                 outputs: compile_provider_outputs(&value.outputs, &format!("{prefix}.outputs"))?,
                 tls: value.tls.as_ref().map(|tls| WebhookTlsPlan {
-                    trust: compile_tls_trust(tls.trust),
+                    trust: tls.trust,
                     ca_certificate: tls.ca_certificate.clone(),
                 }),
             })
@@ -13340,10 +13326,10 @@ filename = "{{requestId}}-{{suffix}}.json"
             CompiledEgressRoute::ParentProxy => "parent",
         };
         let origin_trust = match plan.egress.origin_tls.trust {
-            CompiledTlsTrust::System => "system",
-            CompiledTlsTrust::Custom => "custom",
-            CompiledTlsTrust::SystemPlusCustom => "system+custom",
-            CompiledTlsTrust::Insecure => "insecure",
+            TlsClientTrustMode::System => "system",
+            TlsClientTrustMode::Custom => "custom",
+            TlsClientTrustMode::SystemPlusCustom => "system+custom",
+            TlsClientTrustMode::Insecure => "insecure",
         };
         let policy_default = match plan.policy.default {
             CompiledDefaultDecision::Allow => "allow",
@@ -14338,7 +14324,7 @@ trust = "insecure"
         .expect("a validated canonical IPv6 parent must activate");
 
         let (neutral, _) = activation.into_parts();
-        let (_, _, route, _, _) = neutral.into_parts();
+        let (_, _, route, _) = neutral.into_parts();
         assert!(matches!(
             route,
             http_access_types::Route::AclProxyParent { .. }

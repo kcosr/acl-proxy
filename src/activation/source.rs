@@ -190,6 +190,27 @@ default = "deny"
         assert!(!error.to_string().contains("do-not-echo"));
     }
 
+    #[tokio::test]
+    async fn reload_source_remains_pure_when_custom_tls_trust_is_missing() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("acl-proxy.toml");
+        fs::write(&path, MINIMAL).unwrap();
+        let initial = load_and_compile_config(Some(&path)).unwrap();
+        let source = FileCandidateSource::new(&initial.metadata);
+        fs::write(
+            &path,
+            format!(
+                "{MINIMAL}\n[egress.origin_tls]\ntrust = \"custom\"\nca_certificate = \"missing-ca.pem\"\n"
+            ),
+        )
+        .unwrap();
+
+        source
+            .load_latest(ActivationCancellation::new_for_test())
+            .await
+            .expect("candidate source performs no TLS trust I/O");
+    }
+
     #[test]
     fn cancellation_removes_a_queued_blocking_reload_before_shutdown_waits() {
         let directory = tempdir().unwrap();
@@ -197,10 +218,6 @@ default = "deny"
         fs::write(&path, MINIMAL).unwrap();
         let initial = load_and_compile_config(Some(&path)).unwrap();
         let blocking_spawned = std::sync::Arc::new(tokio::sync::Notify::new());
-        let source = std::sync::Arc::new(FileCandidateSource::with_blocking_spawn_observer(
-            &initial.metadata,
-            blocking_spawned.clone(),
-        ));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .max_blocking_threads(1)
@@ -209,6 +226,10 @@ default = "deny"
             .unwrap();
 
         runtime.block_on(async move {
+            let source = std::sync::Arc::new(FileCandidateSource::with_blocking_spawn_observer(
+                &initial.metadata,
+                blocking_spawned.clone(),
+            ));
             let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = tokio::sync::oneshot::channel();
             let blocker = tokio::task::spawn_blocking(move || {
