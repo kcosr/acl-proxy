@@ -156,9 +156,9 @@ fn metadata_from_stat(stat: &Stat) -> ObjectMetadata {
         size: u64::try_from(stat.st_size).unwrap_or(u64::MAX),
         mutation: MutationMetadata {
             modified_seconds: stat.st_mtime,
-            modified_nanos: stat.st_mtime_nsec as i64,
+            modified_nanos: stat_i64(stat.st_mtime_nsec),
             changed_seconds: stat.st_ctime,
-            changed_nanos: stat.st_ctime_nsec as i64,
+            changed_nanos: stat_i64(stat.st_ctime_nsec),
             attributes: stat.st_mode as u64,
         },
     }
@@ -169,6 +169,13 @@ where
     u64: TryFrom<T>,
 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn stat_i64<T>(value: T) -> i64
+where
+    i64: TryFrom<T>,
+{
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 fn errno(error: rustix::io::Errno) -> io::Error {

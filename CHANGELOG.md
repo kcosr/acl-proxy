@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Made the macOS test harness canonicalize Darwin's symlinked per-user
+  temporary root and reserve listeners on the portable localhost address.
 - Require Windows Access Flow server private keys to be owned by the process
   user and have a protected, owner-restricted DACL, matching the Unix
   owner-only custody requirement.

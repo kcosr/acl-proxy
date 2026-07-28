@@ -604,7 +604,6 @@ impl CapturePolicy {
             redaction_profile: _,
             sink,
             max_body_bytes,
-            max_inflight_body_bytes: _,
             ..
         } = plan;
         Self {

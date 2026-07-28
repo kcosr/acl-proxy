@@ -111,7 +111,7 @@ pub(super) fn reserve_listeners<const N: usize>(
     let mut listeners = Vec::with_capacity(N);
     for _ in 0..N {
         listeners.push(
-            TcpListener::bind(SocketAddr::from(([127, 0, 0, 2], 0)))
+            TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
                 .expect("reserve listener fixture address"),
         );
     }

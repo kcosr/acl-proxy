@@ -1007,8 +1007,25 @@ rules = [{{ literals = "{SECRET_MARKER}" }}]
             )
             .unwrap();
         }
-        let error = load_path(&config_path).unwrap_err();
-        assert!(error.to_string().contains("ASCII case folding"), "{error}");
+        let distinct_case_entries = fs::read_dir(&rules_path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                matches!(
+                    entry.file_name().to_str(),
+                    Some("10-Users.toml" | "10-users.toml")
+                )
+            })
+            .count();
+        if distinct_case_entries == 2 {
+            let error = load_path(&config_path).unwrap_err();
+            assert!(error.to_string().contains("ASCII case folding"), "{error}");
+        } else {
+            assert_eq!(
+                distinct_case_entries, 1,
+                "case-insensitive filesystems must expose one aliased entry"
+            );
+        }
     }
 
     #[test]

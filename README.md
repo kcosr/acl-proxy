@@ -1150,6 +1150,12 @@ cargo clippy --all-targets --all-features -- -D warnings
 scripts/check-ownership.sh
 ```
 
+On macOS, run the test suite through `scripts/test-macos.sh`. Darwin reports
+its per-user temporary directory through the `/var` compatibility symlink, but
+the security-material tests intentionally reject symlinked storage roots. The
+wrapper resolves that directory to its canonical `/private/var` path before
+running the same locked suite.
+
 Repository-local agent instructions are in `AGENTS.md`. Detailed design and
 implementation records are under `docs/implementation/`.
 

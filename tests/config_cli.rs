@@ -760,7 +760,8 @@ fn config_path_environment_is_the_only_static_command_override() {
         .stdout(contains("Configuration is valid"));
 }
 
-#[cfg(unix)]
+// APFS rejects invalid UTF-8 path components before the CLI can observe them.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn config_path_environment_preserves_non_unicode_paths() {
     use std::ffi::OsString;
@@ -781,7 +782,8 @@ fn config_path_environment_preserves_non_unicode_paths() {
         .stdout(contains("Configuration is valid"));
 }
 
-#[cfg(unix)]
+// APFS rejects invalid UTF-8 path components before the CLI can observe them.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn explicit_config_path_overrides_a_non_unicode_environment_path() {
     use std::ffi::OsString;

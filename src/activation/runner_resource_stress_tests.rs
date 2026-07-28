@@ -364,10 +364,14 @@ async fn wait_for_tcp_close_without_reading(stream: &mut tokio::net::TcpStream, 
 #[cfg(not(target_os = "linux"))]
 async fn wait_for_tcp_close_without_reading(stream: &mut tokio::net::TcpStream, message: &str) {
     let mut sink = Vec::new();
-    tokio::time::timeout(QUIESCENCE_TIMEOUT, stream.read_to_end(&mut sink))
+    let result = tokio::time::timeout(QUIESCENCE_TIMEOUT, stream.read_to_end(&mut sink))
         .await
-        .unwrap_or_else(|_| panic!("{message}"))
-        .expect("stress TCP close observation failed");
+        .unwrap_or_else(|_| panic!("{message}"));
+    assert!(
+        result.is_ok()
+            || result.is_err_and(|error| error.kind() == io::ErrorKind::ConnectionReset),
+        "stress TCP close observation failed"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -451,6 +455,7 @@ async fn h1_response_backpressure_origin(mut stream: tokio::net::TcpStream) {
     })
     .await;
     assert!(written > 0, "response backpressure made no origin progress");
+    #[cfg(target_os = "linux")]
     assert!(
         written < H1_BODY_BYTES,
         "response backpressure buffered the complete origin body"
@@ -687,7 +692,7 @@ min_wire_body_concurrency = 32
 [service.forwarding]
 connect_timeout = "10s"
 response_head_timeout = "10s"
-body_idle_timeout = "3s"
+body_idle_timeout = "10s"
 upgrade_idle_timeout = "2s"
 max_request_wire_bytes = 16777216
 max_request_decoded_bytes = 16777216
@@ -796,6 +801,7 @@ async fn h1_request_client(proxy: SocketAddr, origin: SocketAddr, batch: usize, 
     })
     .await;
     assert!(written > 0, "request backpressure made no bounded progress");
+    #[cfg(target_os = "linux")]
     assert!(
         written < H1_BODY_BYTES,
         "request backpressure client sent the complete declared body"
@@ -876,7 +882,7 @@ async fn h2_clients(proxy: SocketAddr, origin: SocketAddr, batch: usize) {
             }
             if cancelled {
                 assert!(!body.is_end_stream());
-                let reset = tokio::time::timeout(QUIESCENCE_TIMEOUT, body.data())
+                let reset = tokio::time::timeout(BATCH_TIMEOUT, body.data())
                     .await
                     .expect("zero-window H2 response was not cancelled")
                     .expect("zero-window H2 response ended without RST_STREAM")

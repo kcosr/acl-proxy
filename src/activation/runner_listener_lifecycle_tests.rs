@@ -28,6 +28,14 @@ struct TestIdentity {
 trait LifecycleIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> LifecycleIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
+fn assert_tcp_stream_closed(result: std::io::Result<usize>) {
+    assert!(
+        matches!(result, Ok(0))
+            || result.is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionReset),
+        "shutdown left downstream application data readable"
+    );
+}
+
 struct FixedOriginalDestination(SocketAddr);
 
 impl OriginalDestinationProvider for FixedOriginalDestination {
@@ -452,7 +460,7 @@ async fn static_owner_closes_and_joins_runtime_owned_upgrade_tasks() {
         .await
         .expect("static owner must close and join runtime listener tasks");
     let mut byte = [0_u8; 1];
-    assert_eq!(idle.read(&mut byte).await.unwrap(), 0);
+    assert_tcp_stream_closed(idle.read(&mut byte).await);
     assert_eq!(
         product.runtime().lifecycle(),
         crate::runtime::LifecycleState::Stopped
@@ -512,7 +520,7 @@ async fn explicit_https_shutdown_interrupts_stalled_client_hello() {
         .await
         .expect("shutdown must interrupt a stalled ClientHello");
     let mut byte = [0_u8; 1];
-    assert_eq!(stalled.read(&mut byte).await.unwrap(), 0);
+    assert_tcp_stream_closed(stalled.read(&mut byte).await);
     crate::activation::assert_listener_addresses_released(&test, [proxy]);
 }
 

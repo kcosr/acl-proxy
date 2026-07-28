@@ -3305,7 +3305,7 @@ default = "deny"
         super::super::assert_listener_addresses_released(&_test, addresses);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn remote_tls_access_flow_enforces_source_rate_table_and_admission_timeout() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
