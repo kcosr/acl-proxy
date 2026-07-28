@@ -892,10 +892,14 @@ impl ProductStaticResources {
                 .shutdown_and_wait(deadline.map(tokio::time::Instant::into_std))
                 .await;
         }
-        self.unix_socket_lifetimes
+        let mut unix_socket_lifetimes = self
+            .unix_socket_lifetimes
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for lifetime in unix_socket_lifetimes.iter() {
+            lifetime.cleanup();
+        }
+        unix_socket_lifetimes.clear();
     }
 
     #[cfg(test)]
@@ -1184,6 +1188,8 @@ pub(crate) enum ProductStaticResourcesError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
     use std::path::Path;
     use std::sync::mpsc as std_mpsc;
     use std::sync::Condvar;
@@ -1410,6 +1416,40 @@ header = "x-acl-proxy-request-id"
             resources.take_prepared_listener_bundle(),
             Err(ProductStaticResourcesError::IngressAlreadyAdopted)
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_before_listener_adoption_cleans_the_prepared_unix_socket() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let reservations = super::super::reserve_listeners::<5>(&_test);
+        let addresses = reservations.addresses();
+        drop(reservations);
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket_path = directory.path().join("prepared.sock");
+        let mut config = static_config(addresses, directory.path());
+        config.listeners.transparent_http.as_mut().unwrap().endpoint =
+            crate::config::compiler::StaticListenerEndpoint::AccessFlow {
+                admission_timeout: Duration::from_secs(1),
+                allowed_destination_ports: vec![80],
+                transport: crate::config::compiler::StaticAccessFlowTransport::Unix {
+                    path: socket_path.clone(),
+                    mode: 0o600,
+                },
+            };
+        let resources = ProductStaticResources::try_new(&config).await.unwrap();
+        resources.prepare_ingress().unwrap();
+        assert!(std::fs::symlink_metadata(&socket_path)
+            .unwrap()
+            .file_type()
+            .is_socket());
+
+        StaticResources::shutdown(resources.as_ref()).await;
+
+        assert!(!socket_path.exists());
+        assert!(crate::config::compiler::unix_listener_lock_path(&socket_path).is_file());
+        super::super::assert_listener_addresses_released(&_test, addresses);
     }
 
     #[tokio::test]

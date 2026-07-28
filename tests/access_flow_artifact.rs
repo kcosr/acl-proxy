@@ -68,17 +68,24 @@ async fn stop(child: &mut ChildGuard, socket: &Path) {
     );
     for _ in 0..200 {
         if child.0.try_wait().unwrap().is_some() {
-            assert!(std::fs::symlink_metadata(socket)
-                .unwrap()
-                .file_type()
-                .is_socket());
-            std::fs::remove_file(socket).unwrap();
             assert!(!socket.exists());
             return;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("ACL Proxy did not stop after SIGTERM");
+}
+
+fn spawn(config_path: &Path) -> ChildGuard {
+    ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_acl-proxy"))
+            .args(["run", "--config"])
+            .arg(config_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    )
 }
 
 #[tokio::test]
@@ -121,15 +128,7 @@ default = "deny"
     );
     std::fs::write(&config_path, config).unwrap();
 
-    let mut child = ChildGuard(
-        Command::new(env!("CARGO_BIN_EXE_acl-proxy"))
-            .args(["run", "--config"])
-            .arg(&config_path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
-    );
+    let mut child = spawn(&config_path);
     wait_until_ready(&mut child.0, control, &socket).await;
 
     let mut rejected = UnixStream::connect(&socket).await.unwrap();
@@ -183,4 +182,63 @@ default = "deny"
     );
     assert!(String::from_utf8_lossy(&response).contains("request denied"));
     stop(&mut child, &socket).await;
+
+    let mut restarted = spawn(&config_path);
+    wait_until_ready(&mut restarted.0, control, &socket).await;
+    stop(&mut restarted, &socket).await;
+}
+
+#[tokio::test]
+async fn forced_exit_leaves_a_stale_socket_that_the_next_startup_recovers() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = directory.path().join("forced-exit.sock");
+    let config_path = directory.path().join("acl-proxy.toml");
+    let control = reserve_address();
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"schema_version = 4
+
+[service]
+request_timeout = "5s"
+shutdown_drain_timeout = "1s"
+
+[control]
+bind = "{control}"
+base_path = "/_acl-proxy"
+
+[listeners.transparent_http]
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
+endpoint.allowed_destination_ports = [80]
+http_versions = ["http1"]
+
+[listeners.transparent_http.endpoint.transport]
+kind = "unix"
+path = {socket:?}
+mode = "0600"
+
+[egress]
+route = "direct"
+
+[policy]
+default = "deny"
+"#
+        ),
+    )
+    .unwrap();
+
+    let mut killed = spawn(&config_path);
+    wait_until_ready(&mut killed.0, control, &socket).await;
+    killed.0.kill().unwrap();
+    assert!(!killed.0.wait().unwrap().success());
+    assert!(std::fs::symlink_metadata(&socket)
+        .unwrap()
+        .file_type()
+        .is_socket());
+
+    let mut restarted = spawn(&config_path);
+    wait_until_ready(&mut restarted.0, control, &socket).await;
+    stop(&mut restarted, &socket).await;
 }

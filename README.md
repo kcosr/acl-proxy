@@ -343,12 +343,12 @@ host listener private and is sufficient for the root-owned guest endpoint and
 root-supervised relay. Other Unix deployments should select the narrowest
 socket mode compatible with their relay process.
 
-The path must be absolute. ACL Proxy refuses every pre-existing path and never
-unlinks it. For a socket owned by the current user, a bounded liveness probe
-only improves the diagnostic: live, busy, and indeterminate sockets report
-`AddrInUse`, while a refused connection identifies a stale socket that must be
-removed explicitly. Symlinks, non-sockets, sockets owned by another user, and
-other probe failures are rejected.
+The path must be absolute. After acquiring the endpoint lock, ACL Proxy removes
+an effective-user-owned socket only when a bounded probe definitively reports
+it stale and a second no-following metadata check confirms that its device and
+inode did not change. Live, busy, indeterminate, replaced, symlink,
+non-socket, wrong-owner, and other uncertain paths are rejected without
+modification.
 
 ACL Proxy prepares the socket and its mode under a private same-directory name,
 then atomically publishes it without replacing an occupied final path. Linux
@@ -359,14 +359,19 @@ coordinates overlapping ACL Proxy instances while permitting disjoint endpoint
 sets; the locks are not a security boundary against other processes running as
 the same trusted workstation user.
 
-ACL Proxy deliberately does not unlink the final path during shutdown because
-POSIX has no atomic compare-inode-and-unlink operation. The service supervisor
-or operator must remove the socket after the proxy has exited and released its
-endpoint lock, before starting it again. This is also required after a later
-startup
-stage fails following socket publication. The immediate parent must already
-exist as a real directory owned by the workstation user with no group or other
-permission bits (normally mode `0700`).
+During controlled shutdown and startup rollback, ACL Proxy stops and joins the
+listener, verifies that the final path still identifies the socket it
+published, unlinks that socket, and only then releases the endpoint lock. The
+regular lock file remains for reuse. A crash or forced termination can leave a
+stale socket, which the next startup recovers using the checks above. POSIX has
+no atomic compare-inode-and-unlink operation, so a noncooperating process under
+the same trusted user could still race the final check. Configuring a path
+claims that pathname for ACL Proxy; a mistaken path can therefore remove
+another same-user application's stale socket. Deployments that do not trust
+all processes under that user should use a dedicated OS identity and private
+runtime directory, or supervisor-owned socket activation. The immediate
+parent must already exist as a real directory owned by the workstation user
+with no group or other permission bits (normally mode `0700`).
 
 Access Flow ingress represents one local workstation principal. The effective
 client is loopback and local for quota purposes, and configurations using this

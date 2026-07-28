@@ -140,10 +140,88 @@ enum PreparedListenerEndpoint {
 #[cfg(unix)]
 pub(super) struct UnixSocketLifetime {
     _lock: File,
+    path: PathBuf,
+    effective_uid: u32,
+    identity: UnixSocketIdentity,
+    cleanup_started: AtomicBool,
 }
 
 #[cfg(not(unix))]
 pub(super) struct UnixSocketLifetime;
+
+#[cfg(not(unix))]
+impl UnixSocketLifetime {
+    pub(super) fn cleanup(&self) {}
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UnixSocketIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+impl UnixSocketIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnixSocketCleanupOutcome {
+    Removed,
+    Absent,
+    Mismatch,
+}
+
+#[cfg(unix)]
+impl UnixSocketLifetime {
+    pub(super) fn cleanup(&self) {
+        if self.cleanup_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        match remove_matching_unix_socket(&self.path, self.effective_uid, self.identity) {
+            Ok(UnixSocketCleanupOutcome::Removed) => {
+                tracing::info!(
+                    target: "acl_proxy::traffic",
+                    endpoint = %self.path.display(),
+                    category = "unix_socket_removed",
+                    "removed the published Unix proxy listener socket"
+                );
+            }
+            Ok(UnixSocketCleanupOutcome::Absent) => {}
+            Ok(UnixSocketCleanupOutcome::Mismatch) => {
+                tracing::warn!(
+                    target: "acl_proxy::traffic",
+                    endpoint = %self.path.display(),
+                    category = "unix_socket_cleanup_mismatch",
+                    "left a Unix proxy listener path untouched because it no longer identifies the published socket"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "acl_proxy::traffic",
+                    endpoint = %self.path.display(),
+                    category = "unix_socket_cleanup_failed",
+                    error_kind = ?error.kind(),
+                    "failed to remove the published Unix proxy listener socket"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixSocketLifetime {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
 
 #[derive(Default)]
 pub(super) struct PreparedProxyListeners {
@@ -1774,7 +1852,7 @@ fn bind_access_flow_unix(
         )
     })?;
 
-    reject_preexisting_unix_socket(path, effective_uid, probe_existing_unix_socket)?;
+    prepare_unix_socket_path(path, effective_uid, probe_existing_unix_socket)?;
 
     let (listener, private_path) = bind_private_unix_socket(path)?;
     if let Err(error) =
@@ -1783,7 +1861,13 @@ fn bind_access_flow_unix(
         let _ = std::fs::remove_file(&private_path);
         return Err(error);
     }
-    let private_metadata = std::fs::symlink_metadata(&private_path)?;
+    let private_metadata = match std::fs::symlink_metadata(&private_path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            let _ = std::fs::remove_file(&private_path);
+            return Err(error);
+        }
+    };
     if let Err(error) = verify_staged_unix_socket(&private_metadata, effective_uid, mode) {
         let _ = std::fs::remove_file(&private_path);
         return Err(error);
@@ -1793,7 +1877,31 @@ fn bind_access_flow_unix(
         return Err(error);
     }
 
-    let lifetime = Arc::new(UnixSocketLifetime { _lock: lock });
+    let private_identity = UnixSocketIdentity::from_metadata(&private_metadata);
+    let published_metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            let _ = remove_matching_unix_socket(path, effective_uid, private_identity);
+            return Err(error);
+        }
+    };
+    if verify_staged_unix_socket(&published_metadata, effective_uid, mode).is_err()
+        || UnixSocketIdentity::from_metadata(&published_metadata) != private_identity
+    {
+        let _ = remove_matching_unix_socket(path, effective_uid, private_identity);
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Unix proxy listener changed during publication",
+        ));
+    }
+
+    let lifetime = Arc::new(UnixSocketLifetime {
+        _lock: lock,
+        path: path.to_path_buf(),
+        effective_uid,
+        identity: private_identity,
+        cleanup_started: AtomicBool::new(false),
+    });
     Ok(PreparedListenerEndpoint::AccessFlowUnix {
         listener,
         lifetime,
@@ -1949,7 +2057,7 @@ fn publish_unix_socket_noreplace(_private_path: &Path, _final_path: &Path) -> io
 }
 
 #[cfg(unix)]
-fn reject_preexisting_unix_socket(
+fn prepare_unix_socket_path(
     path: &Path,
     effective_uid: u32,
     probe: impl FnOnce(&Path) -> io::Result<()>,
@@ -1960,16 +2068,41 @@ fn reject_preexisting_unix_socket(
         Err(error) => return Err(error),
     };
     validate_owned_socket(&metadata, effective_uid)?;
+    let identity = UnixSocketIdentity::from_metadata(&metadata);
 
     match probe(path) {
         Ok(()) => Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             "Unix proxy listener socket is live",
         )),
-        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => Err(io::Error::new(
-            io::ErrorKind::AddrInUse,
-            "Unix proxy listener socket is stale; remove it explicitly before startup",
-        )),
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+            match remove_matching_unix_socket(path, effective_uid, identity)? {
+                UnixSocketCleanupOutcome::Removed => {
+                    tracing::info!(
+                        target: "acl_proxy::traffic",
+                        endpoint = %path.display(),
+                        category = "stale_unix_socket_removed",
+                        "removed a verified stale Unix proxy listener socket during startup"
+                    );
+                    Ok(())
+                }
+                UnixSocketCleanupOutcome::Absent => Ok(()),
+                UnixSocketCleanupOutcome::Mismatch => Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "Unix proxy listener path changed while stale cleanup was in progress",
+                )),
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "Unix proxy listener path changed while it was being inspected",
+                )),
+                Err(error) => Err(error),
+            }
+        }
         Err(error)
             if matches!(
                 error.kind(),
@@ -1983,6 +2116,34 @@ fn reject_preexisting_unix_socket(
                 io::ErrorKind::AddrInUse,
                 "Unix proxy listener socket is live or its accept backlog is unavailable",
             ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn remove_matching_unix_socket(
+    path: &Path,
+    effective_uid: u32,
+    identity: UnixSocketIdentity,
+) -> io::Result<UnixSocketCleanupOutcome> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(UnixSocketCleanupOutcome::Absent);
+        }
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != effective_uid
+        || UnixSocketIdentity::from_metadata(&metadata) != identity
+    {
+        return Ok(UnixSocketCleanupOutcome::Mismatch);
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(UnixSocketCleanupOutcome::Removed),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok(UnixSocketCleanupOutcome::Absent)
         }
         Err(error) => Err(error),
     }
@@ -2728,7 +2889,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unix_listener_lock_mode_and_explicit_cleanup_contract() {
+    fn unix_listener_lock_mode_and_owned_cleanup_contract() {
         let directory = private_unix_tempdir();
         let path = directory.path().join("transparent-http.sock");
         let config = unix_transparent_config(&path, 0o606);
@@ -2739,70 +2900,76 @@ mod tests {
         let metadata = std::fs::symlink_metadata(&path).unwrap();
         assert!(metadata.file_type().is_socket());
         assert_eq!(metadata.permissions().mode() & 0o777, 0o606);
-        let first_inode = metadata.ino();
 
+        let lifetime = match &first.transparent_http.as_ref().unwrap().endpoint {
+            PreparedListenerEndpoint::AccessFlowUnix { lifetime, .. } => Arc::clone(lifetime),
+            _ => unreachable!(),
+        };
+        lifetime.cleanup();
+        assert!(!path.exists());
         let error = match PreparedProxyListeners::bind(&config, |_| unreachable!()) {
             Ok(_) => panic!("second process must not acquire a held Unix listener lock"),
             Err(error) => error,
         };
         assert_eq!(error.name, "transparent_http");
         assert_eq!(error.address, None);
-        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), first_inode);
+        assert_eq!(error.source.kind(), io::ErrorKind::AddrInUse);
 
         drop(first);
-        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), first_inode);
-        let error = match PreparedProxyListeners::bind(&config, |_| unreachable!()) {
-            Ok(_) => panic!("stale Unix socket must require explicit cleanup"),
-            Err(error) => error,
-        };
-        assert_eq!(error.source.kind(), io::ErrorKind::AddrInUse);
-        assert!(error.source.to_string().contains("remove it explicitly"));
+        assert!(PreparedProxyListeners::bind(&config, |_| unreachable!()).is_err());
+        drop(lifetime);
+        assert!(!path.exists());
+        let lock_path = unix_listener_lock_path(&path);
+        let lock_metadata = std::fs::symlink_metadata(lock_path).unwrap();
+        assert!(lock_metadata.file_type().is_file());
+        assert_eq!(lock_metadata.permissions().mode() & 0o777, 0o600);
 
-        std::fs::remove_file(&path).unwrap();
         let rebound = PreparedProxyListeners::bind(&config, |_| unreachable!()).unwrap();
         assert!(std::fs::symlink_metadata(&path)
             .unwrap()
             .file_type()
             .is_socket());
 
+        let replacement_path = directory.path().join("shutdown-replacement.sock");
+        let replacement = UnixListener::bind(&replacement_path).unwrap();
+        let replacement_identity = UnixSocketIdentity::from_metadata(
+            &std::fs::symlink_metadata(&replacement_path).unwrap(),
+        );
+        std::fs::rename(&replacement_path, &path).unwrap();
+        drop(rebound);
+        assert_eq!(
+            UnixSocketIdentity::from_metadata(&std::fs::symlink_metadata(&path).unwrap()),
+            replacement_identity
+        );
+        std::fs::remove_file(&path).unwrap();
+        drop(replacement);
+
+        let regular_rebound = PreparedProxyListeners::bind(&config, |_| unreachable!()).unwrap();
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, b"external replacement").unwrap();
-        drop(rebound);
+        drop(regular_rebound);
         assert_eq!(std::fs::read(&path).unwrap(), b"external replacement");
     }
 
     #[cfg(unix)]
     #[test]
-    fn unix_listener_never_unlinks_preexisting_paths() {
+    fn unix_listener_recovers_stale_socket_but_never_unlinks_other_preexisting_paths() {
         use std::os::unix::fs::symlink;
 
         let directory = private_unix_tempdir();
         let path = directory.path().join("traffic.sock");
         drop(UnixListener::bind(&path).unwrap());
-        let stale_inode = std::fs::symlink_metadata(&path).unwrap().ino();
-        let error = match PreparedProxyListeners::bind(
-            &unix_transparent_config(&path, 0o600),
-            |_| unreachable!(),
-        ) {
-            Ok(_) => panic!("stale Unix socket must require explicit cleanup"),
-            Err(error) => error,
-        };
-        assert_eq!(error.source.kind(), io::ErrorKind::AddrInUse);
-        assert!(error.source.to_string().contains("remove it explicitly"));
-        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), stale_inode);
-
-        std::fs::remove_file(&path).unwrap();
         let prepared = PreparedProxyListeners::bind(
             &unix_transparent_config(&path, 0o600),
             |_| unreachable!(),
         )
         .unwrap();
-        drop(prepared);
         assert!(std::fs::symlink_metadata(&path)
             .unwrap()
             .file_type()
             .is_socket());
-        std::fs::remove_file(&path).unwrap();
+        drop(prepared);
+        assert!(!path.exists());
 
         std::fs::write(&path, b"collision").unwrap();
         assert!(PreparedProxyListeners::bind(
@@ -2825,6 +2992,48 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_listener_cleanup_accepts_an_already_absent_path() {
+        let directory = private_unix_tempdir();
+        let path = directory.path().join("already-absent.sock");
+        let prepared = PreparedProxyListeners::bind(
+            &unix_transparent_config(&path, 0o600),
+            |_| unreachable!(),
+        )
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        drop(prepared);
+
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disjoint_unix_listener_lifetimes_remain_independent() {
+        let directory = private_unix_tempdir();
+        let first_path = directory.path().join("first-independent.sock");
+        let second_path = directory.path().join("second-independent.sock");
+        let first = PreparedProxyListeners::bind(
+            &unix_transparent_config(&first_path, 0o600),
+            |_| unreachable!(),
+        )
+        .unwrap();
+        let second = PreparedProxyListeners::bind(
+            &unix_transparent_config(&second_path, 0o600),
+            |_| unreachable!(),
+        )
+        .unwrap();
+
+        drop(first);
+        assert!(!first_path.exists());
+        assert!(second_path.exists());
+
+        drop(second);
+        assert!(!second_path.exists());
     }
 
     #[cfg(unix)]
@@ -2912,6 +3121,64 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn matching_socket_cleanup_requires_socket_type_and_effective_user_ownership() {
+        use std::os::unix::fs::symlink;
+
+        let directory = private_unix_tempdir();
+        let effective_uid = rustix::process::geteuid().as_raw();
+
+        let regular_path = directory.path().join("regular-replacement");
+        std::fs::write(&regular_path, b"regular").unwrap();
+        let regular_metadata = std::fs::symlink_metadata(&regular_path).unwrap();
+        assert_eq!(
+            remove_matching_unix_socket(
+                &regular_path,
+                effective_uid,
+                UnixSocketIdentity::from_metadata(&regular_metadata),
+            )
+            .unwrap(),
+            UnixSocketCleanupOutcome::Mismatch
+        );
+        assert_eq!(std::fs::read(&regular_path).unwrap(), b"regular");
+
+        let symlink_path = directory.path().join("symlink-replacement");
+        symlink(&regular_path, &symlink_path).unwrap();
+        let symlink_metadata = std::fs::symlink_metadata(&symlink_path).unwrap();
+        assert_eq!(
+            remove_matching_unix_socket(
+                &symlink_path,
+                effective_uid,
+                UnixSocketIdentity::from_metadata(&symlink_metadata),
+            )
+            .unwrap(),
+            UnixSocketCleanupOutcome::Mismatch
+        );
+        assert!(std::fs::symlink_metadata(&symlink_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let socket_path = directory.path().join("wrong-owner.sock");
+        let socket = UnixListener::bind(&socket_path).unwrap();
+        let socket_metadata = std::fs::symlink_metadata(&socket_path).unwrap();
+        assert_eq!(
+            remove_matching_unix_socket(
+                &socket_path,
+                effective_uid.wrapping_add(1),
+                UnixSocketIdentity::from_metadata(&socket_metadata),
+            )
+            .unwrap(),
+            UnixSocketCleanupOutcome::Mismatch
+        );
+        assert!(std::fs::symlink_metadata(&socket_path)
+            .unwrap()
+            .file_type()
+            .is_socket());
+        drop(socket);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn unix_listener_refuses_a_live_same_user_socket_without_unlinking_it() {
         let directory = private_unix_tempdir();
         let path = directory.path().join("live.sock");
@@ -2936,15 +3203,16 @@ mod tests {
     fn preexisting_socket_probe_classification_is_fail_closed() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("existing.sock");
-        drop(UnixListener::bind(&path).unwrap());
-        let inode = std::fs::symlink_metadata(&path).unwrap().ino();
         let effective_uid = rustix::process::geteuid().as_raw();
 
+        drop(UnixListener::bind(&path).unwrap());
+        prepare_unix_socket_path(&path, effective_uid, |_| {
+            Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+        })
+        .unwrap();
+        assert!(!path.exists());
+
         for (probe_error, expected_fragment) in [
-            (
-                io::Error::from(io::ErrorKind::ConnectionRefused),
-                "remove it explicitly",
-            ),
             (
                 io::Error::from(io::ErrorKind::TimedOut),
                 "backlog is unavailable",
@@ -2954,19 +3222,109 @@ mod tests {
                 "backlog is unavailable",
             ),
         ] {
-            let error = reject_preexisting_unix_socket(&path, effective_uid, |_| Err(probe_error))
-                .unwrap_err();
+            drop(UnixListener::bind(&path).unwrap());
+            let inode = std::fs::symlink_metadata(&path).unwrap().ino();
+            let error =
+                prepare_unix_socket_path(&path, effective_uid, |_| Err(probe_error)).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
             assert!(error.to_string().contains(expected_fragment));
             assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), inode);
+            std::fs::remove_file(&path).unwrap();
         }
 
-        let error = reject_preexisting_unix_socket(&path, effective_uid, |_| {
+        drop(UnixListener::bind(&path).unwrap());
+        let inode = std::fs::symlink_metadata(&path).unwrap().ino();
+        let error = prepare_unix_socket_path(&path, effective_uid, |_| {
             Err(io::Error::from(io::ErrorKind::PermissionDenied))
         })
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), inode);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_cleanup_refuses_a_socket_replaced_after_the_probe() {
+        let directory = private_unix_tempdir();
+        let path = directory.path().join("replaced.sock");
+        let replacement_path = directory.path().join("replacement.sock");
+        drop(UnixListener::bind(&path).unwrap());
+        let original_inode = std::fs::symlink_metadata(&path).unwrap().ino();
+        let effective_uid = rustix::process::geteuid().as_raw();
+        let replacement = UnixListener::bind(&replacement_path).unwrap();
+        let replacement_inode = std::fs::symlink_metadata(&replacement_path).unwrap().ino();
+        assert_ne!(replacement_inode, original_inode);
+
+        let error = prepare_unix_socket_path(&path, effective_uid, |_| {
+            std::fs::rename(&replacement_path, &path).unwrap();
+            Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(
+            std::fs::symlink_metadata(&path).unwrap().ino(),
+            replacement_inode
+        );
+        drop(replacement);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_multi_listener_bind_failure_cleans_an_already_published_socket() {
+        let directory = private_unix_tempdir();
+        let first_path = directory.path().join("first.sock");
+        let second_path = directory.path().join("second.sock");
+        std::fs::write(&second_path, b"occupied").unwrap();
+        let mut config = unix_transparent_config(&first_path, 0o600);
+        config.transparent_https = Some(StaticTransparentHttpsListener {
+            endpoint: StaticListenerEndpoint::AccessFlow {
+                admission_timeout: Duration::from_secs(1),
+                allowed_destination_ports: vec![443],
+                transport: StaticAccessFlowTransport::Unix {
+                    path: second_path.clone(),
+                    mode: 0o600,
+                },
+            },
+            http_versions: vec![CompiledHttpVersion::Http1],
+            handshake_timeout: Duration::from_secs(1),
+            request_header_timeout: Duration::from_secs(1),
+            max_connections: 4,
+            max_concurrent_streams: 4,
+            identity_mode: CompiledListenerIdentityMode::Disabled,
+        });
+
+        assert!(PreparedProxyListeners::bind(&config, |_| unreachable!()).is_err());
+
+        assert!(!first_path.exists());
+        assert_eq!(std::fs::read(second_path).unwrap(), b"occupied");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pre_adoption_conversion_failure_cleans_the_published_socket() {
+        let directory = private_unix_tempdir();
+        let path = directory.path().join("invalid-port.sock");
+        let mut config = unix_transparent_config(&path, 0o600);
+        let StaticListenerEndpoint::AccessFlow {
+            allowed_destination_ports,
+            ..
+        } = &mut config.transparent_http.as_mut().unwrap().endpoint
+        else {
+            unreachable!()
+        };
+        *allowed_destination_ports = vec![0];
+        let prepared = PreparedProxyListeners::bind(&config, |_| unreachable!()).unwrap();
+        assert!(path.exists());
+
+        assert!(prepared
+            .into_runtime_inputs_with_transparent_support(
+                true,
+                AccessFlowSecuritySubscription::closed_for_test(),
+            )
+            .is_err());
+
+        assert!(!path.exists());
     }
 
     #[cfg(any(
