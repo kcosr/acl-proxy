@@ -15287,6 +15287,17 @@ client_cidrs = ["127.0.0.0/8"]
     }
 
     #[test]
+    fn shipped_tls_access_flow_example_loads_through_the_exact_facade() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/acl-proxy-access-flow-tls.toml");
+        let loaded = super::super::facade::load_and_compile_exact_config(&path).expect(
+            "shipped TLS/TCP Access Flow example should pass the exact configuration facade",
+        );
+        assert_eq!(loaded.metadata.path, path);
+        assert_eq!(loaded.compiled.static_config.schema_version, 4);
+    }
+
+    #[test]
     fn listener_protocol_connect_matrix() {
         let valid_h1_h2 = MINIMAL
             .replace(

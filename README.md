@@ -268,6 +268,10 @@ handshake_burst = 8
 source_table_capacity = 4096
 ```
 
+See
+[`examples/acl-proxy-access-flow-tls.toml`](examples/acl-proxy-access-flow-tls.toml)
+for the complete paired transparent HTTP and HTTPS shape.
+
 TLS/TCP is TLS 1.3 only and requires ALPN `aw-access-flow/1`. The relay
 authenticates the proxy certificate with its configured name and PEM trust
 bundle; the proxy does not request a client certificate. The AWAF bearer is the
@@ -276,6 +280,19 @@ transport abuse control and is never exposed to ACLs, delegates, captures, or
 decision logs. Remote policy has no source-CIDR fact, and its fixed diagnostic
 client value is `0.0.0.0:0` (`0.0.0.0` in provider and decision-log fields).
 Wire-body quotas use the resolved authority-qualified principal.
+
+Remote-listener transport failure logs use the validated listener identifier,
+constant `access_flow_tls_tcp` transport label, and fixed stage and category
+values instead of raw transport errors. Listener stages are `TcpAccept`,
+`TlsHandshake`, `Alpn`, and `Capacity`;
+their categories are `Unavailable`, `ResourceExhausted`, `RateLimited`,
+`DeadlineExceeded`, `Cancelled`, `Authentication`, `Protocol`, and
+`AlpnMismatch`. Product admission adds only
+`connection_rejected`, `active_capacity_exhausted`, and
+`access_flow_rejected`. These observations never contain the bearer, raw source
+address, DNS answers, certificate subjects, SANs, DER bytes or fingerprints,
+trust or key paths, key material, arbitrary TLS errors, or untrusted bytes. TLS
+key logging is disabled.
 
 The certificate chain and private key are read from bounded, stable, direct,
 single-link files. Unix uses no-follow descriptor traversal and requires the

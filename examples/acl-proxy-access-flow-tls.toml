@@ -17,7 +17,7 @@ endpoint.kind = "access_flow"
 endpoint.admission_timeout = "2s"
 endpoint.allowed_destination_ports = [80]
 http_versions = ["http1"]
-max_connections = 1024
+max_connections = 64
 
 [listeners.transparent_http.identity]
 mode = "required"
@@ -45,7 +45,7 @@ endpoint.kind = "access_flow"
 endpoint.admission_timeout = "2s"
 endpoint.allowed_destination_ports = [443]
 http_versions = ["http1", "http2"]
-max_connections = 1024
+max_connections = 64
 
 [listeners.transparent_https.identity]
 mode = "required"
