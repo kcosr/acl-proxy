@@ -499,15 +499,15 @@ fn default_access_flow_tls_max_handshakes() -> u16 {
 }
 
 fn default_access_flow_tls_max_connections_per_source() -> u16 {
-    access_flow_tls::DEFAULT_MAX_CONNECTIONS_PER_SOURCE
+    access_flow_tls::HARD_MAX_CONNECTIONS_PER_SOURCE
 }
 
 fn default_access_flow_tls_handshakes_per_second() -> u16 {
-    access_flow_tls::DEFAULT_HANDSHAKES_PER_SECOND
+    access_flow_tls::HARD_MAX_HANDSHAKES_PER_SECOND
 }
 
 fn default_access_flow_tls_handshake_burst() -> u16 {
-    access_flow_tls::DEFAULT_HANDSHAKE_BURST
+    access_flow_tls::HARD_MAX_HANDSHAKE_BURST
 }
 
 fn default_access_flow_tls_source_table_capacity() -> u32 {

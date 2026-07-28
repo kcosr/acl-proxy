@@ -246,7 +246,7 @@ endpoint.kind = "access_flow"
 endpoint.admission_timeout = "2s"
 endpoint.allowed_destination_ports = [80]
 http_versions = ["http1"]
-max_connections = 1024
+max_connections = 64
 
 [listeners.transparent_http.identity]
 mode = "required"
@@ -262,15 +262,22 @@ private_key = "/etc/acl-proxy/access-flow-key.pem"
 
 [listeners.transparent_http.endpoint.transport.abuse_control]
 max_handshakes = 128
-max_connections_per_source = 8
-handshakes_per_second = 4
-handshake_burst = 8
+max_connections_per_source = 64
+handshakes_per_second = 100
+handshake_burst = 200
 source_table_capacity = 4096
 ```
 
 See
 [`examples/acl-proxy-access-flow-tls.toml`](examples/acl-proxy-access-flow-tls.toml)
 for the complete paired transparent HTTP and HTTPS shape.
+
+The shipped remote profile assumes one relay source per Proxy and gives each
+listener 64 global slots, a matching 64-connection per-source cap, 100 accepted
+handshakes per second, and a burst of 200. A lower per-source cap would
+silently throttle that topology before the listener reached its configured
+capacity. Multi-source deployments may set a higher global listener capacity
+than the per-source cap; these controls are intentionally independent.
 
 TLS/TCP is TLS 1.3 only and requires ALPN `aw-access-flow/1`. The relay
 authenticates the proxy certificate with its configured name and PEM trust

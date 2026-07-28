@@ -14724,11 +14724,11 @@ mode = "0606"
                     && abuse_control.max_handshakes
                         == access_flow_tls::DEFAULT_MAX_HANDSHAKES
                     && abuse_control.max_connections_per_source
-                        == access_flow_tls::DEFAULT_MAX_CONNECTIONS_PER_SOURCE
+                        == access_flow_tls::HARD_MAX_CONNECTIONS_PER_SOURCE
                     && abuse_control.handshakes_per_second
-                        == access_flow_tls::DEFAULT_HANDSHAKES_PER_SECOND
+                        == access_flow_tls::HARD_MAX_HANDSHAKES_PER_SECOND
                     && abuse_control.handshake_burst
-                        == access_flow_tls::DEFAULT_HANDSHAKE_BURST
+                        == access_flow_tls::HARD_MAX_HANDSHAKE_BURST
                     && abuse_control.source_table_capacity
                         == access_flow_tls::DEFAULT_SOURCE_TABLE_CAPACITY
                     && projected_bytes > 0
@@ -14761,7 +14761,7 @@ mode = "0606"
         let expected_permits = (u64::from(access_flow_tls::DEFAULT_MAX_HANDSHAKES) * 3
             + max_connections
             + u64::from(access_flow_tls::DEFAULT_SOURCE_TABLE_CAPACITY)
-                * u64::from(access_flow_tls::DEFAULT_MAX_CONNECTIONS_PER_SOURCE))
+                * u64::from(access_flow_tls::HARD_MAX_CONNECTIONS_PER_SOURCE))
             * PERMIT_SLOT_BYTES;
         let expected_admitted_copy = max_connections * chunk_bytes;
         let expected = expected_generation
@@ -15295,6 +15295,62 @@ client_cidrs = ["127.0.0.0/8"]
         );
         assert_eq!(loaded.metadata.path, path);
         assert_eq!(loaded.compiled.static_config.schema_version, 4);
+        let assert_listener = |max_connections: usize, endpoint: &StaticListenerEndpoint| {
+            assert_eq!(max_connections, 64);
+            let StaticListenerEndpoint::AccessFlow {
+                transport: StaticAccessFlowTransport::TlsTcp { abuse_control, .. },
+                ..
+            } = endpoint
+            else {
+                panic!("shipped transparent listener must use TLS/TCP Access Flow");
+            };
+            assert_eq!(abuse_control.max_connections_per_source, 64);
+            assert_eq!(abuse_control.handshakes_per_second, 100);
+            assert_eq!(abuse_control.handshake_burst, 200);
+            assert!(usize::from(abuse_control.max_connections_per_source) >= max_connections);
+        };
+        let http = loaded
+            .compiled
+            .static_config
+            .listeners
+            .transparent_http
+            .as_ref()
+            .expect("shipped TLS example must configure transparent HTTP");
+        assert_listener(http.max_connections, &http.endpoint);
+        let https = loaded
+            .compiled
+            .static_config
+            .listeners
+            .transparent_https
+            .as_ref()
+            .expect("shipped TLS example must configure transparent HTTPS");
+        assert_listener(https.max_connections, &https.endpoint);
+    }
+
+    #[test]
+    fn tls_tcp_access_flow_keeps_global_and_per_source_capacity_independent() {
+        let input = tls_access_flow_config("transparent_http", 80).replace(
+            "[listeners.transparent_http.endpoint.transport.server_identity]",
+            "[listeners.transparent_http.endpoint.transport.abuse_control]\n\
+             max_connections_per_source = 8\n\n\
+             [listeners.transparent_http.endpoint.transport.server_identity]",
+        );
+        let compiled =
+            compile(&input).expect("multi-source listeners may exceed one source's capacity");
+        let listener = compiled
+            .static_config
+            .listeners
+            .transparent_http
+            .expect("test listener must compile");
+        assert_eq!(listener.max_connections, 256);
+        assert!(matches!(
+            listener.endpoint,
+            StaticListenerEndpoint::AccessFlow {
+                transport:
+                    StaticAccessFlowTransport::TlsTcp { abuse_control, .. },
+                ..
+            } if abuse_control.max_connections_per_source == 8
+        ));
     }
 
     #[test]
