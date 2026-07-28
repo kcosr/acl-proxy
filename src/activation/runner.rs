@@ -1626,8 +1626,7 @@ methods = ["GET"]
         }
 
         product.shutdown().await;
-        assert!(socket_path.exists());
-        fs::remove_file(&socket_path).unwrap();
+        assert!(!socket_path.exists());
         super::super::assert_listener_addresses_released(&_test, addresses);
     }
 
@@ -1847,8 +1846,7 @@ methods = ["GET"]
         origin_task.await.unwrap();
 
         product.shutdown().await;
-        assert!(socket_path.exists());
-        fs::remove_file(&socket_path).unwrap();
+        assert!(!socket_path.exists());
         super::super::assert_listener_addresses_released(&_test, addresses);
     }
 
@@ -4495,8 +4493,7 @@ header = "x-test-loop"
             .contains("\r\nx-test-loop:"));
 
         product.shutdown().await;
-        assert!(socket_path.exists());
-        fs::remove_file(&socket_path).unwrap();
+        assert!(!socket_path.exists());
     }
 
     #[cfg(unix)]
@@ -4606,8 +4603,7 @@ methods = ["GET"]
         drop(stalled);
         drop(second);
         product.shutdown().await;
-        assert!(socket_path.exists());
-        fs::remove_file(&socket_path).unwrap();
+        assert!(!socket_path.exists());
     }
 
     #[cfg(unix)]
@@ -4745,8 +4741,7 @@ methods = ["GET"]
             .await
             .expect("forced Access Flow cancellation did not close the client connection");
         product.shutdown().await;
-        assert!(socket_path.exists());
-        fs::remove_file(&socket_path).unwrap();
+        assert!(!socket_path.exists());
     }
 
     #[cfg(unix)]
@@ -4893,8 +4888,7 @@ allow_upgrades = true
         tokio::time::timeout(Duration::from_secs(2), product.shutdown())
             .await
             .expect("completed Access Flow WebSocket retained runtime resources");
-        assert!(socket_path.exists());
-        fs::remove_file(&socket_path).unwrap();
+        assert!(!socket_path.exists());
     }
 
     #[cfg(unix)]
@@ -5027,8 +5021,7 @@ urls = ["https://origin.example.test/**"]
         assert!(request.starts_with(b"GET /uds-tls HTTP/1.1\r\n"));
 
         product.shutdown().await;
-        assert!(socket_path.exists());
-        fs::remove_file(&socket_path).unwrap();
+        assert!(!socket_path.exists());
     }
 
     #[tokio::test]

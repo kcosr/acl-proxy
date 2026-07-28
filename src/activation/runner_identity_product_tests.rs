@@ -197,8 +197,7 @@ async fn access_flow_product_enforces_the_identity_mode_matrix() {
         }
 
         product.shutdown().await;
-        assert!(socket_path.exists());
-        fs::remove_file(&socket_path).unwrap();
+        assert!(!socket_path.exists());
     }
 }
 
@@ -797,9 +796,7 @@ methods = ["GET"]
             );
         }
 
-        if socket_path.exists() {
-            fs::remove_file(&socket_path).unwrap();
-        }
+        assert!(!socket_path.exists());
         crate::activation::assert_listener_addresses_released(&_test, addresses);
     }
 }

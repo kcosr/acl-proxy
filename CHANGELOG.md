@@ -85,6 +85,10 @@
 
 ### Changed
 
+- Unix Access Flow listeners now remove their verified published socket during
+  controlled shutdown and startup rollback. Startup also recovers a verified
+  stale socket after acquiring the endpoint lock, while leaving live,
+  indeterminate, replaced, wrong-owner, and wrong-type paths untouched.
 - Moved canonical URL, ACL/redaction and credential cores, forwarding,
   listeners, MITM, HTTP serving, and WebSocket relay behind the neutral
   `access-runtime`; `acl-proxy` retains product configuration, adapters,
