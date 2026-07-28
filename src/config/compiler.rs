@@ -6,9 +6,10 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use access_flow_tls::{
-    TlsAccessFlowHandshakeTimeout, TlsAccessFlowServerLimits, ACTIVE_CHANNEL_BYTES,
-    CHANNEL_TASK_BYTES, GENERATION_CONTROL_BYTES, HANDSHAKE_BYTES, LISTENER_CONTROL_BYTES,
-    MAX_PRIVATE_KEY_BYTES, MAX_SERVER_CHAIN_BYTES, PERMIT_SLOT_BYTES, SOURCE_ENTRY_BYTES,
+    TlsAccessFlowHandshakeTimeout, TlsAccessFlowPerSourceLimits, TlsAccessFlowServerLimits,
+    ACTIVE_CHANNEL_BYTES, CHANNEL_TASK_BYTES, GENERATION_CONTROL_BYTES, HANDSHAKE_BYTES,
+    LISTENER_CONTROL_BYTES, MAX_PRIVATE_KEY_BYTES, MAX_SERVER_CHAIN_BYTES, PERMIT_SLOT_BYTES,
+    SOURCE_ENTRY_BYTES,
 };
 use access_identity::{
     project_static_resolver_resources, AuthorityId, GroupId, IdentityAudience, IdentityState,
@@ -277,7 +278,13 @@ pub(crate) struct CompiledAccessFlowTlsServerIdentity {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct CompiledAccessFlowTlsAbuseControl {
     pub(crate) max_handshakes: u16,
-    pub(crate) max_connections_per_source: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) per_source: Option<CompiledAccessFlowTlsPerSourceAbuseControl>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct CompiledAccessFlowTlsPerSourceAbuseControl {
+    pub(crate) max_connections: u16,
     pub(crate) handshakes_per_second: u16,
     pub(crate) handshake_burst: u16,
     pub(crate) source_table_capacity: u32,
@@ -3259,33 +3266,11 @@ fn checked_access_flow_tls_abuse_control(
     value: &AccessFlowTlsAbuseControlConfig,
     prefix: &str,
 ) -> Result<TlsAccessFlowServerLimits, ConfigCompileError> {
-    for (field, value, maximum) in [
-        (
-            "max_handshakes",
-            u64::from(value.max_handshakes),
-            u64::from(access_flow_tls::HARD_MAX_HANDSHAKES),
-        ),
-        (
-            "max_connections_per_source",
-            u64::from(value.max_connections_per_source),
-            u64::from(access_flow_tls::HARD_MAX_CONNECTIONS_PER_SOURCE),
-        ),
-        (
-            "handshakes_per_second",
-            u64::from(value.handshakes_per_second),
-            u64::from(access_flow_tls::HARD_MAX_HANDSHAKES_PER_SECOND),
-        ),
-        (
-            "handshake_burst",
-            u64::from(value.handshake_burst),
-            u64::from(access_flow_tls::HARD_MAX_HANDSHAKE_BURST),
-        ),
-        (
-            "source_table_capacity",
-            u64::from(value.source_table_capacity),
-            u64::from(access_flow_tls::HARD_MAX_SOURCE_TABLE_CAPACITY),
-        ),
-    ] {
+    for (field, value, maximum) in [(
+        "max_handshakes",
+        u64::from(value.max_handshakes),
+        u64::from(access_flow_tls::HARD_MAX_HANDSHAKES),
+    )] {
         if value == 0 || value > maximum {
             return Err(ConfigCompileError::at(
                 format!("{prefix}.{field}"),
@@ -3293,14 +3278,54 @@ fn checked_access_flow_tls_abuse_control(
             ));
         }
     }
-    TlsAccessFlowServerLimits::new(
-        value.max_handshakes,
-        value.max_connections_per_source,
-        value.handshakes_per_second,
-        value.handshake_burst,
-        value.source_table_capacity,
-    )
-    .map_err(|_| {
+    let per_source = value
+        .per_source
+        .as_ref()
+        .map(|per_source| {
+            for (field, value, maximum) in [
+                (
+                    "max_connections",
+                    u64::from(per_source.max_connections),
+                    u64::from(access_flow_tls::HARD_MAX_CONNECTIONS_PER_SOURCE),
+                ),
+                (
+                    "handshakes_per_second",
+                    u64::from(per_source.handshakes_per_second),
+                    u64::from(access_flow_tls::HARD_MAX_HANDSHAKES_PER_SECOND),
+                ),
+                (
+                    "handshake_burst",
+                    u64::from(per_source.handshake_burst),
+                    u64::from(access_flow_tls::HARD_MAX_HANDSHAKE_BURST),
+                ),
+                (
+                    "source_table_capacity",
+                    u64::from(per_source.source_table_capacity),
+                    u64::from(access_flow_tls::HARD_MAX_SOURCE_TABLE_CAPACITY),
+                ),
+            ] {
+                if value == 0 || value > maximum {
+                    return Err(ConfigCompileError::at(
+                        format!("{prefix}.per_source.{field}"),
+                        format!("must be between 1 and {maximum}"),
+                    ));
+                }
+            }
+            TlsAccessFlowPerSourceLimits::new(
+                per_source.max_connections,
+                per_source.handshakes_per_second,
+                per_source.handshake_burst,
+                per_source.source_table_capacity,
+            )
+            .map_err(|_| {
+                ConfigCompileError::at(
+                    format!("{prefix}.per_source"),
+                    "contains an invalid TLS/TCP Access Flow per-source limit",
+                )
+            })
+        })
+        .transpose()?;
+    TlsAccessFlowServerLimits::new(value.max_handshakes, per_source).map_err(|_| {
         ConfigCompileError::at(
             prefix,
             "contains an invalid TLS/TCP Access Flow abuse-control limit",
@@ -3416,11 +3441,11 @@ fn project_access_flow_tls_listener(
         checked_add(MAX_SERVER_CHAIN_BYTES as u64, MAX_PRIVATE_KEY_BYTES as u64)?,
         GENERATION_CONTROL_BYTES,
     )?;
+    let source_table_capacity = limits
+        .per_source()
+        .map_or(0, |per_source| per_source.source_table_capacity());
     let endpoint = checked_add(
-        checked_mul(
-            u64::from(limits.source_table_capacity()),
-            SOURCE_ENTRY_BYTES,
-        )?,
+        checked_mul(u64::from(source_table_capacity), SOURCE_ENTRY_BYTES)?,
         LISTENER_CONTROL_BYTES,
     )?;
     let connecting_unit = checked_add(
@@ -3430,10 +3455,12 @@ fn project_access_flow_tls_listener(
     let connecting = checked_mul(u64::from(limits.max_handshakes()), connecting_unit)?;
     let active_unit = checked_add(ACTIVE_CHANNEL_BYTES, CHANNEL_TASK_BYTES)?;
     let active = checked_mul(max_connections, active_unit)?;
-    let source_permits = checked_mul(
-        u64::from(limits.source_table_capacity()),
-        u64::from(limits.max_connections_per_source()),
-    )?;
+    let source_permits = limits.per_source().map_or(Ok(0), |per_source| {
+        checked_mul(
+            u64::from(per_source.source_table_capacity()),
+            u64::from(per_source.max_connections_per_source()),
+        )
+    })?;
     let permits = checked_add(
         checked_add(
             checked_mul(u64::from(limits.max_handshakes()), 3)?,
@@ -8867,10 +8894,14 @@ fn compile_listener_endpoint(
                         },
                         abuse_control: CompiledAccessFlowTlsAbuseControl {
                             max_handshakes: checked_limits.max_handshakes(),
-                            max_connections_per_source: checked_limits.max_connections_per_source(),
-                            handshakes_per_second: checked_limits.handshakes_per_second(),
-                            handshake_burst: checked_limits.handshake_burst(),
-                            source_table_capacity: checked_limits.source_table_capacity(),
+                            per_source: checked_limits.per_source().map(|per_source| {
+                                CompiledAccessFlowTlsPerSourceAbuseControl {
+                                    max_connections: per_source.max_connections_per_source(),
+                                    handshakes_per_second: per_source.handshakes_per_second(),
+                                    handshake_burst: per_source.handshake_burst(),
+                                    source_table_capacity: per_source.source_table_capacity(),
+                                }
+                            }),
                         },
                         projected_bytes: project_access_flow_tls_listener(
                             abuse_control,
@@ -14723,14 +14754,7 @@ mode = "0606"
                         == Path::new("/etc/acl-proxy/tls/access-flow-key.pem")
                     && abuse_control.max_handshakes
                         == access_flow_tls::DEFAULT_MAX_HANDSHAKES
-                    && abuse_control.max_connections_per_source
-                        == access_flow_tls::HARD_MAX_CONNECTIONS_PER_SOURCE
-                    && abuse_control.handshakes_per_second
-                        == access_flow_tls::HARD_MAX_HANDSHAKES_PER_SECOND
-                    && abuse_control.handshake_burst
-                        == access_flow_tls::HARD_MAX_HANDSHAKE_BURST
-                    && abuse_control.source_table_capacity
-                        == access_flow_tls::DEFAULT_SOURCE_TABLE_CAPACITY
+                    && abuse_control.per_source.is_none()
                     && projected_bytes > 0
                     && projected_bytes <= MAX_ACCESS_FLOW_TLS_PROJECTED_BYTES
             ));
@@ -14746,22 +14770,18 @@ mode = "0606"
     }
 
     #[test]
-    fn tls_tcp_access_flow_projection_accounts_for_every_default_resource_term() {
+    fn tls_tcp_access_flow_projection_omits_disabled_per_source_resources() {
         let abuse_control = super::super::authoring::AccessFlowTlsAbuseControlConfig::default();
         let max_connections = 256_u64;
         let chunk_bytes = 64_u64 * 1024;
         let expected_generation =
             MAX_SERVER_CHAIN_BYTES as u64 + MAX_PRIVATE_KEY_BYTES as u64 + GENERATION_CONTROL_BYTES;
-        let expected_endpoint = u64::from(access_flow_tls::DEFAULT_SOURCE_TABLE_CAPACITY)
-            * SOURCE_ENTRY_BYTES
-            + LISTENER_CONTROL_BYTES;
+        let expected_endpoint = LISTENER_CONTROL_BYTES;
         let expected_connecting = u64::from(access_flow_tls::DEFAULT_MAX_HANDSHAKES)
             * (ACTIVE_CHANNEL_BYTES + HANDSHAKE_BYTES + CHANNEL_TASK_BYTES);
         let expected_active = max_connections * (ACTIVE_CHANNEL_BYTES + CHANNEL_TASK_BYTES);
         let expected_permits = (u64::from(access_flow_tls::DEFAULT_MAX_HANDSHAKES) * 3
-            + max_connections
-            + u64::from(access_flow_tls::DEFAULT_SOURCE_TABLE_CAPACITY)
-                * u64::from(access_flow_tls::HARD_MAX_CONNECTIONS_PER_SOURCE))
+            + max_connections)
             * PERMIT_SLOT_BYTES;
         let expected_admitted_copy = max_connections * chunk_bytes;
         let expected = expected_generation
@@ -14780,6 +14800,29 @@ mode = "0606"
             )
             .unwrap(),
             expected
+        );
+
+        let configured = super::super::authoring::AccessFlowTlsAbuseControlConfig {
+            max_handshakes: abuse_control.max_handshakes,
+            per_source: Some(
+                super::super::authoring::AccessFlowTlsPerSourceAbuseControlConfig {
+                    max_connections: 64,
+                    handshakes_per_second: 100,
+                    handshake_burst: 200,
+                    source_table_capacity: 128,
+                },
+            ),
+        };
+        let expected_per_source = 128 * SOURCE_ENTRY_BYTES + 128 * 64 * PERMIT_SLOT_BYTES;
+        assert_eq!(
+            project_access_flow_tls_listener(
+                &configured,
+                usize::try_from(max_connections).unwrap(),
+                usize::try_from(chunk_bytes).unwrap(),
+                "listeners.transparent_http",
+            )
+            .unwrap(),
+            expected + expected_per_source
         );
     }
 
@@ -14803,10 +14846,14 @@ mode = "0606"
 
         let abuse_control = super::super::authoring::AccessFlowTlsAbuseControlConfig {
             max_handshakes: 64,
-            max_connections_per_source: 64,
-            handshakes_per_second: 100,
-            handshake_burst: 200,
-            source_table_capacity: 128,
+            per_source: Some(
+                super::super::authoring::AccessFlowTlsPerSourceAbuseControlConfig {
+                    max_connections: 64,
+                    handshakes_per_second: 100,
+                    handshake_burst: 200,
+                    source_table_capacity: 128,
+                },
+            ),
         };
         let limits = checked_access_flow_tls_abuse_control(
             &abuse_control,
@@ -15041,14 +15088,35 @@ directory = "mitm"
             .expect_err("TLS/TCP Access Flow requires listener identity");
         assert!(error.to_string().contains("must be required"), "{error}");
 
+        let maximum = u64::from(access_flow_tls::HARD_MAX_HANDSHAKES);
+        let at_maximum = baseline.replace(
+            "[listeners.transparent_http.identity]",
+            &format!(
+                "[listeners.transparent_http.endpoint.transport.abuse_control]\nmax_handshakes = {maximum}\n\n[listeners.transparent_http.identity]"
+            ),
+        );
+        compile(&at_maximum)
+            .unwrap_or_else(|error| panic!("max_handshakes must accept its hard maximum: {error}"));
+        for invalid in [0, maximum + 1] {
+            let input = baseline.replace(
+                "[listeners.transparent_http.identity]",
+                &format!(
+                    "[listeners.transparent_http.endpoint.transport.abuse_control]\nmax_handshakes = {invalid}\n\n[listeners.transparent_http.identity]"
+                ),
+            );
+            let error = compile(&input).expect_err("invalid global handshake limit must fail");
+            assert!(error.to_string().contains("max_handshakes"), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("between 1 and {maximum}")),
+                "{error}"
+            );
+        }
+
         for (field, over_maximum, maximum) in [
             (
-                "max_handshakes",
-                u64::from(access_flow_tls::HARD_MAX_HANDSHAKES) + 1,
-                u64::from(access_flow_tls::HARD_MAX_HANDSHAKES),
-            ),
-            (
-                "max_connections_per_source",
+                "max_connections",
                 u64::from(access_flow_tls::HARD_MAX_CONNECTIONS_PER_SOURCE) + 1,
                 u64::from(access_flow_tls::HARD_MAX_CONNECTIONS_PER_SOURCE),
             ),
@@ -15068,20 +15136,27 @@ directory = "mitm"
                 u64::from(access_flow_tls::HARD_MAX_SOURCE_TABLE_CAPACITY),
             ),
         ] {
-            let at_maximum = baseline.replace(
-                "[listeners.transparent_http.identity]",
-                &format!(
-                    "[listeners.transparent_http.endpoint.transport.abuse_control]\n{field} = {maximum}\n\n[listeners.transparent_http.identity]"
-                ),
-            );
-            compile(&at_maximum).unwrap_or_else(|error| {
-                panic!("{field} must accept its inclusive hard maximum: {error}")
-            });
             for invalid in [0, over_maximum] {
+                let mut values = [
+                    ("max_connections", 64_u64),
+                    ("handshakes_per_second", 100_u64),
+                    ("handshake_burst", 200_u64),
+                    ("source_table_capacity", 128_u64),
+                ];
+                values
+                    .iter_mut()
+                    .find(|(candidate, _)| *candidate == field)
+                    .expect("bounded per-source field")
+                    .1 = invalid;
+                let per_source = values
+                    .into_iter()
+                    .map(|(name, value)| format!("{name} = {value}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 let input = baseline.replace(
                     "[listeners.transparent_http.identity]",
                     &format!(
-                        "[listeners.transparent_http.endpoint.transport.abuse_control]\n{field} = {invalid}\n\n[listeners.transparent_http.identity]"
+                        "[listeners.transparent_http.endpoint.transport.abuse_control.per_source]\n{per_source}\n\n[listeners.transparent_http.identity]"
                     ),
                 );
                 let error = compile(&input).expect_err("invalid abuse control must fail");
@@ -15093,6 +15168,31 @@ directory = "mitm"
                     "{field}: {error}"
                 );
             }
+
+            let mut per_source =
+                super::super::authoring::AccessFlowTlsPerSourceAbuseControlConfig {
+                    max_connections: 64,
+                    handshakes_per_second: 100,
+                    handshake_burst: 200,
+                    source_table_capacity: 128,
+                };
+            match field {
+                "max_connections" => per_source.max_connections = maximum as u16,
+                "handshakes_per_second" => per_source.handshakes_per_second = maximum as u16,
+                "handshake_burst" => per_source.handshake_burst = maximum as u16,
+                "source_table_capacity" => per_source.source_table_capacity = maximum as u32,
+                _ => unreachable!("bounded per-source field"),
+            }
+            checked_access_flow_tls_abuse_control(
+                &super::super::authoring::AccessFlowTlsAbuseControlConfig {
+                    max_handshakes: access_flow_tls::DEFAULT_MAX_HANDSHAKES,
+                    per_source: Some(per_source),
+                },
+                "listeners.transparent_http.endpoint.transport.abuse_control",
+            )
+            .unwrap_or_else(|error| {
+                panic!("{field} must accept its inclusive hard maximum: {error}")
+            });
         }
     }
 
@@ -15304,10 +15404,10 @@ client_cidrs = ["127.0.0.0/8"]
             else {
                 panic!("shipped transparent listener must use TLS/TCP Access Flow");
             };
-            assert_eq!(abuse_control.max_connections_per_source, 64);
-            assert_eq!(abuse_control.handshakes_per_second, 100);
-            assert_eq!(abuse_control.handshake_burst, 200);
-            assert!(usize::from(abuse_control.max_connections_per_source) >= max_connections);
+            assert_eq!(
+                abuse_control.per_source, None,
+                "single-relay shipped profile must not throttle its one physical source"
+            );
         };
         let http = loaded
             .compiled
@@ -15328,29 +15428,31 @@ client_cidrs = ["127.0.0.0/8"]
     }
 
     #[test]
-    fn tls_tcp_access_flow_keeps_global_and_per_source_capacity_independent() {
-        let input = tls_access_flow_config("transparent_http", 80).replace(
+    fn tls_tcp_access_flow_rejects_old_flat_and_partial_per_source_shapes() {
+        let baseline = tls_access_flow_config("transparent_http", 80);
+        let old_flat = baseline.replace(
             "[listeners.transparent_http.endpoint.transport.server_identity]",
             "[listeners.transparent_http.endpoint.transport.abuse_control]\n\
              max_connections_per_source = 8\n\n\
              [listeners.transparent_http.endpoint.transport.server_identity]",
         );
-        let compiled =
-            compile(&input).expect("multi-source listeners may exceed one source's capacity");
-        let listener = compiled
-            .static_config
-            .listeners
-            .transparent_http
-            .expect("test listener must compile");
-        assert_eq!(listener.max_connections, 256);
-        assert!(matches!(
-            listener.endpoint,
-            StaticListenerEndpoint::AccessFlow {
-                transport:
-                    StaticAccessFlowTransport::TlsTcp { abuse_control, .. },
-                ..
-            } if abuse_control.max_connections_per_source == 8
-        ));
+        let error = toml::from_str::<super::super::authoring::AuthoringConfig>(&old_flat)
+            .expect_err("old flat per-source field must be rejected");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+
+        let partial = baseline.replace(
+            "[listeners.transparent_http.endpoint.transport.server_identity]",
+            "[listeners.transparent_http.endpoint.transport.abuse_control.per_source]\n\
+             max_connections = 8\n\n\
+             [listeners.transparent_http.endpoint.transport.server_identity]",
+        );
+        let error = toml::from_str::<super::super::authoring::AuthoringConfig>(&partial)
+            .expect_err("partial per-source block must be rejected");
+        assert!(
+            error.to_string().contains("missing field")
+                && error.to_string().contains("handshakes_per_second"),
+            "{error}"
+        );
     }
 
     #[test]

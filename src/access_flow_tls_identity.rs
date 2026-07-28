@@ -487,7 +487,8 @@ mod tests {
         (
             TlsAccessFlowHandshakeTimeout::new(Duration::from_secs(2))
                 .expect("test handshake timeout"),
-            TlsAccessFlowServerLimits::default(),
+            TlsAccessFlowServerLimits::new(access_flow_tls::DEFAULT_MAX_HANDSHAKES, None)
+                .expect("test server limits"),
         )
     }
 

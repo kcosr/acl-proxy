@@ -1660,7 +1660,9 @@ private_key = {:?}
 
 [listeners.transparent_https.endpoint.transport.abuse_control]
 max_handshakes = 2
-max_connections_per_source = 2
+
+[listeners.transparent_https.endpoint.transport.abuse_control.per_source]
+max_connections = 2
 handshakes_per_second = 100
 handshake_burst = 100
 source_table_capacity = 4
@@ -1871,7 +1873,9 @@ private_key = {:?}
 
 [listeners.transparent_http.endpoint.transport.abuse_control]
 max_handshakes = 4
-max_connections_per_source = 8
+
+[listeners.transparent_http.endpoint.transport.abuse_control.per_source]
+max_connections = 8
 handshakes_per_second = 100
 handshake_burst = 100
 source_table_capacity = 16
@@ -2409,7 +2413,9 @@ private_key = {:?}
 
 [listeners.transparent_http.endpoint.transport.abuse_control]
 max_handshakes = 4
-max_connections_per_source = 8
+
+[listeners.transparent_http.endpoint.transport.abuse_control.per_source]
+max_connections = 8
 handshakes_per_second = 100
 handshake_burst = 100
 source_table_capacity = 16
@@ -2669,7 +2675,9 @@ private_key = {:?}
 
 [listeners.transparent_http.endpoint.transport.abuse_control]
 max_handshakes = 8
-max_connections_per_source = 16
+
+[listeners.transparent_http.endpoint.transport.abuse_control.per_source]
+max_connections = 16
 handshakes_per_second = 100
 handshake_burst = 100
 source_table_capacity = 16
@@ -2966,7 +2974,9 @@ private_key = {:?}
 
 [listeners.transparent_https.endpoint.transport.abuse_control]
 max_handshakes = 2
-max_connections_per_source = 4
+
+[listeners.transparent_https.endpoint.transport.abuse_control.per_source]
+max_connections = 4
 handshakes_per_second = 100
 handshake_burst = 100
 source_table_capacity = 8
@@ -3158,7 +3168,9 @@ private_key = {:?}
 
 [listeners.transparent_http.endpoint.transport.abuse_control]
 max_handshakes = 2
-max_connections_per_source = 3
+
+[listeners.transparent_http.endpoint.transport.abuse_control.per_source]
+max_connections = 3
 handshakes_per_second = 100
 handshake_burst = 100
 source_table_capacity = 4
@@ -3300,7 +3312,9 @@ private_key = {:?}
 
 [listeners.transparent_http.endpoint.transport.abuse_control]
 max_handshakes = 4
-max_connections_per_source = 2
+
+[listeners.transparent_http.endpoint.transport.abuse_control.per_source]
+max_connections = 2
 handshakes_per_second = 1
 handshake_burst = 1
 source_table_capacity = 1
@@ -3487,7 +3501,9 @@ private_key = {:?}
 
 [listeners.transparent_http.endpoint.transport.abuse_control]
 max_handshakes = 2
-max_connections_per_source = 3
+
+[listeners.transparent_http.endpoint.transport.abuse_control.per_source]
+max_connections = 3
 handshakes_per_second = 100
 handshake_burst = 100
 source_table_capacity = 4

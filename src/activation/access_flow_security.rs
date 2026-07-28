@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use access_flow_tls::{
-    TlsAccessFlowGeneration, TlsAccessFlowHandshakeTimeout, TlsAccessFlowServerAdapter,
-    TlsAccessFlowServerLimits,
+    TlsAccessFlowGeneration, TlsAccessFlowHandshakeTimeout, TlsAccessFlowPerSourceLimits,
+    TlsAccessFlowServerAdapter, TlsAccessFlowServerLimits,
 };
 use tokio::sync::{watch, Mutex as AsyncMutex};
 
@@ -466,14 +466,21 @@ fn load_generation_blocking(
         })?;
         let handshake_timeout = TlsAccessFlowHandshakeTimeout::new(source.handshake_timeout)
             .map_err(|_| AccessFlowSecurityMaterialError::Invalid)?;
-        let limits = TlsAccessFlowServerLimits::new(
-            source.limits.max_handshakes,
-            source.limits.max_connections_per_source,
-            source.limits.handshakes_per_second,
-            source.limits.handshake_burst,
-            source.limits.source_table_capacity,
-        )
-        .map_err(|_| AccessFlowSecurityMaterialError::Invalid)?;
+        let per_source = source
+            .limits
+            .per_source
+            .map(|per_source| {
+                TlsAccessFlowPerSourceLimits::new(
+                    per_source.max_connections,
+                    per_source.handshakes_per_second,
+                    per_source.handshake_burst,
+                    per_source.source_table_capacity,
+                )
+            })
+            .transpose()
+            .map_err(|_| AccessFlowSecurityMaterialError::Invalid)?;
+        let limits = TlsAccessFlowServerLimits::new(source.limits.max_handshakes, per_source)
+            .map_err(|_| AccessFlowSecurityMaterialError::Invalid)?;
         let activated = loaded
             .activate(handshake_timeout, limits)
             .map_err(|_| AccessFlowSecurityMaterialError::Invalid)?;

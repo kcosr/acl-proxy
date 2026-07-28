@@ -35,10 +35,6 @@ private_key = "/etc/acl-proxy/access-flow-key.pem"
 
 [listeners.transparent_http.endpoint.transport.abuse_control]
 max_handshakes = 128
-max_connections_per_source = 64
-handshakes_per_second = 100
-handshake_burst = 200
-source_table_capacity = 4096
 
 [listeners.transparent_https]
 endpoint.kind = "access_flow"
@@ -63,10 +59,6 @@ private_key = "/etc/acl-proxy/access-flow-key.pem"
 
 [listeners.transparent_https.endpoint.transport.abuse_control]
 max_handshakes = 128
-max_connections_per_source = 64
-handshakes_per_second = 100
-handshake_burst = 200
-source_table_capacity = 4096
 
 [identity]
 max_pending_authentications = 256

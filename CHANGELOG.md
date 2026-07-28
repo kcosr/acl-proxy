@@ -10,6 +10,9 @@
 
 ### Breaking Changes
 
+- Replaced flat TLS/TCP Access Flow per-source abuse-control fields with an
+  optional closed `abuse_control.per_source` block. Omission now disables
+  physical-source throttling; present blocks require all four limits.
 - Replaced scalar data-listener `bind` fields with the closed typed `endpoint`
   contract. TCP listeners use `{ kind = "tcp", address = "..." }`; transparent
   HTTP and HTTPS may use Access Flow endpoints whose admission timeout and

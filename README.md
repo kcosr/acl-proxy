@@ -262,7 +262,22 @@ private_key = "/etc/acl-proxy/access-flow-key.pem"
 
 [listeners.transparent_http.endpoint.transport.abuse_control]
 max_handshakes = 128
-max_connections_per_source = 64
+```
+
+The nested `per_source` block is optional. Omitting it disables physical-source
+connection and handshake throttling and allocates no source table. When it is
+present, `max_connections`, `handshakes_per_second`, `handshake_burst`, and
+`source_table_capacity` are all required; partial blocks and the removed flat
+per-source fields are rejected.
+
+Single-relay deployments should normally omit `per_source`: every workload
+connection arrives from the relay's one transport address, so a per-source
+limit would throttle that entire relay as one source. A genuinely multi-source
+or untrusted-edge listener can opt in explicitly:
+
+```toml
+[listeners.transparent_http.endpoint.transport.abuse_control.per_source]
+max_connections = 64
 handshakes_per_second = 100
 handshake_burst = 200
 source_table_capacity = 4096
@@ -272,12 +287,8 @@ See
 [`examples/acl-proxy-access-flow-tls.toml`](examples/acl-proxy-access-flow-tls.toml)
 for the complete paired transparent HTTP and HTTPS shape.
 
-The shipped remote profile assumes one relay source per Proxy and gives each
-listener 64 global slots, a matching 64-connection per-source cap, 100 accepted
-handshakes per second, and a burst of 200. A lower per-source cap would
-silently throttle that topology before the listener reached its configured
-capacity. Multi-source deployments may set a higher global listener capacity
-than the per-source cap; these controls are intentionally independent.
+The shipped remote profile assumes one relay source per Proxy, gives each
+listener 64 global connection slots, and leaves `per_source` disabled.
 
 TLS/TCP is TLS 1.3 only and requires ALPN `aw-access-flow/1`. The relay
 authenticates the proxy certificate with its configured name and PEM trust
