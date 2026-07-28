@@ -33,6 +33,19 @@ TLS_SPECS: dict[str, object] = {
 RUNTIME_TLS_SPECS = {
     name: spec for name, spec in TLS_SPECS.items() if name != "rustls-native-certs"
 }
+RUNTIME_CONSUMER_SURFACE_TLS_SPECS = {
+    **TLS_SPECS,
+    "rustls": {
+        "version": "=0.23.42",
+        "default-features": False,
+        "features": ["ring", "std"],
+    },
+    "tokio-rustls": {
+        "version": "=0.26.4",
+        "default-features": False,
+        "features": ["ring"],
+    },
+}
 TLS_VERSIONS = {
     "rustls": "0.23.42",
     "rustls-native-certs": "0.8.3",
@@ -97,6 +110,7 @@ def check_manifest(
     authority_section: str | None,
     authority_specs: dict[str, object],
     forbidden_tls: set[str],
+    exact_specs: dict[str, object],
 ) -> None:
     document = load_toml(path)
     authority: dict[str, Any] | None = None
@@ -125,7 +139,7 @@ def check_manifest(
                 fail(f"{path}: TLS dependency {name!r} is not canonical")
             if isinstance(spec, dict) and spec == {"workspace": True}:
                 continue
-            if not equivalent_spec(spec, TLS_SPECS[name]):
+            if not equivalent_spec(spec, exact_specs[name]):
                 fail(f"{path}: {name} does not use the exact C06 version/features")
 
     if authority_section is not None:
@@ -290,7 +304,18 @@ def check_repository(acl_root: Path, runtime_root: Path) -> None:
             authority = None
             if manifest == authority_manifest:
                 authority = authority_section
-            check_manifest(manifest, authority, authority_specs, forbidden_tls)
+            exact_specs = TLS_SPECS
+            if root == roots[1] and manifest.relative_to(root) == Path(
+                "fixtures/consumer-harness/surface/Cargo.toml"
+            ):
+                exact_specs = RUNTIME_CONSUMER_SURFACE_TLS_SPECS
+            check_manifest(
+                manifest,
+                authority,
+                authority_specs,
+                forbidden_tls,
+                exact_specs,
+            )
 
         main_lock = root / "Cargo.lock"
         if not main_lock.is_file():

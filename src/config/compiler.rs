@@ -5,6 +5,12 @@ use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+use access_flow_tls::{
+    TlsAccessFlowHandshakeTimeout, TlsAccessFlowPerSourceLimits, TlsAccessFlowServerLimits,
+    ACTIVE_CHANNEL_BYTES, CHANNEL_TASK_BYTES, GENERATION_CONTROL_BYTES, HANDSHAKE_BYTES,
+    LISTENER_CONTROL_BYTES, MAX_PRIVATE_KEY_BYTES, MAX_SERVER_CHAIN_BYTES, PERMIT_SLOT_BYTES,
+    SOURCE_ENTRY_BYTES,
+};
 use access_identity::{
     project_static_resolver_resources, AuthorityId, GroupId, IdentityAudience, IdentityState,
     IdentitySubject, PrincipalId, PrincipalKind, StaticGroup, StaticPrincipal, TokenId,
@@ -62,10 +68,10 @@ use http_access_runtime::http1::PARSER_STORE_BYTES;
 use http_access_url::{canonicalize_http_url, CompiledUrlPattern};
 
 use super::authoring::{
-    AccessFlowTransportConfig, AuthorizationConfig, AuthorizationProviderConfig,
-    CredentialActionConfig, CredentialSourceConfig, CredentialsConfig, EgressConfig, EgressRoute,
-    HeaderEffectConfig, HeaderEffectWhen, Http1ConnectPolicy, HttpVersion,
-    IdentityPrincipalKindConfig, IdentityStateConfig, IdentitySubjectConfig,
+    AccessFlowTlsAbuseControlConfig, AccessFlowTransportConfig, AuthorizationConfig,
+    AuthorizationProviderConfig, CredentialActionConfig, CredentialSourceConfig, CredentialsConfig,
+    EgressConfig, EgressRoute, HeaderEffectConfig, HeaderEffectWhen, Http1ConnectPolicy,
+    HttpVersion, IdentityPrincipalKindConfig, IdentityStateConfig, IdentitySubjectConfig,
     ListenerEndpointConfig, ListenerIdentityModeConfig, ListenersConfig, MitmConfig,
     ObservationConfig, ParentProxyKind, ParentProxyPresentationConfig, PolicyConfig,
     PolicyRuleConfig, RedactionConfig, RedactionPayloads, RuleDecision, SafetyConfig,
@@ -96,6 +102,7 @@ const MAX_MIN_WIRE_BODY_CONCURRENCY: usize = 4_096;
 const MAX_CONTENT_DECODING_RATIO: usize = 128;
 const MAX_LISTENER_CONNECTIONS: usize = 1_048_576;
 const MAX_LISTENER_STREAMS: u32 = 65_535;
+const MAX_ACCESS_FLOW_TLS_PROJECTED_BYTES: u64 = 256 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
 #[cfg(not(target_os = "linux"))]
@@ -249,7 +256,38 @@ pub(crate) enum StaticListenerEndpoint {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum StaticAccessFlowTransport {
-    Unix { path: PathBuf, mode: u32 },
+    Unix {
+        path: PathBuf,
+        mode: u32,
+    },
+    TlsTcp {
+        bind: SocketAddr,
+        handshake_timeout: Duration,
+        server_identity: CompiledAccessFlowTlsServerIdentity,
+        abuse_control: CompiledAccessFlowTlsAbuseControl,
+        projected_bytes: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct CompiledAccessFlowTlsServerIdentity {
+    pub(crate) certificate_chain: PathBuf,
+    pub(crate) private_key: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct CompiledAccessFlowTlsAbuseControl {
+    pub(crate) max_handshakes: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) per_source: Option<CompiledAccessFlowTlsPerSourceAbuseControl>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct CompiledAccessFlowTlsPerSourceAbuseControl {
+    pub(crate) max_connections: u16,
+    pub(crate) handshakes_per_second: u16,
+    pub(crate) handshake_burst: u16,
+    pub(crate) source_table_capacity: u32,
 }
 
 pub(crate) fn unix_listener_lock_path(path: &Path) -> PathBuf {
@@ -1253,7 +1291,9 @@ fn compile_config_inner(
     validate_positive_limits(config)?;
     validate_identity(config)?;
     validate_protected_identity_locators(config)?;
+    validate_access_flow_tls_locator_collisions(config)?;
     let listener_facts = validate_listener_control_mitm_matrix(config)?;
+    validate_access_flow_tls_feature_budget(config)?;
     validate_tls_and_parent_matrix(config, &listener_facts, &endpoint_urls)?;
     let validation = validate_references_and_security_boundaries(config)?;
     let redaction = compile_redaction_plan(&config.redaction)?;
@@ -1361,7 +1401,7 @@ fn normalize_authored_paths(
     config: &mut super::authoring::AuthoringConfig,
     root: &Path,
 ) -> Result<(), ConfigCompileError> {
-    for (endpoint, field) in [
+    for (endpoint, prefix) in [
         config
             .listeners
             .explicit_http
@@ -1385,23 +1425,40 @@ fn normalize_authored_paths(
     ]
     .into_iter()
     .zip([
-        "listeners.explicit_http.endpoint.transport.path",
-        "listeners.transparent_http.endpoint.transport.path",
-        "listeners.explicit_https.endpoint.transport.path",
-        "listeners.transparent_https.endpoint.transport.path",
+        "listeners.explicit_http.endpoint.transport",
+        "listeners.transparent_http.endpoint.transport",
+        "listeners.explicit_https.endpoint.transport",
+        "listeners.transparent_https.endpoint.transport",
     ]) {
-        if let Some(ListenerEndpointConfig::AccessFlow {
-            transport: AccessFlowTransportConfig::Unix { path, .. },
-            ..
-        }) = endpoint
-        {
-            if !path.is_absolute() {
-                return Err(ConfigCompileError::at(field, "must be an absolute path"));
+        let Some(ListenerEndpointConfig::AccessFlow { transport, .. }) = endpoint else {
+            continue;
+        };
+        match transport {
+            AccessFlowTransportConfig::Unix { path, .. } => {
+                let field = format!("{prefix}.path");
+                if !path.is_absolute() {
+                    return Err(ConfigCompileError::at(field, "must be an absolute path"));
+                }
+                let normalized = lexical_normalize_absolute(path).ok_or_else(|| {
+                    ConfigCompileError::at(field.clone(), "could not be normalized")
+                })?;
+                if normalized != *path {
+                    return Err(ConfigCompileError::at(field, "must already be normalized"));
+                }
             }
-            let normalized = lexical_normalize_absolute(path)
-                .ok_or_else(|| ConfigCompileError::at(field, "could not be normalized"))?;
-            if normalized != *path {
-                return Err(ConfigCompileError::at(field, "must already be normalized"));
+            AccessFlowTransportConfig::TlsTcp {
+                server_identity, ..
+            } => {
+                server_identity.certificate_chain = normalize_authored_path(
+                    root,
+                    &server_identity.certificate_chain,
+                    &format!("{prefix}.server_identity.certificate_chain"),
+                )?;
+                server_identity.private_key = normalize_authored_path(
+                    root,
+                    &server_identity.private_key,
+                    &format!("{prefix}.server_identity.private_key"),
+                )?;
             }
         }
     }
@@ -2446,18 +2503,262 @@ fn validate_protected_identity_locators(
     Ok(())
 }
 
+fn validate_access_flow_tls_locator_collisions(
+    config: &super::authoring::AuthoringConfig,
+) -> Result<(), ConfigCompileError> {
+    let identity_files = identity_file_sources(config);
+    let mut certificate_paths = Vec::new();
+    let mut private_key_paths = Vec::new();
+
+    for (endpoint, prefix) in [
+        config
+            .listeners
+            .explicit_http
+            .as_ref()
+            .map(|listener| &listener.endpoint),
+        config
+            .listeners
+            .transparent_http
+            .as_ref()
+            .map(|listener| &listener.endpoint),
+        config
+            .listeners
+            .explicit_https
+            .as_ref()
+            .map(|listener| &listener.endpoint),
+        config
+            .listeners
+            .transparent_https
+            .as_ref()
+            .map(|listener| &listener.endpoint),
+    ]
+    .into_iter()
+    .zip([
+        "listeners.explicit_http.endpoint.transport.server_identity",
+        "listeners.transparent_http.endpoint.transport.server_identity",
+        "listeners.explicit_https.endpoint.transport.server_identity",
+        "listeners.transparent_https.endpoint.transport.server_identity",
+    ]) {
+        let Some(ListenerEndpointConfig::AccessFlow {
+            transport:
+                AccessFlowTransportConfig::TlsTcp {
+                    server_identity, ..
+                },
+            ..
+        }) = endpoint
+        else {
+            continue;
+        };
+        if protected_locators_equal(
+            &server_identity.certificate_chain,
+            &server_identity.private_key,
+        ) {
+            return Err(ConfigCompileError::at(
+                format!("{prefix}.private_key"),
+                "must not overlap the Access Flow TLS certificate chain",
+            ));
+        }
+        for (path, field) in [
+            (
+                &server_identity.certificate_chain,
+                format!("{prefix}.certificate_chain"),
+            ),
+            (
+                &server_identity.private_key,
+                format!("{prefix}.private_key"),
+            ),
+        ] {
+            if protected_locator_set_contains(&identity_files, path) {
+                return Err(ConfigCompileError::at(
+                    field,
+                    "must not overlap an identity token source",
+                ));
+            }
+        }
+        certificate_paths.push(server_identity.certificate_chain.clone());
+        private_key_paths.push(server_identity.private_key.clone());
+    }
+
+    if certificate_paths.iter().any(|certificate| {
+        private_key_paths
+            .iter()
+            .any(|private_key| protected_locators_equal(certificate, private_key))
+    }) {
+        return Err(ConfigCompileError::at(
+            "listeners",
+            "Access Flow TLS certificate and private-key locators must not overlap",
+        ));
+    }
+    let protected_files = certificate_paths
+        .into_iter()
+        .chain(private_key_paths)
+        .collect::<Vec<_>>();
+    let reject_overlap = |path: &Path, field: String| {
+        if protected_files
+            .iter()
+            .any(|protected| protected_locators_equal(protected, path))
+        {
+            Err(ConfigCompileError::at(
+                field,
+                "must not overlap Access Flow TLS identity material",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+
+    for (name, provider) in &config.authorization.providers {
+        match provider {
+            AuthorizationProviderConfig::Process(provider) => {
+                reject_overlap(
+                    &provider.command,
+                    format!("authorization.providers.{name}.command"),
+                )?;
+            }
+            AuthorizationProviderConfig::Webhook(provider) => {
+                if let Some(path) = provider
+                    .tls
+                    .as_ref()
+                    .and_then(|tls| tls.ca_certificate.as_ref())
+                {
+                    reject_overlap(
+                        path,
+                        format!("authorization.providers.{name}.tls.ca_certificate"),
+                    )?;
+                }
+            }
+            AuthorizationProviderConfig::UnixSocket(_) => {}
+        }
+    }
+    for (name, source) in &config.credentials.sources {
+        if let CredentialSourceConfig::File(source) = source {
+            reject_overlap(&source.path, format!("credentials.sources.{name}.path"))?;
+        }
+    }
+    if let Some(tls) = config
+        .control
+        .as_ref()
+        .and_then(|control| control.tls.as_ref())
+    {
+        reject_overlap(
+            &tls.certificate_chain,
+            "control.tls.certificate_chain".into(),
+        )?;
+        reject_overlap(&tls.private_key, "control.tls.private_key".into())?;
+    }
+    if let Some(tls) = config
+        .listeners
+        .explicit_https
+        .as_ref()
+        .map(|listener| &listener.tls)
+    {
+        reject_overlap(
+            &tls.certificate_chain,
+            "listeners.explicit_https.tls.certificate_chain".into(),
+        )?;
+        reject_overlap(
+            &tls.private_key,
+            "listeners.explicit_https.tls.private_key".into(),
+        )?;
+    }
+    if let Some(MitmConfig::Files(mitm)) = config.mitm.as_ref() {
+        reject_overlap(&mitm.ca_certificate, "mitm.ca_certificate".into())?;
+        reject_overlap(&mitm.ca_private_key, "mitm.ca_private_key".into())?;
+    }
+    if let Some(path) = config.egress.origin_tls.ca_certificate.as_ref() {
+        reject_overlap(path, "egress.origin_tls.ca_certificate".into())?;
+    }
+    if let Some(path) = config
+        .egress
+        .parent_proxy
+        .as_ref()
+        .and_then(|parent| parent.tls.as_ref())
+        .and_then(|tls| tls.ca_certificate.as_ref())
+    {
+        reject_overlap(path, "egress.parent_proxy.tls.ca_certificate".into())?;
+    }
+    Ok(())
+}
+
 fn reject_protected_file_overlap(
     protected_files: &BTreeSet<PathBuf>,
     candidate: &Path,
     field: &str,
 ) -> Result<(), ConfigCompileError> {
-    if protected_files.contains(candidate) {
+    if protected_locator_set_contains(protected_files, candidate) {
         return Err(ConfigCompileError::at(
             field,
             "must not overlap an identity token source",
         ));
     }
     Ok(())
+}
+
+fn protected_locator_set_contains(protected_files: &BTreeSet<PathBuf>, candidate: &Path) -> bool {
+    protected_files
+        .iter()
+        .any(|protected| protected_locators_equal(protected, candidate))
+}
+
+#[cfg(not(windows))]
+fn protected_locators_equal(left: &Path, right: &Path) -> bool {
+    left == right
+}
+
+#[cfg(windows)]
+fn protected_locators_equal(left: &Path, right: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::path::Prefix;
+    use windows_sys::Win32::Globalization::{
+        CompareStringOrdinal, COMPARESTRING_RESULT, CSTR_EQUAL,
+    };
+
+    fn wide(path: &Path) -> Option<(Vec<u16>, i32)> {
+        let mut components = path.components();
+        let Component::Prefix(prefix) = components.next()? else {
+            return None;
+        };
+        let mut value = Vec::new();
+        match prefix.kind() {
+            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
+                value.extend([u16::from(drive), u16::from(b':')]);
+            }
+            Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+                value.extend([u16::from(b'\\'), u16::from(b'\\')]);
+                value.extend(server.encode_wide());
+                value.push(u16::from(b'\\'));
+                value.extend(share.encode_wide());
+            }
+            Prefix::DeviceNS(_) | Prefix::Verbatim(_) => return None,
+        }
+        if !matches!(components.next(), Some(Component::RootDir)) {
+            return None;
+        }
+        value.push(u16::from(b'\\'));
+        let mut first = true;
+        for component in components {
+            let Component::Normal(name) = component else {
+                return None;
+            };
+            if !first {
+                value.push(u16::from(b'\\'));
+            }
+            value.extend(name.encode_wide());
+            first = false;
+        }
+        let length = i32::try_from(value.len()).ok()?;
+        Some((value, length))
+    }
+
+    let Some((left, left_len)) = wide(left) else {
+        return false;
+    };
+    let Some((right, right_len)) = wide(right) else {
+        return false;
+    };
+    let comparison: COMPARESTRING_RESULT =
+        unsafe { CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) };
+    comparison == CSTR_EQUAL
 }
 
 fn valid_identity_environment_name(value: &str) -> bool {
@@ -2689,7 +2990,8 @@ fn validate_listener_control_mitm_matrix(
         validate_listener_endpoint(
             &listener.endpoint,
             "listeners.explicit_http",
-            false,
+            None,
+            listener.identity.as_ref().map(|identity| identity.mode),
             &mut facts,
         )?;
         validate_http_versions(
@@ -2711,7 +3013,8 @@ fn validate_listener_control_mitm_matrix(
         validate_listener_endpoint(
             &listener.endpoint,
             "listeners.transparent_http",
-            true,
+            Some(80),
+            listener.identity.as_ref().map(|identity| identity.mode),
             &mut facts,
         )?;
         validate_http_versions(
@@ -2728,7 +3031,8 @@ fn validate_listener_control_mitm_matrix(
         validate_listener_endpoint(
             &listener.endpoint,
             "listeners.explicit_https",
-            false,
+            None,
+            listener.identity.as_ref().map(|identity| identity.mode),
             &mut facts,
         )?;
         validate_http_versions(
@@ -2750,7 +3054,8 @@ fn validate_listener_control_mitm_matrix(
         validate_listener_endpoint(
             &listener.endpoint,
             "listeners.transparent_https",
-            true,
+            Some(443),
+            listener.identity.as_ref().map(|identity| identity.mode),
             &mut facts,
         )?;
         validate_http_versions(
@@ -2841,7 +3146,8 @@ fn validate_listener_control_mitm_matrix(
 fn validate_listener_endpoint(
     endpoint: &ListenerEndpointConfig,
     prefix: &str,
-    allow_unix: bool,
+    access_flow_destination_port: Option<u16>,
+    identity_mode: Option<ListenerIdentityModeConfig>,
     facts: &mut ListenerFacts,
 ) -> Result<(), ConfigCompileError> {
     match endpoint {
@@ -2855,18 +3161,12 @@ fn validate_listener_endpoint(
             allowed_destination_ports,
             transport,
         } => {
-            if !allow_unix {
+            let Some(required_destination_port) = access_flow_destination_port else {
                 return Err(ConfigCompileError::at(
                     format!("{prefix}.endpoint.kind"),
                     "access_flow is valid only for transparent HTTP and HTTPS listeners",
                 ));
-            }
-            if cfg!(not(unix)) {
-                return Err(ConfigCompileError::at(
-                    format!("{prefix}.endpoint.kind"),
-                    "access_flow with a Unix transport is not supported on this platform",
-                ));
-            }
+            };
             if allowed_destination_ports.is_empty() {
                 return Err(ConfigCompileError::at(
                     format!("{prefix}.endpoint.allowed_destination_ports"),
@@ -2883,40 +3183,301 @@ fn validate_listener_endpoint(
                     "must contain unique nonzero destination ports",
                 ));
             }
-            let AccessFlowTransportConfig::Unix { path, mode } = transport;
-            let path_field = format!("{prefix}.endpoint.transport.path");
-            if !path.is_absolute() {
-                return Err(ConfigCompileError::at(
-                    path_field,
-                    "must be an absolute path",
-                ));
-            }
-            if unix_socket_path_contains_nul(path) {
-                return Err(ConfigCompileError::at(
-                    path_field,
-                    "must not contain a NUL byte",
-                ));
-            }
-            if unix_socket_path_bytes(path) > MAX_UNIX_SOCKET_PATH_BYTES {
-                return Err(ConfigCompileError::at(
-                    path_field,
-                    format!("must be at most {MAX_UNIX_SOCKET_PATH_BYTES} bytes"),
-                ));
-            }
-            parse_socket_mode(mode, &format!("{prefix}.endpoint.transport.mode"))?;
-            let lock_path = unix_listener_lock_path(path);
-            if !facts.unix_artifact_paths.insert(path.clone())
-                || !facts.unix_artifact_paths.insert(lock_path)
-            {
-                return Err(ConfigCompileError::at(
-                    path_field,
-                    "collides with another Unix proxy listener socket or lock path",
-                ));
+            match transport {
+                AccessFlowTransportConfig::Unix { path, mode } => {
+                    if cfg!(not(unix)) {
+                        return Err(ConfigCompileError::at(
+                            format!("{prefix}.endpoint.transport.kind"),
+                            "the Unix Access Flow transport is not supported on this platform",
+                        ));
+                    }
+                    let path_field = format!("{prefix}.endpoint.transport.path");
+                    if !path.is_absolute() {
+                        return Err(ConfigCompileError::at(
+                            path_field,
+                            "must be an absolute path",
+                        ));
+                    }
+                    if unix_socket_path_contains_nul(path) {
+                        return Err(ConfigCompileError::at(
+                            path_field,
+                            "must not contain a NUL byte",
+                        ));
+                    }
+                    if unix_socket_path_bytes(path) > MAX_UNIX_SOCKET_PATH_BYTES {
+                        return Err(ConfigCompileError::at(
+                            path_field,
+                            format!("must be at most {MAX_UNIX_SOCKET_PATH_BYTES} bytes"),
+                        ));
+                    }
+                    parse_socket_mode(mode, &format!("{prefix}.endpoint.transport.mode"))?;
+                    let lock_path = unix_listener_lock_path(path);
+                    if !facts.unix_artifact_paths.insert(path.clone())
+                        || !facts.unix_artifact_paths.insert(lock_path)
+                    {
+                        return Err(ConfigCompileError::at(
+                            path_field,
+                            "collides with another Unix proxy listener socket or lock path",
+                        ));
+                    }
+                }
+                AccessFlowTransportConfig::TlsTcp {
+                    bind,
+                    handshake_timeout,
+                    abuse_control,
+                    ..
+                } => {
+                    let bind_path = format!("{prefix}.endpoint.transport.bind");
+                    let bind = validate_bind(*bind, &bind_path, false)?;
+                    insert_unique_bind(&mut facts.binds, bind, &bind_path)?;
+                    if allowed_destination_ports.as_slice() != [required_destination_port] {
+                        return Err(ConfigCompileError::at(
+                            format!("{prefix}.endpoint.allowed_destination_ports"),
+                            format!(
+                                "must be exactly [{required_destination_port}] for this TLS/TCP listener"
+                            ),
+                        ));
+                    }
+                    if !matches!(identity_mode, Some(ListenerIdentityModeConfig::Required)) {
+                        return Err(ConfigCompileError::at(
+                            format!("{prefix}.identity.mode"),
+                            "must be required for a TLS/TCP Access Flow listener",
+                        ));
+                    }
+                    TlsAccessFlowHandshakeTimeout::new(handshake_timeout.get()).map_err(|_| {
+                        ConfigCompileError::at(
+                            format!("{prefix}.endpoint.transport.handshake_timeout"),
+                            "must be nonzero and no greater than 30 seconds",
+                        )
+                    })?;
+                    checked_access_flow_tls_abuse_control(
+                        abuse_control,
+                        &format!("{prefix}.endpoint.transport.abuse_control"),
+                    )?;
+                }
             }
             facts.uses_access_flow = true;
         }
     }
     Ok(())
+}
+
+fn checked_access_flow_tls_abuse_control(
+    value: &AccessFlowTlsAbuseControlConfig,
+    prefix: &str,
+) -> Result<TlsAccessFlowServerLimits, ConfigCompileError> {
+    for (field, value, maximum) in [(
+        "max_handshakes",
+        u64::from(value.max_handshakes),
+        u64::from(access_flow_tls::HARD_MAX_HANDSHAKES),
+    )] {
+        if value == 0 || value > maximum {
+            return Err(ConfigCompileError::at(
+                format!("{prefix}.{field}"),
+                format!("must be between 1 and {maximum}"),
+            ));
+        }
+    }
+    let per_source = value
+        .per_source
+        .as_ref()
+        .map(|per_source| {
+            for (field, value, maximum) in [
+                (
+                    "max_connections",
+                    u64::from(per_source.max_connections),
+                    u64::from(access_flow_tls::HARD_MAX_CONNECTIONS_PER_SOURCE),
+                ),
+                (
+                    "handshakes_per_second",
+                    u64::from(per_source.handshakes_per_second),
+                    u64::from(access_flow_tls::HARD_MAX_HANDSHAKES_PER_SECOND),
+                ),
+                (
+                    "handshake_burst",
+                    u64::from(per_source.handshake_burst),
+                    u64::from(access_flow_tls::HARD_MAX_HANDSHAKE_BURST),
+                ),
+                (
+                    "source_table_capacity",
+                    u64::from(per_source.source_table_capacity),
+                    u64::from(access_flow_tls::HARD_MAX_SOURCE_TABLE_CAPACITY),
+                ),
+            ] {
+                if value == 0 || value > maximum {
+                    return Err(ConfigCompileError::at(
+                        format!("{prefix}.per_source.{field}"),
+                        format!("must be between 1 and {maximum}"),
+                    ));
+                }
+            }
+            TlsAccessFlowPerSourceLimits::new(
+                per_source.max_connections,
+                per_source.handshakes_per_second,
+                per_source.handshake_burst,
+                per_source.source_table_capacity,
+            )
+            .map_err(|_| {
+                ConfigCompileError::at(
+                    format!("{prefix}.per_source"),
+                    "contains an invalid TLS/TCP Access Flow per-source limit",
+                )
+            })
+        })
+        .transpose()?;
+    TlsAccessFlowServerLimits::new(value.max_handshakes, per_source).map_err(|_| {
+        ConfigCompileError::at(
+            prefix,
+            "contains an invalid TLS/TCP Access Flow abuse-control limit",
+        )
+    })
+}
+
+fn validate_access_flow_tls_feature_budget(
+    config: &super::authoring::AuthoringConfig,
+) -> Result<(), ConfigCompileError> {
+    let mut projected = 0_u64;
+    for (listener, prefix) in [
+        config.listeners.transparent_http.as_ref().map(|listener| {
+            (
+                &listener.endpoint,
+                listener.max_connections,
+                config.service.forwarding.chunk_bytes,
+            )
+        }),
+        config.listeners.transparent_https.as_ref().map(|listener| {
+            (
+                &listener.endpoint,
+                listener.max_connections,
+                config.service.forwarding.chunk_bytes,
+            )
+        }),
+    ]
+    .into_iter()
+    .zip(["listeners.transparent_http", "listeners.transparent_https"])
+    {
+        let Some((
+            ListenerEndpointConfig::AccessFlow { transport, .. },
+            max_connections,
+            chunk_bytes,
+        )) = listener
+        else {
+            continue;
+        };
+        let AccessFlowTransportConfig::TlsTcp { abuse_control, .. } = transport else {
+            continue;
+        };
+        let listener_projection =
+            project_access_flow_tls_listener(abuse_control, max_connections, chunk_bytes, prefix)?;
+        projected = projected.checked_add(listener_projection).ok_or_else(|| {
+            ConfigCompileError::at(
+                "listeners",
+                "TLS/TCP Access Flow feature projection arithmetic overflow",
+            )
+        })?;
+    }
+    if projected > MAX_ACCESS_FLOW_TLS_PROJECTED_BYTES {
+        return Err(ConfigCompileError::at(
+            "listeners",
+            format!(
+                "TLS/TCP Access Flow projected bytes {projected} exceed the {MAX_ACCESS_FLOW_TLS_PROJECTED_BYTES}-byte feature ceiling"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn project_access_flow_tls_listener(
+    abuse_control: &AccessFlowTlsAbuseControlConfig,
+    max_connections: usize,
+    chunk_bytes: usize,
+    prefix: &str,
+) -> Result<u64, ConfigCompileError> {
+    let hard_max_active = usize::try_from(access_flow_tls::HARD_MAX_ACTIVE_CHANNELS)
+        .expect("the shared active-channel maximum fits usize on supported targets");
+    if max_connections > hard_max_active {
+        return Err(ConfigCompileError::at(
+            format!("{prefix}.max_connections"),
+            format!(
+                "must be no greater than {} for TLS/TCP Access Flow",
+                access_flow_tls::HARD_MAX_ACTIVE_CHANNELS
+            ),
+        ));
+    }
+    let limits = checked_access_flow_tls_abuse_control(
+        abuse_control,
+        &format!("{prefix}.endpoint.transport.abuse_control"),
+    )?;
+    let max_connections = u64::try_from(max_connections).map_err(|_| {
+        ConfigCompileError::at(
+            format!("{prefix}.max_connections"),
+            "cannot be represented by the TLS/TCP Access Flow resource projection",
+        )
+    })?;
+    let chunk_bytes = u64::try_from(chunk_bytes).map_err(|_| {
+        ConfigCompileError::at(
+            "service.forwarding.chunk_bytes",
+            "cannot be represented by the TLS/TCP Access Flow resource projection",
+        )
+    })?;
+    let checked_add = |left: u64, right: u64| {
+        left.checked_add(right).ok_or_else(|| {
+            ConfigCompileError::at(
+                prefix,
+                "TLS/TCP Access Flow feature projection arithmetic overflow",
+            )
+        })
+    };
+    let checked_mul = |left: u64, right: u64| {
+        left.checked_mul(right).ok_or_else(|| {
+            ConfigCompileError::at(
+                prefix,
+                "TLS/TCP Access Flow feature projection arithmetic overflow",
+            )
+        })
+    };
+
+    let generation = checked_add(
+        checked_add(MAX_SERVER_CHAIN_BYTES as u64, MAX_PRIVATE_KEY_BYTES as u64)?,
+        GENERATION_CONTROL_BYTES,
+    )?;
+    let source_table_capacity = limits
+        .per_source()
+        .map_or(0, |per_source| per_source.source_table_capacity());
+    let endpoint = checked_add(
+        checked_mul(u64::from(source_table_capacity), SOURCE_ENTRY_BYTES)?,
+        LISTENER_CONTROL_BYTES,
+    )?;
+    let connecting_unit = checked_add(
+        checked_add(ACTIVE_CHANNEL_BYTES, HANDSHAKE_BYTES)?,
+        CHANNEL_TASK_BYTES,
+    )?;
+    let connecting = checked_mul(u64::from(limits.max_handshakes()), connecting_unit)?;
+    let active_unit = checked_add(ACTIVE_CHANNEL_BYTES, CHANNEL_TASK_BYTES)?;
+    let active = checked_mul(max_connections, active_unit)?;
+    let source_permits = limits.per_source().map_or(Ok(0), |per_source| {
+        checked_mul(
+            u64::from(per_source.source_table_capacity()),
+            u64::from(per_source.max_connections_per_source()),
+        )
+    })?;
+    let permits = checked_add(
+        checked_add(
+            checked_mul(u64::from(limits.max_handshakes()), 3)?,
+            max_connections,
+        )?,
+        source_permits,
+    )?;
+    let permit_bytes = checked_mul(permits, PERMIT_SLOT_BYTES)?;
+    let admitted_copy_bytes = checked_mul(max_connections, chunk_bytes)?;
+
+    checked_add(
+        checked_add(
+            checked_add(checked_add(generation, endpoint)?, connecting)?,
+            active,
+        )?,
+        checked_add(permit_bytes, admitted_copy_bytes)?,
+    )
 }
 
 #[cfg(unix)]
@@ -8169,7 +8730,7 @@ fn compile_static_config(
             min_wire_body_concurrency: config.service.min_wire_body_concurrency,
         },
         control: config.control.as_ref().map(compile_control),
-        listeners: compile_listeners(&config.listeners),
+        listeners: compile_listeners(&config.listeners, config.service.forwarding.chunk_bytes),
         mitm: config.mitm.as_ref().map(compile_mitm),
         callback_public_url,
         logging: StaticLoggingConfig {
@@ -8208,13 +8769,20 @@ fn compile_tls_identity(value: &StaticTlsIdentityConfig) -> CompiledTlsIdentity 
     }
 }
 
-fn compile_listeners(value: &ListenersConfig) -> StaticListenersConfig {
+fn compile_listeners(
+    value: &ListenersConfig,
+    forwarding_chunk_bytes: usize,
+) -> StaticListenersConfig {
     StaticListenersConfig {
         explicit_http: value
             .explicit_http
             .as_ref()
             .map(|listener| StaticCleartextListener {
-                endpoint: compile_listener_endpoint(&listener.endpoint),
+                endpoint: compile_listener_endpoint(
+                    &listener.endpoint,
+                    listener.max_connections,
+                    forwarding_chunk_bytes,
+                ),
                 http_versions: compile_http_versions(&listener.http_versions),
                 request_header_timeout: listener.request_header_timeout.get(),
                 max_connections: listener.max_connections,
@@ -8226,7 +8794,11 @@ fn compile_listeners(value: &ListenersConfig) -> StaticListenersConfig {
             .transparent_http
             .as_ref()
             .map(|listener| StaticCleartextListener {
-                endpoint: compile_listener_endpoint(&listener.endpoint),
+                endpoint: compile_listener_endpoint(
+                    &listener.endpoint,
+                    listener.max_connections,
+                    forwarding_chunk_bytes,
+                ),
                 http_versions: compile_http_versions(&listener.http_versions),
                 request_header_timeout: listener.request_header_timeout.get(),
                 max_connections: listener.max_connections,
@@ -8238,7 +8810,11 @@ fn compile_listeners(value: &ListenersConfig) -> StaticListenersConfig {
             .explicit_https
             .as_ref()
             .map(|listener| StaticExplicitHttpsListener {
-                endpoint: compile_listener_endpoint(&listener.endpoint),
+                endpoint: compile_listener_endpoint(
+                    &listener.endpoint,
+                    listener.max_connections,
+                    forwarding_chunk_bytes,
+                ),
                 http_versions: compile_http_versions(&listener.http_versions),
                 handshake_timeout: listener.handshake_timeout.get(),
                 request_header_timeout: listener.request_header_timeout.get(),
@@ -8250,7 +8826,11 @@ fn compile_listeners(value: &ListenersConfig) -> StaticListenersConfig {
             }),
         transparent_https: value.transparent_https.as_ref().map(|listener| {
             StaticTransparentHttpsListener {
-                endpoint: compile_listener_endpoint(&listener.endpoint),
+                endpoint: compile_listener_endpoint(
+                    &listener.endpoint,
+                    listener.max_connections,
+                    forwarding_chunk_bytes,
+                ),
                 http_versions: compile_http_versions(&listener.http_versions),
                 handshake_timeout: listener.handshake_timeout.get(),
                 request_header_timeout: listener.request_header_timeout.get(),
@@ -8272,7 +8852,11 @@ fn compile_listener_identity_mode(
     }
 }
 
-fn compile_listener_endpoint(value: &ListenerEndpointConfig) -> StaticListenerEndpoint {
+fn compile_listener_endpoint(
+    value: &ListenerEndpointConfig,
+    max_connections: usize,
+    forwarding_chunk_bytes: usize,
+) -> StaticListenerEndpoint {
     match value {
         ListenerEndpointConfig::Tcp { address } => StaticListenerEndpoint::Tcp {
             address: canonical_socket_addr(*address),
@@ -8290,6 +8874,44 @@ fn compile_listener_endpoint(value: &ListenerEndpointConfig) -> StaticListenerEn
                     mode: u32::from_str_radix(mode, 8)
                         .expect("Unix listener mode was validated before compilation"),
                 },
+                AccessFlowTransportConfig::TlsTcp {
+                    bind,
+                    handshake_timeout,
+                    server_identity,
+                    abuse_control,
+                } => {
+                    let checked_limits = checked_access_flow_tls_abuse_control(
+                        abuse_control,
+                        "listeners.endpoint.transport.abuse_control",
+                    )
+                    .expect("TLS/TCP Access Flow abuse control was validated before compilation");
+                    StaticAccessFlowTransport::TlsTcp {
+                        bind: canonical_socket_addr(*bind),
+                        handshake_timeout: handshake_timeout.get(),
+                        server_identity: CompiledAccessFlowTlsServerIdentity {
+                            certificate_chain: server_identity.certificate_chain.clone(),
+                            private_key: server_identity.private_key.clone(),
+                        },
+                        abuse_control: CompiledAccessFlowTlsAbuseControl {
+                            max_handshakes: checked_limits.max_handshakes(),
+                            per_source: checked_limits.per_source().map(|per_source| {
+                                CompiledAccessFlowTlsPerSourceAbuseControl {
+                                    max_connections: per_source.max_connections_per_source(),
+                                    handshakes_per_second: per_source.handshakes_per_second(),
+                                    handshake_burst: per_source.handshake_burst(),
+                                    source_table_capacity: per_source.source_table_capacity(),
+                                }
+                            }),
+                        },
+                        projected_bytes: project_access_flow_tls_listener(
+                            abuse_control,
+                            max_connections,
+                            forwarding_chunk_bytes,
+                            "listeners.endpoint",
+                        )
+                        .expect("TLS/TCP Access Flow projection was validated before compilation"),
+                    }
+                }
             };
             StaticListenerEndpoint::AccessFlow {
                 admission_timeout: admission_timeout.get(),
@@ -8435,6 +9057,7 @@ mod tests {
         let input = http_access_policy_acl::EvaluationInput::new(
             &facts,
             peer_ip,
+            Some(peer_ip),
             &header_facts,
             1,
             http_access_types::BodyRepresentation::PreservedContentCoded,
@@ -9881,6 +10504,63 @@ http_versions = ["http1"]
         let config: super::super::authoring::AuthoringConfig =
             toml::from_str(toml).expect("test input should deserialize");
         compile_config(config, Path::new("/etc/acl-proxy"))
+    }
+
+    fn tls_access_flow_config(listener: &str, destination_port: u16) -> String {
+        let bind_port = if destination_port == 80 { 7443 } else { 7444 };
+        let mitm = if listener == "transparent_https" {
+            r#"
+[mitm]
+mode = "generated"
+directory = "mitm"
+"#
+        } else {
+            ""
+        };
+        format!(
+            r#"schema_version = 4
+
+[listeners.{listener}]
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
+endpoint.allowed_destination_ports = [{destination_port}]
+http_versions = ["http1"]
+max_connections = 256
+
+[listeners.{listener}.endpoint.transport]
+kind = "tls_tcp"
+bind = "127.0.0.1:{bind_port}"
+handshake_timeout = "5s"
+
+[listeners.{listener}.endpoint.transport.server_identity]
+certificate_chain = "tls/access-flow-chain.pem"
+private_key = "tls/access-flow-key.pem"
+
+[listeners.{listener}.identity]
+mode = "required"
+
+[identity]
+max_pending_authentications = 128
+max_pending_authentications_per_connection = 8
+
+[identity.resolver]
+kind = "static"
+authority = "test-authority"
+
+[[identity.resolver.principals]]
+id = "test-principal"
+kind = "service_account"
+
+[[identity.resolver.tokens]]
+id = "test-token"
+principal = "test-principal"
+source = "environment"
+variable = "AW_REMOTE_IDENTITY_TOKEN"
+{mitm}
+[policy]
+default = "deny"
+"#
+        )
     }
 
     fn policy_rule_with_id(id: &str) -> String {
@@ -13964,12 +14644,12 @@ mode = "0606"
                 "path",
             ),
             (
-                "remote transport",
+                "mixed remote and Unix fields",
                 unix.replace(
                     "kind = \"unix\"\npath =",
-                    "kind = \"tls_tcp\"\ncertificate = \"secret.pem\"\npath =",
+                    "kind = \"tls_tcp\"\nbind = \"127.0.0.1:7443\"\nhandshake_timeout = \"5s\"\nserver_identity = { certificate_chain = \"chain.pem\", private_key = \"key.pem\" }\npath =",
                 ),
-                "tls_tcp",
+                "path",
             ),
         ] {
             let error =
@@ -14024,6 +14704,614 @@ mode = "0606"
             let error = compile(&input).unwrap_err();
             assert!(error.to_string().contains(expected), "{name}: {error}");
         }
+    }
+
+    #[test]
+    fn tls_tcp_access_flow_schema_compiles_with_closed_defaults_and_fingerprint() {
+        for (listener_name, destination_port) in
+            [("transparent_http", 80), ("transparent_https", 443)]
+        {
+            let input = tls_access_flow_config(listener_name, destination_port);
+            let compiled = compile(&input).expect("valid TLS/TCP Access Flow should compile");
+            let listener = if destination_port == 80 {
+                compiled.static_config.listeners.transparent_http.unwrap()
+            } else {
+                let https = compiled.static_config.listeners.transparent_https.unwrap();
+                StaticCleartextListener {
+                    endpoint: https.endpoint,
+                    http_versions: https.http_versions,
+                    request_header_timeout: https.request_header_timeout,
+                    max_connections: https.max_connections,
+                    max_concurrent_streams: https.max_concurrent_streams,
+                    identity_mode: https.identity_mode,
+                    connect: None,
+                }
+            };
+            assert_eq!(
+                listener.identity_mode,
+                CompiledListenerIdentityMode::Required
+            );
+            assert!(matches!(
+                listener.endpoint,
+                StaticListenerEndpoint::AccessFlow {
+                    admission_timeout,
+                    allowed_destination_ports,
+                    transport:
+                        StaticAccessFlowTransport::TlsTcp {
+                            bind,
+                            handshake_timeout,
+                            server_identity,
+                            abuse_control,
+                            projected_bytes,
+                        },
+                } if admission_timeout == Duration::from_secs(2)
+                    && allowed_destination_ports == [destination_port]
+                    && bind.port() == if destination_port == 80 { 7443 } else { 7444 }
+                    && handshake_timeout == Duration::from_secs(5)
+                    && server_identity.certificate_chain
+                        == Path::new("/etc/acl-proxy/tls/access-flow-chain.pem")
+                    && server_identity.private_key
+                        == Path::new("/etc/acl-proxy/tls/access-flow-key.pem")
+                    && abuse_control.max_handshakes
+                        == access_flow_tls::DEFAULT_MAX_HANDSHAKES
+                    && abuse_control.per_source.is_none()
+                    && projected_bytes > 0
+                    && projected_bytes <= MAX_ACCESS_FLOW_TLS_PROJECTED_BYTES
+            ));
+        }
+
+        let baseline = compile(&tls_access_flow_config("transparent_http", 80)).unwrap();
+        let changed = compile(
+            &tls_access_flow_config("transparent_http", 80)
+                .replace("127.0.0.1:7443", "127.0.0.2:7443"),
+        )
+        .unwrap();
+        assert_ne!(baseline.static_fingerprint, changed.static_fingerprint);
+    }
+
+    #[test]
+    fn tls_tcp_access_flow_projection_omits_disabled_per_source_resources() {
+        let abuse_control = super::super::authoring::AccessFlowTlsAbuseControlConfig::default();
+        let max_connections = 256_u64;
+        let chunk_bytes = 64_u64 * 1024;
+        let expected_generation =
+            MAX_SERVER_CHAIN_BYTES as u64 + MAX_PRIVATE_KEY_BYTES as u64 + GENERATION_CONTROL_BYTES;
+        let expected_endpoint = LISTENER_CONTROL_BYTES;
+        let expected_connecting = u64::from(access_flow_tls::DEFAULT_MAX_HANDSHAKES)
+            * (ACTIVE_CHANNEL_BYTES + HANDSHAKE_BYTES + CHANNEL_TASK_BYTES);
+        let expected_active = max_connections * (ACTIVE_CHANNEL_BYTES + CHANNEL_TASK_BYTES);
+        let expected_permits = (u64::from(access_flow_tls::DEFAULT_MAX_HANDSHAKES) * 3
+            + max_connections)
+            * PERMIT_SLOT_BYTES;
+        let expected_admitted_copy = max_connections * chunk_bytes;
+        let expected = expected_generation
+            + expected_endpoint
+            + expected_connecting
+            + expected_active
+            + expected_permits
+            + expected_admitted_copy;
+
+        assert_eq!(
+            project_access_flow_tls_listener(
+                &abuse_control,
+                usize::try_from(max_connections).unwrap(),
+                usize::try_from(chunk_bytes).unwrap(),
+                "listeners.transparent_http",
+            )
+            .unwrap(),
+            expected
+        );
+
+        let configured = super::super::authoring::AccessFlowTlsAbuseControlConfig {
+            max_handshakes: abuse_control.max_handshakes,
+            per_source: Some(
+                super::super::authoring::AccessFlowTlsPerSourceAbuseControlConfig {
+                    max_connections: 64,
+                    handshakes_per_second: 100,
+                    handshake_burst: 200,
+                    source_table_capacity: 128,
+                },
+            ),
+        };
+        let expected_per_source = 128 * SOURCE_ENTRY_BYTES + 128 * 64 * PERMIT_SLOT_BYTES;
+        assert_eq!(
+            project_access_flow_tls_listener(
+                &configured,
+                usize::try_from(max_connections).unwrap(),
+                usize::try_from(chunk_bytes).unwrap(),
+                "listeners.transparent_http",
+            )
+            .unwrap(),
+            expected + expected_per_source
+        );
+    }
+
+    #[test]
+    #[ignore = "RT06 product resource gate invokes this projection probe explicitly"]
+    fn rt06_product_projection_probe() {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+
+        const LISTENER_COUNT: u64 = 2;
+        const MAX_CONNECTIONS: usize = 64;
+        const CHUNK_BYTES: usize = 64 * 1024;
+
+        let output = std::env::var_os("ACL_PROXY_RT06_PROJECTION_OUTPUT")
+            .map(PathBuf::from)
+            .expect("ACL_PROXY_RT06_PROJECTION_OUTPUT must name a new absolute output file");
+        assert!(
+            output.is_absolute() && output.file_name().is_some(),
+            "ACL_PROXY_RT06_PROJECTION_OUTPUT must name a new absolute output file"
+        );
+
+        let abuse_control = super::super::authoring::AccessFlowTlsAbuseControlConfig {
+            max_handshakes: 64,
+            per_source: Some(
+                super::super::authoring::AccessFlowTlsPerSourceAbuseControlConfig {
+                    max_connections: 64,
+                    handshakes_per_second: 100,
+                    handshake_burst: 200,
+                    source_table_capacity: 128,
+                },
+            ),
+        };
+        let limits = checked_access_flow_tls_abuse_control(
+            &abuse_control,
+            "listeners.transparent_http.endpoint.transport.abuse_control",
+        )
+        .expect("the RT06 abuse-control limits must be valid");
+        let listener_bytes = project_access_flow_tls_listener(
+            &abuse_control,
+            MAX_CONNECTIONS,
+            CHUNK_BYTES,
+            "listeners.transparent_http",
+        )
+        .expect("the RT06 measurement configuration must have a valid resource projection");
+        let identity = access_flow_tls::TlsAccessFlowServerIdentity::new(
+            access_flow_tls::TlsAccessFlowGeneration::new(1).unwrap(),
+            access_flow_tls::TlsAccessFlowCertificateChain::new(vec![vec![0x30]]).unwrap(),
+            access_flow_tls::TlsAccessFlowPrivateKey::new(vec![0x30]).unwrap(),
+        );
+        let tls_projection = access_flow_tls::project_tls_server_resources(
+            &identity,
+            limits,
+            u32::try_from(MAX_CONNECTIONS).unwrap(),
+        )
+        .expect("the RT06 TLS server resource projection must be valid");
+        let projected_bytes = listener_bytes
+            .checked_mul(LISTENER_COUNT)
+            .expect("the RT06 projection must fit u64");
+        // Each admitted TLS flow also owns one Proxy upstream socket.
+        let projected_descriptors = tls_projection
+            .descriptors()
+            .checked_add(u64::try_from(MAX_CONNECTIONS).unwrap())
+            .and_then(|value| value.checked_mul(LISTENER_COUNT))
+            .expect("the RT06 descriptor projection must fit u64");
+        let minimum_active_bytes_per_flow = ACTIVE_CHANNEL_BYTES
+            .checked_add(CHANNEL_TASK_BYTES)
+            .and_then(|value| value.checked_add(CHUNK_BYTES as u64))
+            .expect("the RT06 active-flow projection must fit u64");
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output)
+            .expect("the RT06 projection output must not already exist");
+        writeln!(
+            file,
+            "name\tvalue\nproxy_projected_bytes\t{projected_bytes}\n\
+             proxy_projected_descriptors\t{projected_descriptors}\n\
+             proxy_minimum_active_bytes_per_flow\t{minimum_active_bytes_per_flow}"
+        )
+        .expect("the RT06 projection output must be writable");
+        file.sync_all()
+            .expect("the RT06 projection output must be durable");
+    }
+
+    #[test]
+    fn tls_tcp_access_flow_feature_budget_is_global_across_listeners() {
+        let baseline = tls_access_flow_config("transparent_http", 80)
+            .replace("max_connections = 256", "max_connections = 1024");
+        let both_listeners = baseline.replace(
+            "[identity]",
+            r#"[listeners.transparent_https]
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
+endpoint.allowed_destination_ports = [443]
+http_versions = ["http1"]
+max_connections = 1024
+
+[listeners.transparent_https.endpoint.transport]
+kind = "tls_tcp"
+bind = "127.0.0.1:7444"
+handshake_timeout = "5s"
+
+[listeners.transparent_https.endpoint.transport.server_identity]
+certificate_chain = "tls/access-flow-https-chain.pem"
+private_key = "tls/access-flow-https-key.pem"
+
+[listeners.transparent_https.identity]
+mode = "required"
+
+[mitm]
+mode = "generated"
+directory = "mitm"
+
+[identity]"#,
+        );
+        let single_projection = project_access_flow_tls_listener(
+            &super::super::authoring::AccessFlowTlsAbuseControlConfig::default(),
+            1024,
+            64 * 1024,
+            "listeners.transparent_http",
+        )
+        .unwrap();
+        assert!(single_projection < MAX_ACCESS_FLOW_TLS_PROJECTED_BYTES);
+        assert!(single_projection * 2 > MAX_ACCESS_FLOW_TLS_PROJECTED_BYTES);
+
+        let error = compile(&both_listeners).expect_err("the aggregate TLS budget must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("exceed the 268435456-byte feature ceiling"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn tls_tcp_access_flow_rejects_unknown_alias_fallback_and_client_credential_fields() {
+        let baseline = tls_access_flow_config("transparent_http", 80);
+        let missing_timeout = baseline.replace("handshake_timeout = \"5s\"\n", "");
+        let error = toml::from_str::<super::super::authoring::AuthoringConfig>(&missing_timeout)
+            .unwrap_err();
+        assert!(error.to_string().contains("handshake_timeout"), "{error}");
+
+        for (name, input) in [
+            (
+                "Unix path",
+                baseline.replace(
+                    "handshake_timeout = \"5s\"",
+                    "handshake_timeout = \"5s\"\npath = \"/tmp/legacy.sock\"",
+                ),
+            ),
+            (
+                "client identity source",
+                baseline.replace(
+                    "handshake_timeout = \"5s\"",
+                    "handshake_timeout = \"5s\"\nclient_identity_source = \"client.pem\"",
+                ),
+            ),
+            (
+                "client auth",
+                baseline.replace(
+                    "handshake_timeout = \"5s\"",
+                    "handshake_timeout = \"5s\"\nclient_auth = \"required\"",
+                ),
+            ),
+            (
+                "cleartext",
+                baseline.replace(
+                    "handshake_timeout = \"5s\"",
+                    "handshake_timeout = \"5s\"\ncleartext = true",
+                ),
+            ),
+            (
+                "opportunistic",
+                baseline.replace(
+                    "handshake_timeout = \"5s\"",
+                    "handshake_timeout = \"5s\"\nopportunistic = true",
+                ),
+            ),
+            (
+                "insecure",
+                baseline.replace(
+                    "handshake_timeout = \"5s\"",
+                    "handshake_timeout = \"5s\"\ninsecure = true",
+                ),
+            ),
+            (
+                "fallback",
+                baseline.replace(
+                    "handshake_timeout = \"5s\"",
+                    "handshake_timeout = \"5s\"\nfallback = \"unix\"",
+                ),
+            ),
+            (
+                "certificate alias",
+                baseline.replace(
+                    "certificate_chain = \"tls/access-flow-chain.pem\"",
+                    "certificate = \"tls/access-flow-chain.pem\"",
+                ),
+            ),
+            (
+                "private key alias",
+                baseline.replace(
+                    "private_key = \"tls/access-flow-key.pem\"",
+                    "key = \"tls/access-flow-key.pem\"",
+                ),
+            ),
+        ] {
+            let error =
+                toml::from_str::<super::super::authoring::AuthoringConfig>(&input).unwrap_err();
+            assert!(
+                error.to_string().contains("unknown field"),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn tls_tcp_access_flow_enforces_ports_identity_timeouts_and_abuse_bounds() {
+        let baseline = tls_access_flow_config("transparent_http", 80);
+        for (name, input, expected) in [
+            (
+                "wrong port",
+                baseline.replace(
+                    "endpoint.allowed_destination_ports = [80]",
+                    "endpoint.allowed_destination_ports = [8080]",
+                ),
+                "must be exactly [80]",
+            ),
+            (
+                "extra port",
+                baseline.replace(
+                    "endpoint.allowed_destination_ports = [80]",
+                    "endpoint.allowed_destination_ports = [80, 8080]",
+                ),
+                "must be exactly [80]",
+            ),
+            (
+                "optional identity",
+                baseline.replace("mode = \"required\"", "mode = \"optional\""),
+                "must be required",
+            ),
+            (
+                "handshake over maximum",
+                baseline.replace("handshake_timeout = \"5s\"", "handshake_timeout = \"31s\""),
+                "no greater than 30 seconds",
+            ),
+        ] {
+            let error = compile(&input).expect_err(name);
+            assert!(error.to_string().contains(expected), "{name}: {error}");
+        }
+
+        let mut missing_identity: super::super::authoring::AuthoringConfig =
+            toml::from_str(&baseline).unwrap();
+        missing_identity
+            .listeners
+            .transparent_http
+            .as_mut()
+            .unwrap()
+            .identity = None;
+        missing_identity.identity = None;
+        let error = compile_config(missing_identity, Path::new("/etc/acl-proxy"))
+            .expect_err("TLS/TCP Access Flow requires listener identity");
+        assert!(error.to_string().contains("must be required"), "{error}");
+
+        let maximum = u64::from(access_flow_tls::HARD_MAX_HANDSHAKES);
+        let at_maximum = baseline.replace(
+            "[listeners.transparent_http.identity]",
+            &format!(
+                "[listeners.transparent_http.endpoint.transport.abuse_control]\nmax_handshakes = {maximum}\n\n[listeners.transparent_http.identity]"
+            ),
+        );
+        compile(&at_maximum)
+            .unwrap_or_else(|error| panic!("max_handshakes must accept its hard maximum: {error}"));
+        for invalid in [0, maximum + 1] {
+            let input = baseline.replace(
+                "[listeners.transparent_http.identity]",
+                &format!(
+                    "[listeners.transparent_http.endpoint.transport.abuse_control]\nmax_handshakes = {invalid}\n\n[listeners.transparent_http.identity]"
+                ),
+            );
+            let error = compile(&input).expect_err("invalid global handshake limit must fail");
+            assert!(error.to_string().contains("max_handshakes"), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("between 1 and {maximum}")),
+                "{error}"
+            );
+        }
+
+        for (field, over_maximum, maximum) in [
+            (
+                "max_connections",
+                u64::from(access_flow_tls::HARD_MAX_CONNECTIONS_PER_SOURCE) + 1,
+                u64::from(access_flow_tls::HARD_MAX_CONNECTIONS_PER_SOURCE),
+            ),
+            (
+                "handshakes_per_second",
+                u64::from(access_flow_tls::HARD_MAX_HANDSHAKES_PER_SECOND) + 1,
+                u64::from(access_flow_tls::HARD_MAX_HANDSHAKES_PER_SECOND),
+            ),
+            (
+                "handshake_burst",
+                u64::from(access_flow_tls::HARD_MAX_HANDSHAKE_BURST) + 1,
+                u64::from(access_flow_tls::HARD_MAX_HANDSHAKE_BURST),
+            ),
+            (
+                "source_table_capacity",
+                u64::from(access_flow_tls::HARD_MAX_SOURCE_TABLE_CAPACITY) + 1,
+                u64::from(access_flow_tls::HARD_MAX_SOURCE_TABLE_CAPACITY),
+            ),
+        ] {
+            for invalid in [0, over_maximum] {
+                let mut values = [
+                    ("max_connections", 64_u64),
+                    ("handshakes_per_second", 100_u64),
+                    ("handshake_burst", 200_u64),
+                    ("source_table_capacity", 128_u64),
+                ];
+                values
+                    .iter_mut()
+                    .find(|(candidate, _)| *candidate == field)
+                    .expect("bounded per-source field")
+                    .1 = invalid;
+                let per_source = values
+                    .into_iter()
+                    .map(|(name, value)| format!("{name} = {value}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let input = baseline.replace(
+                    "[listeners.transparent_http.identity]",
+                    &format!(
+                        "[listeners.transparent_http.endpoint.transport.abuse_control.per_source]\n{per_source}\n\n[listeners.transparent_http.identity]"
+                    ),
+                );
+                let error = compile(&input).expect_err("invalid abuse control must fail");
+                assert!(error.to_string().contains(field), "{field}: {error}");
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("between 1 and {maximum}")),
+                    "{field}: {error}"
+                );
+            }
+
+            let mut per_source =
+                super::super::authoring::AccessFlowTlsPerSourceAbuseControlConfig {
+                    max_connections: 64,
+                    handshakes_per_second: 100,
+                    handshake_burst: 200,
+                    source_table_capacity: 128,
+                };
+            match field {
+                "max_connections" => per_source.max_connections = maximum as u16,
+                "handshakes_per_second" => per_source.handshakes_per_second = maximum as u16,
+                "handshake_burst" => per_source.handshake_burst = maximum as u16,
+                "source_table_capacity" => per_source.source_table_capacity = maximum as u32,
+                _ => unreachable!("bounded per-source field"),
+            }
+            checked_access_flow_tls_abuse_control(
+                &super::super::authoring::AccessFlowTlsAbuseControlConfig {
+                    max_handshakes: access_flow_tls::DEFAULT_MAX_HANDSHAKES,
+                    per_source: Some(per_source),
+                },
+                "listeners.transparent_http.endpoint.transport.abuse_control",
+            )
+            .unwrap_or_else(|error| {
+                panic!("{field} must accept its inclusive hard maximum: {error}")
+            });
+        }
+    }
+
+    #[test]
+    fn tls_tcp_access_flow_rejects_bind_locator_and_feature_budget_collisions() {
+        let baseline = tls_access_flow_config("transparent_http", 80);
+        let duplicate_bind = baseline.replace(
+            "[identity]",
+            r#"[listeners.transparent_https]
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
+endpoint.allowed_destination_ports = [443]
+http_versions = ["http1"]
+max_connections = 64
+
+[listeners.transparent_https.endpoint.transport]
+kind = "tls_tcp"
+bind = "127.0.0.1:7443"
+handshake_timeout = "5s"
+
+[listeners.transparent_https.endpoint.transport.server_identity]
+certificate_chain = "tls/access-flow-chain.pem"
+private_key = "tls/access-flow-key.pem"
+
+[listeners.transparent_https.endpoint.transport.abuse_control]
+
+[listeners.transparent_https.identity]
+mode = "required"
+
+[mitm]
+mode = "generated"
+directory = "mitm"
+
+[identity]"#,
+        );
+        let error = compile(&duplicate_bind).expect_err("overlapping TLS binds must fail");
+        assert!(error
+            .to_string()
+            .contains("overlaps another proxy listener bind"));
+
+        let same_locator = baseline.replace(
+            "private_key = \"tls/access-flow-key.pem\"",
+            "private_key = \"tls/access-flow-chain.pem\"",
+        );
+        let error = compile(&same_locator).expect_err("certificate/key overlap must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("must not overlap the Access Flow TLS certificate chain"),
+            "{error}"
+        );
+
+        let credential_overlap = baseline.replace(
+            "[policy]",
+            r#"[credentials.sources.overlap]
+source = "file"
+path = "tls/access-flow-key.pem"
+
+[policy]"#,
+        );
+        let error = compile(&credential_overlap).expect_err("secret locator overlap must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("must not overlap Access Flow TLS identity material"),
+            "{error}"
+        );
+
+        let process_overlap = baseline.replace(
+            "[policy]",
+            r#"[authorization.providers.overlap]
+kind = "process"
+command = "tls/access-flow-key.pem"
+
+[policy]"#,
+        );
+        let error = compile(&process_overlap).expect_err("static locator overlap must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("authorization.providers.overlap.command"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("must not overlap Access Flow TLS identity material"),
+            "{error}"
+        );
+
+        let over_budget = baseline.replace("max_connections = 256", "max_connections = 2048");
+        let error = compile(&over_budget).expect_err("TLS feature budget must be enforced");
+        assert!(
+            error
+                .to_string()
+                .contains("exceed the 268435456-byte feature ceiling"),
+            "{error}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn protected_locator_comparison_uses_windows_case_semantics() {
+        assert!(protected_locators_equal(
+            Path::new(r"C:\acl-proxy\TLS\access-flow-key.pem"),
+            Path::new(r"c:\ACL-PROXY\tls\ACCESS-FLOW-KEY.PEM"),
+        ));
+        assert!(protected_locators_equal(
+            Path::new(r"C:\acl-proxy\tls\access-flow-key.pem"),
+            Path::new(r"\\?\c:\ACL-PROXY\TLS\ACCESS-FLOW-KEY.PEM"),
+        ));
+        assert!(protected_locators_equal(
+            Path::new(r"\\server\share\acl-proxy\tls\access-flow-key.pem"),
+            Path::new(r"\\?\UNC\SERVER\SHARE\ACL-PROXY\TLS\ACCESS-FLOW-KEY.PEM"),
+        ));
+        assert!(!protected_locators_equal(
+            Path::new(r"C:\acl-proxy\tls\access-flow-key.pem"),
+            Path::new(r"C:\acl-proxy\tls\access-flow-chain.pem"),
+        ));
     }
 
     #[cfg(unix)]
@@ -14096,6 +15384,75 @@ client_cidrs = ["127.0.0.0/8"]
             .expect("shipped Unix host example should pass the exact configuration facade");
         assert_eq!(loaded.metadata.path, path);
         assert_eq!(loaded.compiled.static_config.schema_version, 4);
+    }
+
+    #[test]
+    fn shipped_tls_access_flow_example_loads_through_the_exact_facade() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/acl-proxy-access-flow-tls.toml");
+        let loaded = super::super::facade::load_and_compile_exact_config(&path).expect(
+            "shipped TLS/TCP Access Flow example should pass the exact configuration facade",
+        );
+        assert_eq!(loaded.metadata.path, path);
+        assert_eq!(loaded.compiled.static_config.schema_version, 4);
+        let assert_listener = |max_connections: usize, endpoint: &StaticListenerEndpoint| {
+            assert_eq!(max_connections, 64);
+            let StaticListenerEndpoint::AccessFlow {
+                transport: StaticAccessFlowTransport::TlsTcp { abuse_control, .. },
+                ..
+            } = endpoint
+            else {
+                panic!("shipped transparent listener must use TLS/TCP Access Flow");
+            };
+            assert_eq!(
+                abuse_control.per_source, None,
+                "single-relay shipped profile must not throttle its one physical source"
+            );
+        };
+        let http = loaded
+            .compiled
+            .static_config
+            .listeners
+            .transparent_http
+            .as_ref()
+            .expect("shipped TLS example must configure transparent HTTP");
+        assert_listener(http.max_connections, &http.endpoint);
+        let https = loaded
+            .compiled
+            .static_config
+            .listeners
+            .transparent_https
+            .as_ref()
+            .expect("shipped TLS example must configure transparent HTTPS");
+        assert_listener(https.max_connections, &https.endpoint);
+    }
+
+    #[test]
+    fn tls_tcp_access_flow_rejects_old_flat_and_partial_per_source_shapes() {
+        let baseline = tls_access_flow_config("transparent_http", 80);
+        let old_flat = baseline.replace(
+            "[listeners.transparent_http.endpoint.transport.server_identity]",
+            "[listeners.transparent_http.endpoint.transport.abuse_control]\n\
+             max_connections_per_source = 8\n\n\
+             [listeners.transparent_http.endpoint.transport.server_identity]",
+        );
+        let error = toml::from_str::<super::super::authoring::AuthoringConfig>(&old_flat)
+            .expect_err("old flat per-source field must be rejected");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+
+        let partial = baseline.replace(
+            "[listeners.transparent_http.endpoint.transport.server_identity]",
+            "[listeners.transparent_http.endpoint.transport.abuse_control.per_source]\n\
+             max_connections = 8\n\n\
+             [listeners.transparent_http.endpoint.transport.server_identity]",
+        );
+        let error = toml::from_str::<super::super::authoring::AuthoringConfig>(&partial)
+            .expect_err("partial per-source block must be rejected");
+        assert!(
+            error.to_string().contains("missing field")
+                && error.to_string().contains("handshakes_per_second"),
+            "{error}"
+        );
     }
 
     #[test]

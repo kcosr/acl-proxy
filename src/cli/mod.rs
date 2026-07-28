@@ -12,7 +12,7 @@ use crate::config::{
     StaticProductConfig,
 };
 use crate::logging::LoggingSettings;
-use crate::runtime::{ReloadTriggerResult, Runtime};
+use crate::runtime::ReloadTriggerResult;
 
 mod export_ca;
 
@@ -171,8 +171,12 @@ fn run_inner() -> Result<ExitCode, CliError> {
         }
         Command::Config { command } => match command {
             ConfigCommand::Validate => {
-                load_and_compile_config(config_path)
+                let loaded = load_and_compile_config(config_path)
                     .map_err(|error| CliError::Config(error.to_string()))?;
+                crate::activation::access_flow_security::validate_access_flow_security_material(
+                    &loaded.compiled.static_config.listeners,
+                )
+                .map_err(|error| CliError::Product(error.to_string()))?;
                 println!("Configuration is valid");
                 Ok(ExitCode::SUCCESS)
             }
@@ -283,7 +287,7 @@ async fn supervise_process(
                         if reload_task.is_some() {
                             reload_again = true;
                         } else {
-                            reload_task = Some(spawn_reload(runtime.clone()));
+                            reload_task = Some(spawn_reload(Arc::clone(product)));
                         }
                     }
                 }
@@ -312,7 +316,7 @@ async fn supervise_process(
                 }
                 if reload_again {
                     reload_again = false;
-                    reload_task = Some(spawn_reload(runtime.clone()));
+                    reload_task = Some(spawn_reload(Arc::clone(product)));
                 }
             }
         }
@@ -327,8 +331,14 @@ async fn supervise_process(
     let shutdown_diagnostic = product.shutdown_diagnostic();
     if let Some(reload) = reload_task {
         match reload.await {
-            Ok(Ok(_)) | Ok(Err(crate::runtime::RuntimeError::ShuttingDown)) => {}
-            Ok(Err(error)) => tracing::debug!(%error, "reload ended during process shutdown"),
+            Ok(result) => {
+                if let Err(error) = result.configuration {
+                    tracing::debug!(%error, "configuration reload ended during process shutdown");
+                }
+                if let Err(error) = result.access_flow_security {
+                    tracing::debug!(%error, "Access Flow security reload ended during process shutdown");
+                }
+            }
             Err(error) => {
                 return Err(CliError::Process(format!(
                     "configuration reload coordinator did not join: {error}"
@@ -373,23 +383,22 @@ async fn shutdown_while_polling_signals(
     }
 }
 
-type ReloadTask =
-    tokio::task::JoinHandle<Result<ReloadTriggerResult, crate::runtime::RuntimeError>>;
+type ReloadTask = tokio::task::JoinHandle<crate::activation::runner::ProductReloadResult>;
 
-fn spawn_reload(runtime: Arc<Runtime>) -> ReloadTask {
-    tokio::spawn(async move { runtime.trigger_reload().await })
+fn spawn_reload(product: Arc<ProductRuntime>) -> ReloadTask {
+    tokio::spawn(async move { product.trigger_reload().await })
 }
 
 async fn wait_for_reload(
     task: &mut Option<ReloadTask>,
-) -> Result<Result<ReloadTriggerResult, crate::runtime::RuntimeError>, tokio::task::JoinError> {
+) -> Result<crate::activation::runner::ProductReloadResult, tokio::task::JoinError> {
     task.as_mut()
         .expect("reload completion is selected only while a task is owned")
         .await
 }
 
-fn log_reload_result(result: Result<ReloadTriggerResult, crate::runtime::RuntimeError>) {
-    match result {
+fn log_reload_result(result: crate::activation::runner::ProductReloadResult) {
+    match result.configuration {
         Ok(ReloadTriggerResult::Coalesced) => {
             tracing::info!("configuration reload coalesced with the active attempt");
         }
@@ -405,6 +414,10 @@ fn log_reload_result(result: Result<ReloadTriggerResult, crate::runtime::Runtime
             );
         }
         Err(error) => tracing::error!(%error, "configuration reload failed"),
+    }
+    match result.access_flow_security {
+        Ok(()) => tracing::info!("Access Flow security-material reload completed successfully"),
+        Err(error) => tracing::error!(%error, "Access Flow security-material reload failed"),
     }
 }
 

@@ -2,8 +2,17 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Require Windows Access Flow server private keys to be owned by the process
+  user and have a protected, owner-restricted DACL, matching the Unix
+  owner-only custody requirement.
+
 ### Breaking Changes
 
+- Replaced flat TLS/TCP Access Flow per-source abuse-control fields with an
+  optional closed `abuse_control.per_source` block. Omission now disables
+  physical-source throttling; present blocks require all four limits.
 - Replaced scalar data-listener `bind` fields with the closed typed `endpoint`
   contract. TCP listeners use `{ kind = "tcp", address = "..." }`; transparent
   HTTP and HTTPS may use Access Flow endpoints whose admission timeout and
@@ -34,6 +43,14 @@
 
 ### Added
 
+- Added server-authenticated TLS 1.3/TCP beneath transparent HTTP/HTTPS Access
+  Flow listeners, with exact `aw-access-flow/1` ALPN, mandatory AWAF workload
+  bearer resolution, bounded source-aware pre-admission controls, fixed
+  accept coordination with no-wait handshake admission, bounded transient and
+  descriptor-pressure retry before terminal listener failure, secure
+  server-identity loading, independent SIGHUP rotation, expiry/readiness
+  gating, and remote ingress projections that never treat a transport source
+  as policy authority.
 - Added schema-v4 implicit sibling `rules.d` policy fragments with secure
   bounded snapshot loading, deterministic fragment-before-main composition,
   global rule validation, source-aware diagnostics and policy dumps, and

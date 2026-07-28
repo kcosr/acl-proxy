@@ -40,6 +40,107 @@ pub(super) struct ObjectIdentity {
     pub(super) file_id: [u8; 16],
 }
 
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProtectedFileIdentity(ObjectIdentity);
+
+#[cfg(windows)]
+pub(crate) struct ProtectedFileSnapshot {
+    identity: ProtectedFileIdentity,
+    bytes: zeroize::Zeroizing<Vec<u8>>,
+}
+
+#[cfg(windows)]
+impl ProtectedFileSnapshot {
+    pub(crate) const fn identity(&self) -> ProtectedFileIdentity {
+        self.identity
+    }
+
+    pub(crate) fn into_bytes(self) -> zeroize::Zeroizing<Vec<u8>> {
+        self.bytes
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProtectedFileSnapshotError {
+    Unavailable,
+    Untrusted,
+    ResourceLimit,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProtectedFilePolicy {
+    Stable,
+    OwnerRestricted,
+}
+
+#[cfg(windows)]
+pub(crate) fn load_protected_file_snapshot(
+    path: &Path,
+    maximum_bytes: usize,
+    policy: ProtectedFilePolicy,
+) -> Result<ProtectedFileSnapshot, ProtectedFileSnapshotError> {
+    let parent_path = path.parent().ok_or(ProtectedFileSnapshotError::Untrusted)?;
+    let name = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or(ProtectedFileSnapshotError::Untrusted)?;
+    let parent =
+        platform::open_parent(parent_path).map_err(|_| ProtectedFileSnapshotError::Unavailable)?;
+    let probed = platform::probe_at(&parent, name)
+        .map_err(|_| ProtectedFileSnapshotError::Unavailable)?
+        .ok_or(ProtectedFileSnapshotError::Unavailable)?;
+    if probed.kind != ObjectKind::RegularFile || probed.links != 1 {
+        return Err(ProtectedFileSnapshotError::Untrusted);
+    }
+    if probed.size > maximum_bytes as u64 {
+        return Err(ProtectedFileSnapshotError::ResourceLimit);
+    }
+    let (mut file, opened) = platform::open_protected_file_at(
+        &parent,
+        name,
+        policy == ProtectedFilePolicy::OwnerRestricted,
+    )
+    .map_err(|_| ProtectedFileSnapshotError::Unavailable)?;
+    if opened != probed {
+        return Err(ProtectedFileSnapshotError::Untrusted);
+    }
+    if policy == ProtectedFilePolicy::OwnerRestricted
+        && !platform::has_owner_restricted_dacl(&file)
+            .map_err(|_| ProtectedFileSnapshotError::Unavailable)?
+    {
+        return Err(ProtectedFileSnapshotError::Untrusted);
+    }
+    let read_limit = maximum_bytes
+        .checked_add(1)
+        .ok_or(ProtectedFileSnapshotError::ResourceLimit)?;
+    let bytes = platform::read_sensitive_file_limited(&mut file, read_limit)
+        .map_err(|_| ProtectedFileSnapshotError::Unavailable)?;
+    if bytes.len() > maximum_bytes {
+        return Err(ProtectedFileSnapshotError::ResourceLimit);
+    }
+    let post =
+        platform::metadata_file(&file).map_err(|_| ProtectedFileSnapshotError::Unavailable)?;
+    let final_probe =
+        platform::probe_at(&parent, name).map_err(|_| ProtectedFileSnapshotError::Unavailable)?;
+    let custody_is_stable = policy != ProtectedFilePolicy::OwnerRestricted
+        || platform::has_owner_restricted_dacl(&file)
+            .map_err(|_| ProtectedFileSnapshotError::Unavailable)?;
+    if post != probed
+        || final_probe != Some(probed)
+        || bytes.len() as u64 != probed.size
+        || !custody_is_stable
+    {
+        return Err(ProtectedFileSnapshotError::Untrusted);
+    }
+    Ok(ProtectedFileSnapshot {
+        identity: ProtectedFileIdentity(probed.identity),
+        bytes,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct MutationMetadata {
     pub(super) modified_seconds: i64,
@@ -763,6 +864,24 @@ mod tests {
             Err(LoadSourcesError::Snapshot(
                 SourceSnapshotError::MultipleLinks { .. }
             ))
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_ancestor_reparse_point_is_rejected() {
+        use std::os::windows::fs::symlink_dir;
+
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("target");
+        let selected = directory.path().join("selected");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("acl-proxy.toml"), MAIN).unwrap();
+        symlink_dir(&target, &selected).unwrap();
+
+        assert!(matches!(
+            load_sources(&selected.join("acl-proxy.toml"), |_, _| Ok::<_, ()>(())),
+            Err(LoadSourcesError::Snapshot(SourceSnapshotError::Io { .. }))
         ));
     }
 

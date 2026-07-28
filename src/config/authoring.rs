@@ -447,7 +447,55 @@ pub(super) enum ListenerEndpointConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum AccessFlowTransportConfig {
-    Unix { path: PathBuf, mode: String },
+    Unix {
+        path: PathBuf,
+        mode: String,
+    },
+    TlsTcp {
+        bind: SocketAddr,
+        handshake_timeout: PositiveDuration,
+        server_identity: AccessFlowTlsServerIdentityConfig,
+        #[serde(default)]
+        abuse_control: AccessFlowTlsAbuseControlConfig,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AccessFlowTlsServerIdentityConfig {
+    pub certificate_chain: PathBuf,
+    pub private_key: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AccessFlowTlsAbuseControlConfig {
+    #[serde(default = "default_access_flow_tls_max_handshakes")]
+    pub max_handshakes: u16,
+    #[serde(default)]
+    pub per_source: Option<AccessFlowTlsPerSourceAbuseControlConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AccessFlowTlsPerSourceAbuseControlConfig {
+    pub max_connections: u16,
+    pub handshakes_per_second: u16,
+    pub handshake_burst: u16,
+    pub source_table_capacity: u32,
+}
+
+impl Default for AccessFlowTlsAbuseControlConfig {
+    fn default() -> Self {
+        Self {
+            max_handshakes: default_access_flow_tls_max_handshakes(),
+            per_source: None,
+        }
+    }
+}
+
+fn default_access_flow_tls_max_handshakes() -> u16 {
+    access_flow_tls::DEFAULT_MAX_HANDSHAKES
 }
 
 #[derive(Debug, Clone, Deserialize)]

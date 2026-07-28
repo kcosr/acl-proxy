@@ -11,6 +11,7 @@ BASELINE="$TEMP/baseline"
 mkdir -p "$BASELINE/acl-proxy/fixtures/empty" \
     "$BASELINE/access-runtime/crates/example" \
     "$BASELINE/access-runtime/crates/example/src" \
+    "$BASELINE/access-runtime/fixtures/consumer-harness/surface" \
     "$BASELINE/access-runtime/.cargo"
 
 python3 - "$BASELINE" <<'PY'
@@ -46,6 +47,17 @@ tokio-rustls.workspace = true
 )
 (root / "access-runtime/crates/example/src/lib.rs").write_text(
     'pub fn neutral_tls_fixture() {}\n', encoding="utf-8"
+)
+(root / "access-runtime/fixtures/consumer-harness/surface/Cargo.toml").write_text(
+    '''[package]
+name = "access-runtime-consumer-surface"
+version = "0.0.0"
+
+[dependencies]
+rustls = { version = "=0.23.42", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring"] }
+''',
+    encoding="utf-8",
 )
 
 def lock(root_package, include_native):
@@ -169,6 +181,12 @@ elif mode == "runtime-member-native":
     append(
         root / "access-runtime/crates/example/Cargo.toml",
         'rustls-native-certs = "=0.8.3"\n',
+    )
+elif mode == "runtime-consumer-enables-tls12":
+    replace(
+        root / "access-runtime/fixtures/consumer-harness/surface/Cargo.toml",
+        'features = ["ring", "std"]',
+        'features = ["ring", "std", "tls12"]',
     )
 elif mode == "runtime-native-source":
     append(
@@ -496,6 +514,7 @@ mutations=(
     runtime-native-dependency
     runtime-native-alias
     runtime-member-native
+    runtime-consumer-enables-tls12
     runtime-native-source
     member-wrong-rustls
     member-rustls-alias

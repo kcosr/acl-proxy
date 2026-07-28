@@ -89,6 +89,78 @@ async fn response_send_raw(proxy: SocketAddr, request: &[u8]) -> Vec<u8> {
     response_read_to_close(stream).await
 }
 
+#[tokio::test]
+async fn write_half_closed_client_receives_the_complete_delayed_upstream_response() {
+    assert_half_closed_client_receives_delayed_response(true).await;
+}
+
+#[tokio::test]
+async fn write_half_closed_keep_alive_client_receives_the_complete_response_then_eof() {
+    assert_half_closed_client_receives_delayed_response(false).await;
+}
+
+async fn assert_half_closed_client_receives_delayed_response(connection_close: bool) {
+    let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+    let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let origin = origin_listener.local_addr().unwrap();
+    let (release_body, body_release) = tokio::sync::oneshot::channel();
+    let origin_task = tokio::spawn(async move {
+        let (mut stream, _) = origin_listener.accept().await.unwrap();
+        response_read_head(&mut stream).await;
+        let response_head = if connection_close {
+            b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\n".as_slice()
+        } else {
+            b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n".as_slice()
+        };
+        stream.write_all(response_head).await.unwrap();
+        stream.flush().await.unwrap();
+        body_release.await.unwrap();
+        stream.write_all(b"delayed-body!").await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    let authority = format!("half-close.test:{}", origin.port());
+    let (proxy, listener) = response_prebound_listener();
+    let config = response_base_config(
+        proxy,
+        r#"[policy]
+default = "allow"
+"#,
+    );
+    let (_directory, product) = start_response_product(
+        &config,
+        listener,
+        [(format!("http://{authority}/"), origin)],
+    )
+    .await;
+
+    let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    let connection_header = if connection_close {
+        "Connection: close\r\n"
+    } else {
+        ""
+    };
+    client
+        .write_all(
+            format!(
+                "GET http://{authority}/response HTTP/1.1\r\nHost: {authority}\r\n{connection_header}\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    client.shutdown().await.unwrap();
+    let head = response_read_head(&mut client).await;
+    assert!(head.starts_with(b"HTTP/1.1 200 "));
+    release_body.send(()).unwrap();
+    let body = response_read_to_close(client).await;
+
+    assert_eq!(body, b"delayed-body!");
+    origin_task.await.unwrap();
+    product.shutdown().await;
+}
+
 fn local_failure_capture_config() -> &'static str {
     r#"[redaction.profiles.failure_capture]
 replacement = "[MASKED]"

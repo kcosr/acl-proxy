@@ -1137,6 +1137,7 @@ header = "x-test-loop"
         let input = EvaluationInput::new(
             request.facts(),
             peer,
+            Some(peer),
             request.policy_header_facts(),
             RuntimeRequest::INITIAL_REVISION,
             BodyRepresentation::PreservedContentCoded,
@@ -1266,6 +1267,7 @@ header = "x-test-loop"
         let input = EvaluationInput::new(
             request.facts(),
             "192.0.2.10".parse().unwrap(),
+            Some("192.0.2.10".parse().unwrap()),
             request.policy_header_facts(),
             RuntimeRequest::INITIAL_REVISION,
             BodyRepresentation::PreservedContentCoded,
@@ -1322,6 +1324,7 @@ header = "x-test-loop"
         let input = EvaluationInput::new(
             request.facts(),
             "192.0.2.10".parse().unwrap(),
+            Some("192.0.2.10".parse().unwrap()),
             request.policy_header_facts(),
             RuntimeRequest::INITIAL_REVISION,
             BodyRepresentation::PreservedContentCoded,

@@ -522,6 +522,69 @@ fn config_validate_escapes_controls_in_invalid_fragment_basename() {
     assert!(!stderr.contains("bad-\n-name.toml"), "{stderr}");
 }
 
+#[test]
+fn config_validate_resolves_tls_access_flow_identity_with_sanitized_errors() {
+    let config = config_file(
+        r#"schema_version = 4
+
+[listeners.transparent_http]
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
+endpoint.allowed_destination_ports = [80]
+http_versions = ["http1"]
+
+[listeners.transparent_http.identity]
+mode = "required"
+
+[listeners.transparent_http.endpoint.transport]
+kind = "tls_tcp"
+bind = "127.0.0.2:7443"
+handshake_timeout = "2s"
+
+[listeners.transparent_http.endpoint.transport.server_identity]
+certificate_chain = "/sensitive/missing/access-flow-chain.pem"
+private_key = "/sensitive/missing/access-flow-key.pem"
+
+[identity]
+max_pending_authentications = 8
+max_pending_authentications_per_connection = 2
+
+[identity.resolver]
+kind = "static"
+authority = "config-validate-tls"
+
+[[identity.resolver.principals]]
+id = "test-workload"
+kind = "service_account"
+
+[[identity.resolver.tokens]]
+id = "test-token"
+principal = "test-workload"
+source = "environment"
+variable = "AW_CONFIG_VALIDATE_TLS_IDENTITY_TOKEN"
+
+[policy]
+default = "deny"
+"#,
+    );
+
+    let output = command()
+        .args(["config", "validate", "--config"])
+        .arg(config.path())
+        .output()
+        .expect("run config validate");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("Access Flow TLS security material is unavailable"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("/sensitive/"), "{stderr}");
+    assert!(!stderr.contains("access-flow-chain.pem"), "{stderr}");
+    assert!(!stderr.contains("access-flow-key.pem"), "{stderr}");
+}
+
 #[cfg(unix)]
 #[test]
 fn static_cli_commands_never_execute_provider_or_resolve_secrets() {

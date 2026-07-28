@@ -95,15 +95,13 @@ impl StandaloneRequestFactory for ProductStandaloneRequestFactory {
         Box::pin(async move {
             let started_at = Instant::now();
             let listener_transport = ingress.listener_transport();
-            let (
-                facts,
-                peer,
-                peer_is_local,
-                listener_connect_denied,
-                identity,
-                body,
-                private_fields,
-            ) = ingress.into_parts();
+            let (facts, projection, listener_connect_denied, identity, body, private_fields) =
+                ingress.into_parts();
+            let client = projection.client();
+            let request_binding_peer_ip =
+                projection.checked_request_binding_peer_ip(identity.as_ref())?;
+            let policy_peer_ip = projection.policy_peer_ip();
+            let quota_key = WireBodyQuotaKey::from_subject(projection.wire_body_quota_subject());
             let lease = self
                 .runtime
                 .lease()
@@ -149,7 +147,7 @@ impl StandaloneRequestFactory for ProductStandaloneRequestFactory {
                 lease.observation().capture_epoch().clone(),
                 lease.standalone().sensitive_header_policy().clone(),
                 request_id.clone(),
-                peer,
+                client,
                 &facts,
                 lease.max_content_decoding_expansion_ratio(),
             )
@@ -157,8 +155,10 @@ impl StandaloneRequestFactory for ProductStandaloneRequestFactory {
             let input = StandaloneProviderInput {
                 request_id,
                 facts,
-                peer,
-                quota_key: WireBodyQuotaKey::from_peer(peer.ip(), |_| peer_is_local),
+                client,
+                request_binding_peer_ip,
+                policy_peer_ip,
+                quota_key,
                 body,
                 partitioned,
                 started_at,
@@ -229,7 +229,9 @@ impl Clock for TokioRuntimeClock {
 struct StandaloneProviderInput {
     pub(crate) request_id: String,
     pub(crate) facts: http_access_types::InterceptedRequestFacts,
-    pub(crate) peer: SocketAddr,
+    pub(crate) client: SocketAddr,
+    pub(crate) request_binding_peer_ip: IpAddr,
+    pub(crate) policy_peer_ip: Option<IpAddr>,
     pub(crate) quota_key: WireBodyQuotaKey,
     pub(crate) body: StandaloneIngressBody,
     pub(crate) partitioned: PartitionedIngressHeaders,
@@ -285,7 +287,8 @@ struct PreparedDecision {
     headers: HeaderMap,
     inbound: InboundCredentials,
     internal_context: HeaderMap,
-    peer_ip: IpAddr,
+    request_binding_peer_ip: IpAddr,
+    policy_peer_ip: Option<IpAddr>,
     quota_key: WireBodyQuotaKey,
     body_budget: BodyBudget,
     body_budget_activation: BodyBudgetActivation,
@@ -515,7 +518,9 @@ impl StandalonePolicyProvider {
         let StandaloneProviderInput {
             request_id,
             facts,
-            peer,
+            client,
+            request_binding_peer_ip,
+            policy_peer_ip,
             quota_key,
             body: ingress_body,
             partitioned,
@@ -562,13 +567,11 @@ impl StandalonePolicyProvider {
             sensitive_headers,
         )
         .map_err(|_| StandaloneProviderPrepareError::HeaderFacts)?;
-        let evaluation_input = EvaluationInput::new(
+        let evaluation_input = policy_evaluation_input(
             &facts,
-            peer.ip(),
+            request_binding_peer_ip,
+            policy_peer_ip,
             &header_facts,
-            RuntimeRequest::INITIAL_REVISION,
-            BodyRepresentation::PreservedContentCoded,
-            BodyObservation::unobserved(),
             identity.as_ref(),
         )
         .map_err(|_| StandaloneProviderPrepareError::Policy)?;
@@ -647,7 +650,7 @@ impl StandalonePolicyProvider {
         )?;
         let request = RuntimeRequest::new(
             facts,
-            peer.ip(),
+            request_binding_peer_ip,
             header_facts,
             BodyRepresentation::PreservedContentCoded,
             body,
@@ -687,7 +690,7 @@ impl StandalonePolicyProvider {
             request_id: audit_request_id,
             method: audit_method,
             url: audit_url,
-            peer_ip: peer.ip(),
+            peer_ip: client.ip(),
             sensitive_header_presence: audit_sensitive_header_presence,
             allow_level: lease
                 .observation()
@@ -716,7 +719,8 @@ impl StandalonePolicyProvider {
             headers,
             inbound,
             internal_context,
-            peer_ip: peer.ip(),
+            request_binding_peer_ip,
+            policy_peer_ip,
             quota_key,
             body_budget,
             body_budget_activation,
@@ -969,7 +973,7 @@ impl StandalonePolicyProvider {
                         .collect::<Vec<_>>();
                     let provider_headers =
                         ProviderRequestHeaders::new(&included).map_err(|_| 500_u16)?;
-                    let peer_ip = state.peer_ip.to_string();
+                    let peer_ip = state.request_binding_peer_ip.to_string();
                     let provider_identity = metadata.include_identity.then(|| {
                         access_identity::ProviderIdentityProjection::from(request.identity())
                     });
@@ -1018,7 +1022,8 @@ impl StandalonePolicyProvider {
                                 delegated,
                                 ProviderDisposition::Deny,
                                 &request,
-                                state.peer_ip,
+                                state.request_binding_peer_ip,
+                                state.policy_peer_ip,
                             )?;
                             let PolicyEvaluation::Deny { provenance } = policy_result else {
                                 return Err(500);
@@ -1047,7 +1052,8 @@ impl StandalonePolicyProvider {
                                 delegated,
                                 ProviderDisposition::Allow,
                                 &request,
-                                state.peer_ip,
+                                state.request_binding_peer_ip,
+                                state.policy_peer_ip,
                             )?;
                             let PolicyEvaluation::Allow {
                                 provenance,
@@ -1115,7 +1121,8 @@ impl StandalonePolicyProvider {
                                 delegated,
                                 ProviderDisposition::Deny,
                                 &request,
-                                state.peer_ip,
+                                state.request_binding_peer_ip,
+                                state.policy_peer_ip,
                             )?;
                             let PolicyEvaluation::Deny { provenance } = policy_result else {
                                 return Err(500);
@@ -1137,7 +1144,8 @@ impl StandalonePolicyProvider {
                                 delegated,
                                 ProviderDisposition::Pass,
                                 &request,
-                                state.peer_ip,
+                                state.request_binding_peer_ip,
+                                state.policy_peer_ip,
                             )?;
                         }
                     }
@@ -1778,15 +1786,14 @@ fn resolve_delegate(
     delegated: http_access_policy_acl::DelegateMatch<ProductRuleEffectsRef>,
     disposition: ProviderDisposition,
     request: &RuntimeRequest,
-    peer_ip: IpAddr,
+    request_binding_peer_ip: IpAddr,
+    policy_peer_ip: Option<IpAddr>,
 ) -> Result<PolicyEvaluation<ProductRuleEffectsRef>, u16> {
-    let input = EvaluationInput::new(
+    let input = policy_evaluation_input(
         request.facts(),
-        peer_ip,
+        request_binding_peer_ip,
+        policy_peer_ip,
         request.policy_header_facts(),
-        RuntimeRequest::INITIAL_REVISION,
-        BodyRepresentation::PreservedContentCoded,
-        BodyObservation::unobserved(),
         request.identity(),
     )
     .map_err(|_| 500_u16)?;
@@ -1796,6 +1803,25 @@ fn resolve_delegate(
         .snapshot()
         .resolve_delegate(delegated, disposition, &input)
         .map_err(|_| 500_u16)
+}
+
+fn policy_evaluation_input<'a>(
+    facts: &'a http_access_types::InterceptedRequestFacts,
+    request_binding_peer_ip: IpAddr,
+    policy_peer_ip: Option<IpAddr>,
+    header_facts: &'a PolicyHeaderFacts,
+    identity: &'a access_identity::IdentityContext,
+) -> Result<EvaluationInput<'a>, http_access_policy_acl::AclError> {
+    EvaluationInput::new(
+        facts,
+        request_binding_peer_ip,
+        policy_peer_ip,
+        header_facts,
+        RuntimeRequest::INITIAL_REVISION,
+        BodyRepresentation::PreservedContentCoded,
+        BodyObservation::unobserved(),
+        identity,
+    )
 }
 
 fn upgrade_is_disallowed(
@@ -1818,6 +1844,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod local_response_contract_tests {
+    use std::net::Ipv4Addr;
+
+    use http_access_policy_acl::{
+        DefaultDecision, PeerCidr, ProductActionRef, Rule, RulePredicates, TrafficPolicySnapshot,
+    };
+    use http_access_types::{PolicyGeneration, SnapshotIdentity};
+
     use super::*;
 
     #[test]
@@ -1838,6 +1871,103 @@ mod local_response_contract_tests {
             Some(2)
         );
         assert_eq!(clock.deadline_millis(epoch - Duration::from_nanos(1)), None);
+    }
+
+    #[test]
+    fn remote_projection_sentinels_survive_delegate_resume_without_becoming_policy_source() {
+        let identity = access_identity::authenticated_identity_context_fixture();
+        let projection = http_access_runtime::StandaloneIngressProjection::from_access_flow(
+            access_flow::AccessFlowIngressOrigin::RemoteAccessFlow,
+            &identity,
+        )
+        .unwrap();
+        let client = projection.client();
+        let request_binding_peer_ip = projection
+            .checked_request_binding_peer_ip(&identity)
+            .unwrap();
+        assert_eq!(client, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
+        assert_eq!(request_binding_peer_ip, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(projection.policy_peer_ip(), None);
+
+        let provider_client_ip = request_binding_peer_ip.to_string();
+        let provider_request = ProviderRequest {
+            request_id: "request",
+            rule_id: "delegate",
+            url: "http://example.test/resource",
+            method: "GET",
+            client_ip: &provider_client_ip,
+            headers: None,
+            identity: None,
+            body: None,
+        };
+        assert_eq!(provider_request.client_ip, "0.0.0.0");
+
+        let facts = http_access_types::InterceptedRequestFacts::new(
+            http_access_types::IngressMode::TransparentHttp,
+            HttpVersion::Http11,
+            HttpMethod::new("GET").unwrap(),
+            http_access_url::canonicalize_http_url("http://example.test/resource").unwrap(),
+            Vec::new(),
+            http_access_types::BodyMetadata::new(BodyFraming::None),
+            None,
+        )
+        .unwrap();
+        let header_facts =
+            PolicyHeaderFacts::from_partitioned(Vec::new(), Vec::new(), Vec::new()).unwrap();
+        let input = policy_evaluation_input(
+            &facts,
+            request_binding_peer_ip,
+            projection.policy_peer_ip(),
+            &header_facts,
+            &identity,
+        )
+        .unwrap();
+        assert_eq!(input.policy_peer_ip(), None);
+        assert_eq!(
+            input.request_binding_peer_ip(),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        );
+
+        let snapshot_identity = SnapshotIdentity::new();
+        let action = ProductActionRef::new(&snapshot_identity, StableId::new("provider").unwrap());
+        let snapshot = TrafficPolicySnapshot::new(
+            PolicyGeneration::new(1).unwrap(),
+            snapshot_identity,
+            DefaultDecision::Deny,
+            Vec::new(),
+            vec![
+                Rule::delegate(
+                    StableId::new("delegate").unwrap(),
+                    RulePredicates::any(),
+                    action,
+                    "delegate",
+                ),
+                Rule::allow(
+                    StableId::new("peer-default").unwrap(),
+                    RulePredicates::new(
+                        Vec::new(),
+                        Vec::new(),
+                        vec![PeerCidr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).unwrap()],
+                        Vec::new(),
+                        None,
+                    )
+                    .unwrap(),
+                    "peer",
+                ),
+            ],
+        )
+        .unwrap();
+        let PolicyEvaluation::Delegate(delegated) = snapshot.evaluate(&input).unwrap() else {
+            panic!("expected the first rule to delegate");
+        };
+        assert!(matches!(
+            snapshot
+                .resolve_delegate(delegated, ProviderDisposition::Pass, &input)
+                .unwrap(),
+            PolicyEvaluation::Deny { .. }
+        ));
+        assert_eq!(input.policy_peer_ip(), None);
+        assert_eq!(provider_request.client_ip, "0.0.0.0");
     }
 
     fn request_and_clock() -> (RuntimeRequest, Arc<TokioRuntimeClock>) {

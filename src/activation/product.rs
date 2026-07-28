@@ -1053,6 +1053,7 @@ trust = "system"
         let input = http_access_policy_acl::EvaluationInput::new(
             &facts,
             "192.0.2.10".parse().unwrap(),
+            Some("192.0.2.10".parse().unwrap()),
             &header_facts,
             1,
             http_access_types::BodyRepresentation::PreservedContentCoded,

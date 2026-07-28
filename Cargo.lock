@@ -20,12 +20,16 @@ dependencies = [
 name = "access-flow-conformance"
 version = "0.1.0"
 dependencies = [
+ "access-async-contracts",
  "access-flow",
  "access-flow-relay",
+ "access-flow-tls",
  "access-flow-unix",
  "access-identity",
+ "base64",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -37,6 +41,24 @@ dependencies = [
  "access-identity",
  "rustix",
  "tokio",
+]
+
+[[package]]
+name = "access-flow-tls"
+version = "0.1.0"
+dependencies = [
+ "access-async-contracts",
+ "access-flow",
+ "access-flow-relay",
+ "idna",
+ "rustix",
+ "rustls",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "tokio",
+ "tokio-rustls",
+ "x509-cert",
+ "zeroize",
 ]
 
 [[package]]
@@ -77,6 +99,7 @@ version = "0.3.0-rc.1"
 dependencies = [
  "access-async-contracts",
  "access-flow",
+ "access-flow-tls",
  "access-flow-unix",
  "access-identity",
  "access-rpc-framing",

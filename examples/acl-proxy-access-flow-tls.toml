@@ -1,0 +1,101 @@
+schema_version = 4
+
+[service]
+request_timeout = "30s"
+shutdown_drain_timeout = "30s"
+
+[control]
+bind = "127.0.0.1:8898"
+base_path = "/_acl-proxy"
+request_header_timeout = "10s"
+request_body_timeout = "10s"
+max_connections = 128
+max_request_body_bytes = 65536
+
+[listeners.transparent_http]
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
+endpoint.allowed_destination_ports = [80]
+http_versions = ["http1"]
+max_connections = 64
+
+[listeners.transparent_http.identity]
+mode = "required"
+
+[listeners.transparent_http.endpoint.transport]
+kind = "tls_tcp"
+# A wildcard bind requires a host firewall that permits only the intended
+# relay network. It is not a general-purpose explicit proxy listener.
+bind = "0.0.0.0:7443"
+handshake_timeout = "5s"
+
+[listeners.transparent_http.endpoint.transport.server_identity]
+certificate_chain = "/etc/acl-proxy/access-flow-chain.pem"
+private_key = "/etc/acl-proxy/access-flow-key.pem"
+
+[listeners.transparent_http.endpoint.transport.abuse_control]
+max_handshakes = 128
+
+[listeners.transparent_https]
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
+endpoint.allowed_destination_ports = [443]
+http_versions = ["http1", "http2"]
+max_connections = 64
+
+[listeners.transparent_https.identity]
+mode = "required"
+
+[listeners.transparent_https.endpoint.transport]
+kind = "tls_tcp"
+# Keep this port scoped to the intended relay network as well. Transparent
+# clients still require an original-destination redirect at the workload.
+bind = "0.0.0.0:7444"
+handshake_timeout = "5s"
+
+[listeners.transparent_https.endpoint.transport.server_identity]
+certificate_chain = "/etc/acl-proxy/access-flow-chain.pem"
+private_key = "/etc/acl-proxy/access-flow-key.pem"
+
+[listeners.transparent_https.endpoint.transport.abuse_control]
+max_handshakes = 128
+
+[identity]
+max_pending_authentications = 256
+max_pending_authentications_per_connection = 16
+
+[identity.resolver]
+kind = "static"
+authority = "remote-workloads"
+
+[[identity.resolver.principals]]
+id = "gateway-workload"
+kind = "service_account"
+
+[[identity.resolver.tokens]]
+id = "gateway-workload-primary"
+principal = "gateway-workload"
+source = "environment"
+variable = "AW_IDENTITY_TOKEN"
+
+[mitm]
+mode = "generated"
+directory = "runtime/certs"
+
+[egress]
+route = "direct"
+
+[egress.origin_tls]
+trust = "system"
+http_versions = ["http1", "http2"]
+
+[policy]
+default = "deny"
+
+[observation.logging]
+level = "info"
+console = true
+
+[safety.loop_detection]
+inject = true
+header = "x-acl-proxy-request-id"

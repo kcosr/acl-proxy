@@ -236,6 +236,106 @@ path = "/Users/your-user/Library/Application Support/AW Gateway/runtime/transpar
 mode = "0600"
 ```
 
+The same Access Flow endpoint may use server-authenticated TLS/TCP for a relay
+on another host. Remote listeners require workload identity and use exact
+destination port 80 for transparent HTTP or 443 for transparent HTTPS:
+
+```toml
+[listeners.transparent_http]
+endpoint.kind = "access_flow"
+endpoint.admission_timeout = "2s"
+endpoint.allowed_destination_ports = [80]
+http_versions = ["http1"]
+max_connections = 64
+
+[listeners.transparent_http.identity]
+mode = "required"
+
+[listeners.transparent_http.endpoint.transport]
+kind = "tls_tcp"
+bind = "0.0.0.0:7443"
+handshake_timeout = "5s"
+
+[listeners.transparent_http.endpoint.transport.server_identity]
+certificate_chain = "/etc/acl-proxy/access-flow-chain.pem"
+private_key = "/etc/acl-proxy/access-flow-key.pem"
+
+[listeners.transparent_http.endpoint.transport.abuse_control]
+max_handshakes = 128
+```
+
+The nested `per_source` block is optional. Omitting it disables physical-source
+connection and handshake throttling and allocates no source table. When it is
+present, `max_connections`, `handshakes_per_second`, `handshake_burst`, and
+`source_table_capacity` are all required; partial blocks and the removed flat
+per-source fields are rejected.
+
+Single-relay deployments should normally omit `per_source`: every workload
+connection arrives from the relay's one transport address, so a per-source
+limit would throttle that entire relay as one source. A genuinely multi-source
+or untrusted-edge listener can opt in explicitly:
+
+```toml
+[listeners.transparent_http.endpoint.transport.abuse_control.per_source]
+max_connections = 64
+handshakes_per_second = 100
+handshake_burst = 200
+source_table_capacity = 4096
+```
+
+See
+[`examples/acl-proxy-access-flow-tls.toml`](examples/acl-proxy-access-flow-tls.toml)
+for the complete paired transparent HTTP and HTTPS shape.
+
+The shipped remote profile assumes one relay source per Proxy, gives each
+listener 64 global connection slots, and leaves `per_source` disabled.
+
+TLS/TCP is TLS 1.3 only and requires ALPN `aw-access-flow/1`. The relay
+authenticates the proxy certificate with its configured name and PEM trust
+bundle; the proxy does not request a client certificate. The AWAF bearer is the
+sole workload authentication input. A remote socket source is used only for
+transport abuse control and is never exposed to ACLs, delegates, captures, or
+decision logs. Remote policy has no source-CIDR fact, and its fixed diagnostic
+client value is `0.0.0.0:0` (`0.0.0.0` in provider and decision-log fields).
+Wire-body quotas use the resolved authority-qualified principal.
+
+Remote-listener transport failure logs use the validated listener identifier,
+constant `access_flow_tls_tcp` transport label, and fixed stage and category
+values instead of raw transport errors. Listener stages are `TcpAccept`,
+`TlsHandshake`, `Alpn`, and `Capacity`;
+their categories are `Unavailable`, `ResourceExhausted`, `RateLimited`,
+`DeadlineExceeded`, `Cancelled`, `Authentication`, `Protocol`, and
+`AlpnMismatch`. Product admission adds only
+`connection_rejected`, `active_capacity_exhausted`, and
+`access_flow_rejected`. These observations never contain the bearer, raw source
+address, DNS answers, certificate subjects, SANs, DER bytes or fingerprints,
+trust or key paths, key material, arbitrary TLS errors, or untrusted bytes. TLS
+key logging is disabled.
+
+The certificate chain and private key are read from bounded, stable, direct,
+single-link files. Unix uses no-follow descriptor traversal and requires the
+private key to be owner-only. Windows uses the same handle-pinned, reparse-safe
+snapshot contract as configuration loading and requires the private key to
+be owned by the process user with a protected DACL whose allow entries name
+only that owner. Missing, inherited, null, malformed, or non-owner-granting
+DACLs fail closed.
+`acl-proxy config validate` performs the same material validation as startup
+without binding the listener.
+
+Use a dedicated or otherwise narrowly constrained issuing CA for Access Flow.
+The relay sends its reusable AWAF bearer after standard WebPKI validation, so
+any server key that chains to the configured bundle and satisfies the
+configured `server_name` can receive that bearer. Keep the server private key
+only on the ACL Proxy host; neither the Gateway, workload container, nor an
+intermediate TLS terminator needs it. Access Flow performs no online OCSP or
+CRL retrieval. Operational revocation therefore uses short-lived server
+certificates plus explicit replacement of the relay trust generation.
+
+One fixed listener coordinator continues accepting TCP candidates while
+handshake, preface, and bearer operations are in flight. Global, per-source,
+rate, and handshake capacity are acquired synchronously without waiting;
+overflow candidates are closed without spawning admission tasks.
+
 The workstation host path must be inside a user-writable runtime directory
 owned by the workstation user and protected with mode `0700`; the placeholder
 above must be replaced with that user's actual home path. Mode `0600` keeps the
@@ -912,11 +1012,66 @@ acl-proxy config validate --config /etc/acl-proxy/acl-proxy.toml
 acl-proxy policy dump --format table --config /etc/acl-proxy/acl-proxy.toml
 ```
 
-`SIGHUP` compiles and activates a complete reloadable generation. Invalid TOML,
-an invalid schema, activation failure, or a rejected static change leaves the
-current generation published and readiness unchanged; a later corrected reload
-can publish normally. Static listener, control, filesystem ownership, and
-process-wide resource changes are rejected as static changes.
+### Remote Access Flow Cutover
+
+Unix and TLS/TCP are strict physical transport alternatives for each route.
+There is no cleartext, opportunistic TLS, downgrade, endpoint fallback, or
+automatic return to Unix after a remote failure. A controlled Unix-to-TLS
+cutover is:
+
+1. Add the workload principal, groups, and bearer to the Proxy resolver and
+   validate policy before exposing a remote listener.
+2. Provision a dedicated CA and a `serverAuth` leaf whose SAN matches the
+   Gateway route's exact `server_name`. Install the owner-only private key only
+   on the Proxy host.
+3. Install the minimal CA bundle on the Gateway host, configure one exact
+   Proxy address and port per route, and validate both product configurations.
+4. Permit container egress only to those Proxy endpoints, permit Proxy-host
+   ingress only from the intended relay network, and retain only the DNS
+   access required to resolve configured names. TLS transport does not itself
+   provide no-NAT isolation.
+5. Start the Proxy listener and verify readiness, then activate the Gateway
+   route and transparent redirect. Prove real HTTP and nested HTTPS policy,
+   identity, and denial behavior before removing the old Unix route.
+
+Rollback restores the previous Unix route and its redirect as one coordinated
+configuration change after stopping new TLS admission. Do not configure a
+fallback route. Keep the old socket and deployment material until the real-flow
+check passes, and remove the remote firewall allowance only after the remote
+route has drained.
+
+### Certificate And Bearer Rotation
+
+Rotate a CA or server identity with a bounded trust overlap:
+
+1. Add the new CA to the existing bounded Gateway PEM bundle and send `SIGHUP`
+   to `aw-container-agent`. Verify relay readiness.
+2. Atomically replace the Proxy leaf chain and owner-only key at their unchanged
+   paths, then send `SIGHUP` to ACL Proxy.
+3. Verify both readiness endpoints and a real bearer-authenticated Access Flow.
+4. Remove the old CA from the Gateway bundle, send `SIGHUP` to the agent, and
+   verify the real flow again.
+
+If the Gateway trust reload fails, repair the bundle and send another `SIGHUP`;
+new relay admission remains closed while established flows drain. If the Proxy
+identity reload fails, restore the prior matching leaf/key pair and reload it
+while the old CA is still trusted. Do not proceed to trust removal until the
+new generation has carried a real flow.
+
+Bearer rotation is a separate disruptive transaction. `SIGHUP` does not reload
+the Gateway bearer or static resolver configuration. Close new admission,
+drain existing flows, update the Proxy resolver and Gateway environment
+together, then restart the affected processes and verify authorization.
+
+`SIGHUP` independently reloads the policy/configuration generation and Access
+Flow TLS server identities from their unchanged static locators. A policy
+failure leaves the current policy generation published. A TLS identity failure
+closes every new Access Flow admission, including Unix listeners, and changes
+readiness to HTTP 503; existing admitted flows retain their generation and
+drain. A later valid TLS identity reload atomically reopens admission and
+readiness. Leaf expiry has the same fail-closed admission behavior. Static
+listener, control, filesystem ownership, and process-wide resource changes
+remain restart-required.
 
 `SIGINT` and `SIGTERM` initiate joined graceful shutdown and continue to be
 polled while admitted work drains within `service.shutdown_drain_timeout`.

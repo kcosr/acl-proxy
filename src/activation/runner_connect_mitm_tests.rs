@@ -180,6 +180,20 @@ async fn open_connect(proxy: SocketAddr, target: &str) -> tokio::net::TcpStream 
     stream
 }
 
+async fn read_http_head(reader: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
+    let mut head = Vec::new();
+    let mut byte = [0_u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        tokio::time::timeout(Duration::from_secs(2), reader.read_exact(&mut byte))
+            .await
+            .expect("HTTP head read timed out")
+            .expect("HTTP head ended early");
+        head.push(byte[0]);
+        assert!(head.len() <= 32 * 1024, "HTTP head exceeded test bound");
+    }
+    head
+}
+
 async fn write_websocket_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     opcode: u8,
@@ -370,6 +384,68 @@ async fn connect_mitm_forwards_inner_request_and_rejects_nested_connect() {
     assert!(nested.starts_with(b"HTTP/1.1 400 "));
     release_tx.send(()).ok();
     drop(tunnel);
+    origin_task.await.unwrap();
+    product.shutdown().await;
+    assert!(StdTcpListener::bind(proxy).is_ok());
+}
+
+#[tokio::test]
+async fn connect_mitm_write_half_close_preserves_a_delayed_inner_response() {
+    let _test = super::super::super::LISTENER_TEST_LOCK.lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let origin_identity = write_identity(directory.path(), "localhost");
+    let origin = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let origin_address = origin.local_addr().unwrap();
+    let acceptor = tls_acceptor(&origin_identity, &[b"http/1.1"]);
+    let (release_body, body_release) = tokio::sync::oneshot::channel();
+    let origin_task = tokio::spawn(async move {
+        let (stream, _) = origin.accept().await.unwrap();
+        let mut stream = acceptor.accept(stream).await.unwrap();
+        let request = read_http_message(&mut stream).await;
+        assert!(request.starts_with(b"GET /half-close HTTP/1.1\r\n"));
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n")
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        body_release.await.unwrap();
+        stream.write_all(b"delayed-body!").await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    let (proxy, listener) = prebound_listener();
+    let target = format!("localhost:{}", origin_address.port());
+    let ca = initialize_generated_ca(&directory.path().join("mitm"));
+    let text = connect_config(proxy, &target, "explicit_http", "", "", "");
+    let network = mapped_network(proxy, &format!("https://{target}/"), origin_address);
+    let product = start_product(&directory, &text, listener, Some(network)).await;
+    let stream = open_connect(proxy, &target).await;
+    let connector = tls_connector(ca, &[b"http/1.1"]);
+    let mut tunnel = connector
+        .connect(ServerName::try_from("localhost").unwrap(), stream)
+        .await
+        .unwrap();
+    tunnel
+        .write_all(
+            format!(
+                "GET /half-close HTTP/1.1\r\nHost: {target}\r\nContent-Length: 0\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    tunnel.shutdown().await.unwrap();
+    let head = read_http_head(&mut tunnel).await;
+    assert!(head.starts_with(b"HTTP/1.1 200 "));
+    release_body.send(()).unwrap();
+    let mut body = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), tunnel.read_to_end(&mut body))
+        .await
+        .expect("MITM connection did not close after the delayed response")
+        .unwrap();
+    assert_eq!(body, b"delayed-body!");
+
     origin_task.await.unwrap();
     product.shutdown().await;
     assert!(StdTcpListener::bind(proxy).is_ok());

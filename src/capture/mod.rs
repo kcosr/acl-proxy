@@ -1685,6 +1685,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn remote_access_flow_capture_uses_the_exact_non_source_client_sentinel() {
+        let identity = access_identity::authenticated_identity_context_fixture();
+        let projection = http_access_runtime::StandaloneIngressProjection::from_access_flow(
+            access_flow::AccessFlowIngressOrigin::RemoteAccessFlow,
+            &identity,
+        )
+        .unwrap();
+        let client = projection.client();
+        let policy = http_access_types::SensitiveHeaderPolicy::new([], [], []).unwrap();
+        let request_id = http_access_types::StableId::new("remote-capture").unwrap();
+        let method = http_access_types::HttpMethod::new("GET").unwrap();
+        let url = http_access_url::canonicalize_http_url("http://example.test/resource").unwrap();
+        let facts = CaptureFacts::new(
+            &policy,
+            http_access_types::CaptureFactsInput {
+                request_id: &request_id,
+                event: CaptureEvent::RequestAllowed,
+                ingress_mode: IngressMode::TransparentHttp,
+                method: Some(&method),
+                url: Some(&url),
+                client_ip: Some(client.ip()),
+                target: Some(url.authority()),
+                version: Some(HttpVersion::Http11),
+                status: None,
+                headers: &[],
+            },
+        )
+        .unwrap();
+        let metadata = SanitizedCaptureMetadata::from_facts(
+            facts,
+            "2026-01-01T00:00:00Z".to_owned(),
+            Some(client.port()),
+            false,
+            None,
+        );
+
+        assert_eq!(
+            metadata.record.client,
+            CaptureEndpoint {
+                address: Some("0.0.0.0".to_owned()),
+                port: Some(0),
+            }
+        );
+        assert_eq!(projection.policy_peer_ip(), None);
+    }
+
     fn capture_sink(directory: PathBuf) -> CaptureSinkSpec {
         CaptureSinkSpec::new(
             directory,

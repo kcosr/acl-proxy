@@ -7,6 +7,10 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use access_identity::PrincipalRef;
+use http_access_runtime::{WireBodyQuotaSubject, WireBodyQuotaSubjectKind};
+
+#[cfg(test)]
 use crate::network::canonical_ip;
 use crate::safety::allocation::{
     self, AllocationAuthority, ExactAllocationLease, ReservedStableBodyBuilder, StableBody,
@@ -31,15 +35,34 @@ type QuotaShard = Mutex<HashMap<WireBodyQuotaKey, Arc<QuotaEntry>>>;
 pub(crate) enum WireBodyQuotaKey {
     LocalHost,
     Peer(IpAddr),
+    Principal(PrincipalRef),
 }
 
 impl WireBodyQuotaKey {
+    #[cfg(test)]
     pub(crate) fn from_peer(peer: IpAddr, is_process_local: impl FnOnce(IpAddr) -> bool) -> Self {
         let peer = canonical_ip(peer);
         if peer.is_loopback() || is_process_local(peer) {
             Self::LocalHost
         } else {
             Self::Peer(peer)
+        }
+    }
+
+    pub(crate) fn from_subject(subject: &WireBodyQuotaSubject) -> Self {
+        match subject.kind() {
+            WireBodyQuotaSubjectKind::LocalHost => Self::LocalHost,
+            WireBodyQuotaSubjectKind::PeerIp => Self::Peer(
+                subject
+                    .as_peer_ip()
+                    .expect("checked peer quota subjects retain a peer IP"),
+            ),
+            WireBodyQuotaSubjectKind::Principal => Self::Principal(
+                subject
+                    .as_principal()
+                    .expect("checked principal quota subjects retain a principal")
+                    .clone(),
+            ),
         }
     }
 }
@@ -49,6 +72,7 @@ impl fmt::Debug for WireBodyQuotaKey {
         match self {
             Self::LocalHost => formatter.write_str("WireBodyQuotaKey::LocalHost"),
             Self::Peer(_) => formatter.write_str("WireBodyQuotaKey::Peer"),
+            Self::Principal(_) => formatter.write_str("WireBodyQuotaKey::Principal(<redacted>)"),
         }
     }
 }
@@ -615,10 +639,20 @@ pub(crate) enum WireBodyBufferError {
 mod linked_tests {
     use std::net::{IpAddr, Ipv4Addr};
 
+    use access_identity::{AuthorityId, PrincipalId, PrincipalKind, PrincipalRef};
+
     use super::*;
 
     fn key() -> WireBodyQuotaKey {
         WireBodyQuotaKey::from_peer(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), |_| false)
+    }
+
+    fn principal(authority: &str, id: &str) -> PrincipalRef {
+        PrincipalRef::new(
+            AuthorityId::new(authority).unwrap(),
+            PrincipalId::new(id).unwrap(),
+            PrincipalKind::ServiceAccount,
+        )
     }
 
     fn allocation(chunks: usize) -> usize {
@@ -1074,6 +1108,69 @@ mod linked_tests {
         );
         assert_eq!(global_pool.quota_charge(&second_key), 0);
         assert_eq!(global_second.live_bytes(), 0);
+    }
+
+    #[test]
+    fn shared_principal_subjects_share_quota_and_remain_isolated_from_other_subjects() {
+        let one = allocation(1);
+        let pool = WireBodyPool::new(one * 6, one);
+        let principal_a = principal("authority-a", "workload");
+        let same_principal =
+            WireBodyQuotaKey::from_subject(&WireBodyQuotaSubject::principal(principal_a.clone()));
+        let same_principal_again =
+            WireBodyQuotaKey::from_subject(&WireBodyQuotaSubject::principal(principal_a));
+        let other_principal = WireBodyQuotaKey::from_subject(&WireBodyQuotaSubject::principal(
+            principal("authority-a", "other"),
+        ));
+        let other_authority = WireBodyQuotaKey::from_subject(&WireBodyQuotaSubject::principal(
+            principal("authority-b", "workload"),
+        ));
+        let local = WireBodyQuotaKey::from_subject(&WireBodyQuotaSubject::local_host());
+        let peer = WireBodyQuotaKey::from_subject(&WireBodyQuotaSubject::peer_ip(IpAddr::V4(
+            Ipv4Addr::new(192, 0, 2, 10),
+        )));
+
+        assert_eq!(same_principal, same_principal_again);
+        assert_ne!(same_principal, other_principal);
+        assert_ne!(same_principal, other_authority);
+        assert_ne!(same_principal, local);
+        assert_ne!(same_principal, peer);
+        assert_eq!(
+            format!("{same_principal:?}"),
+            "WireBodyQuotaKey::Principal(<redacted>)"
+        );
+
+        let first = pool.begin(one, same_principal.clone());
+        let same = pool.begin(one, same_principal_again);
+        let different = pool.begin(one, other_principal);
+        let mut first_body = first.buffer();
+        first_body.try_extend_from_slice(b"first").unwrap();
+        assert_eq!(
+            same.buffer().try_extend_from_slice(b"same"),
+            Err(WireBodyBufferError::QuotaExhausted)
+        );
+        let other_authority = pool.begin(one, other_authority);
+        let local = pool.begin(one, local);
+        let peer = pool.begin(one, peer);
+        for (guard, bytes) in [
+            (&different, b"different".as_slice()),
+            (&other_authority, b"authority".as_slice()),
+            (&local, b"local".as_slice()),
+            (&peer, b"peer".as_slice()),
+        ] {
+            guard.buffer().try_extend_from_slice(bytes).unwrap();
+        }
+        assert_eq!(pool.quota_charge(&same_principal), one);
+
+        drop(first_body);
+        drop(first);
+        drop(same);
+        drop(different);
+        drop(other_authority);
+        drop(local);
+        drop(peer);
+        assert_eq!(pool.global_charge(), 0);
+        assert_eq!(pool.quota_entry_count(), 0);
     }
 
     #[test]
