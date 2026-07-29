@@ -3305,6 +3305,8 @@ default = "deny"
         super::super::assert_listener_addresses_released(&_test, addresses);
     }
 
+    // The fixture needs distinct 127.0.0.1 and 127.0.0.2 source addresses;
+    // Linux routes all of 127/8 through loopback by default.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn remote_tls_access_flow_enforces_source_rate_table_and_admission_timeout() {

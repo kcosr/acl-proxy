@@ -367,11 +367,11 @@ async fn wait_for_tcp_close_without_reading(stream: &mut tokio::net::TcpStream, 
     let result = tokio::time::timeout(QUIESCENCE_TIMEOUT, stream.read_to_end(&mut sink))
         .await
         .unwrap_or_else(|_| panic!("{message}"));
-    assert!(
-        result.is_ok()
-            || result.is_err_and(|error| error.kind() == io::ErrorKind::ConnectionReset),
-        "stress TCP close observation failed"
-    );
+    match result {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+        Err(error) => panic!("stress TCP close observation failed: {error}"),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -678,6 +678,15 @@ fn deterministic_bytes(length: usize, salt: u8) -> Vec<u8> {
 }
 
 fn stress_config(bind: SocketAddr, origins: &StressOrigins) -> String {
+    // Darwin and the Linux ARM64 build container need more scheduler headroom
+    // than native Linux x86_64 for the mixed-protocol stress workload.
+    let body_idle_timeout = if cfg!(target_os = "macos") {
+        "10s"
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        "5s"
+    } else {
+        "3s"
+    };
     format!(
         r#"schema_version = 4
 
@@ -692,7 +701,7 @@ min_wire_body_concurrency = 32
 [service.forwarding]
 connect_timeout = "10s"
 response_head_timeout = "10s"
-body_idle_timeout = "10s"
+body_idle_timeout = "{body_idle_timeout}"
 upgrade_idle_timeout = "2s"
 max_request_wire_bytes = 16777216
 max_request_decoded_bytes = 16777216

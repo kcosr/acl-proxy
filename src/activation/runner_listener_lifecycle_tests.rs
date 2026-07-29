@@ -29,11 +29,12 @@ trait LifecycleIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> LifecycleIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 fn assert_tcp_stream_closed(result: std::io::Result<usize>) {
-    assert!(
-        matches!(result, Ok(0))
-            || result.is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionReset),
-        "shutdown left downstream application data readable"
-    );
+    match result {
+        Ok(0) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Ok(bytes) => panic!("shutdown left {bytes} bytes of downstream application data readable"),
+        Err(error) => panic!("shutdown produced an unexpected downstream read error: {error}"),
+    }
 }
 
 struct FixedOriginalDestination(SocketAddr);
