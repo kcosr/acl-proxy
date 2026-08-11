@@ -57,6 +57,7 @@ x509-cert = { version = "=0.2.5", default-features = false, features = ["pem"] }
 fs2 = "0.4"
 humantime = "2.1"
 access-async-contracts = { path = "../access-runtime/crates/access-async-contracts", version = "=0.1.0" }
+access-execution-context = { path = "../access-runtime/crates/access-execution-context", version = "=0.1.0" }
 access-flow = { path = "../access-runtime/crates/access-flow", version = "=0.1.0" }
 access-flow-tls = { path = "../access-runtime/crates/access-flow-tls", version = "=0.1.0" }
 access-flow-unix = { path = "../access-runtime/crates/access-flow-unix", version = "=0.1.0" }

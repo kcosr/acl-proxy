@@ -5,6 +5,7 @@ use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+use access_execution_context::ExecutionContext;
 use access_flow_tls::{
     TlsAccessFlowHandshakeTimeout, TlsAccessFlowPerSourceLimits, TlsAccessFlowServerLimits,
     ACTIVE_CHANNEL_BYTES, CHANNEL_TASK_BYTES, GENERATION_CONTROL_BYTES, HANDSHAKE_BYTES,
@@ -164,6 +165,7 @@ const MAX_IDENTITY_GROUPS: usize = 4_096;
 const MAX_IDENTITY_TOKENS: usize = 8_192;
 const MAX_IDENTITY_MEMBERSHIPS: usize = 65_536;
 const MAX_IDENTITY_GROUPS_PER_PRINCIPAL: usize = 256;
+pub(crate) const ACCESS_FLOW_EXECUTION_CONTEXT_HEADER: &str = "x-agent-access-context";
 const PROVIDER_REPLACEMENT_STAGING_BYTES: usize = 64 * 1024;
 const WEBSOCKET_DEFLATE_SCRATCH_BYTES: usize = 64 * 1024;
 const PROVIDER_REQUEST_STREAM_SCRATCH_BYTES: usize = 64 * 1024;
@@ -519,7 +521,13 @@ pub(crate) struct EgressPlan {
     pub(crate) origin_tls: TransportTlsPlan,
     pub(crate) parent_proxy: Option<ParentProxyPlan>,
     pub(crate) request_headers: Vec<HeaderEffectPlan>,
+    pub(crate) access_flow_execution_context: Option<AccessFlowExecutionContextPlan>,
     pub(crate) credential_actions: Vec<CredentialActionPlan>,
+}
+
+#[derive(Clone)]
+pub(crate) struct AccessFlowExecutionContextPlan {
+    pub(crate) urls: Vec<CompiledUrlPattern>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -636,6 +644,7 @@ pub(crate) struct PolicyRulePlan {
     pub(crate) methods: Vec<Method>,
     pub(crate) client_cidrs: Vec<ipnet::IpNet>,
     pub(crate) identity: Option<IdentityPredicatePlan>,
+    pub(crate) execution_contexts: Option<Vec<ExecutionContext>>,
     pub(crate) headers: HeaderPredicatesPlan,
     pub(crate) request_timeout: Option<Duration>,
     pub(crate) allow_upgrades: bool,
@@ -1294,14 +1303,14 @@ fn compile_config_inner(
     let static_config =
         compile_static_config(config, config_root.clone(), endpoint_urls.callback.clone())?;
     let ValidationFacts {
-        compiled_urls_by_rule,
+        compiled_urls,
         capture_sink,
     } = validation;
     let reloadable_plan = compile_reloadable_plan(
         config,
         &config_root,
         &endpoint_urls,
-        compiled_urls_by_rule,
+        compiled_urls,
         capture_sink,
         resource_plan,
         redaction,
@@ -4028,25 +4037,86 @@ fn validate_encoded_target_length(
 }
 
 struct ValidationFacts {
-    compiled_urls_by_rule: Vec<Vec<CompiledUrlPattern>>,
+    compiled_urls: CompiledUrlPlans,
     capture_sink: Option<CaptureSinkSpec>,
+}
+
+struct CompiledUrlPlans {
+    policy_by_rule: Vec<Vec<CompiledUrlPattern>>,
+    access_flow_execution_context: Option<Vec<CompiledUrlPattern>>,
 }
 
 fn validate_references_and_security_boundaries(
     config: &super::authoring::AuthoringConfig,
 ) -> Result<ValidationFacts, ConfigCompileError> {
     validate_named_maps(config)?;
-    let credential_destinations = validate_credentials(config)?;
-    validate_internal_context(config)?;
-    validate_provider_security(config, &credential_destinations)?;
-    let compiled_urls_by_rule = validate_policy(config)?;
+    let compiled_access_flow_execution_context_urls =
+        validate_access_flow_execution_context(config)?;
+    let execution_context_projection = compiled_access_flow_execution_context_urls.is_some();
+    let credential_destinations = validate_credentials(config, execution_context_projection)?;
+    validate_internal_context(config, execution_context_projection)?;
+    validate_provider_security(
+        config,
+        &credential_destinations,
+        execution_context_projection,
+    )?;
+    let compiled_urls_by_rule = validate_policy(config, execution_context_projection)?;
     validate_credential_transport_security(config, &compiled_urls_by_rule)?;
     let capture_sink = validate_capture(config)?;
 
     Ok(ValidationFacts {
-        compiled_urls_by_rule,
+        compiled_urls: CompiledUrlPlans {
+            policy_by_rule: compiled_urls_by_rule,
+            access_flow_execution_context: compiled_access_flow_execution_context_urls,
+        },
         capture_sink,
     })
+}
+
+fn validate_access_flow_execution_context(
+    config: &super::authoring::AuthoringConfig,
+) -> Result<Option<Vec<CompiledUrlPattern>>, ConfigCompileError> {
+    let Some(projection) = &config.egress.access_flow_execution_context else {
+        return Ok(None);
+    };
+    let loop_header = normalize_header_name(
+        &config.safety.loop_detection.header,
+        "safety.loop_detection.header",
+    )?;
+    if loop_header == ACCESS_FLOW_EXECUTION_CONTEXT_HEADER {
+        return Err(ConfigCompileError::at(
+            "safety.loop_detection.header",
+            "must not use the protected Access Flow execution-context header",
+        ));
+    }
+    if projection.urls.is_empty() {
+        return Err(ConfigCompileError::at(
+            "egress.access_flow_execution_context.urls",
+            "must not be empty",
+        ));
+    }
+    if projection.urls.len() > MAX_URLS_PER_RULE {
+        return Err(ConfigCompileError::at_category(
+            ConfigCompileDiagnosticCategory::LimitExceeded,
+            "egress.access_flow_execution_context.urls",
+            "contains too many URL patterns",
+        ));
+    }
+    projection
+        .urls
+        .iter()
+        .enumerate()
+        .map(|(index, pattern)| {
+            let path = format!("egress.access_flow_execution_context.urls[{index}]");
+            let compiled = CompiledUrlPattern::compile(pattern)
+                .map_err(|error| ConfigCompileError::at(&path, error.to_string()))?;
+            if compiled.scheme() != Some(HttpScheme::Https) {
+                return Err(ConfigCompileError::at(&path, "must match HTTPS URLs only"));
+            }
+            Ok(compiled)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 fn validate_named_maps(
@@ -4093,6 +4163,7 @@ fn validate_identifier(value: &str, path: &str) -> Result<(), ConfigCompileError
 
 fn validate_credentials(
     config: &super::authoring::AuthoringConfig,
+    execution_context_projection: bool,
 ) -> Result<BTreeSet<String>, ConfigCompileError> {
     let loop_header = normalize_header_name(
         &config.safety.loop_detection.header,
@@ -4104,7 +4175,12 @@ fn validate_credentials(
             name,
             &format!("credentials.allowed_custom_headers[{index}]"),
         )?;
-        reject_base_protected_header(&header, &loop_header, "credentials.allowed_custom_headers")?;
+        reject_protected_header(
+            &header,
+            &loop_header,
+            "credentials.allowed_custom_headers",
+            execution_context_projection,
+        )?;
         if !allowed_custom.insert(header) {
             return Err(ConfigCompileError::at(
                 "credentials.allowed_custom_headers",
@@ -4170,7 +4246,12 @@ fn validate_credentials(
             &inbound.header,
             &format!("credentials.inbound.{name}.header"),
         )?;
-        reject_base_protected_header(&header, &loop_header, "credentials.inbound")?;
+        reject_protected_header(
+            &header,
+            &loop_header,
+            "credentials.inbound",
+            execution_context_projection,
+        )?;
         if !inbound_headers.insert(header.clone()) {
             return Err(ConfigCompileError::at(
                 format!("credentials.inbound.{name}.header"),
@@ -4229,6 +4310,7 @@ fn validate_credentials(
         &all_credential_destinations,
         &inbound_headers,
         &internal_context_headers,
+        execution_context_projection,
     )?;
     Ok(all_credential_destinations)
 }
@@ -4414,6 +4496,7 @@ fn provider_output_destinations(
 
 fn validate_internal_context(
     config: &super::authoring::AuthoringConfig,
+    execution_context_projection: bool,
 ) -> Result<(), ConfigCompileError> {
     let mut names = BTreeSet::new();
     for (index, name) in config
@@ -4426,6 +4509,12 @@ fn validate_internal_context(
             name,
             &format!("authorization.internal_context_headers[{index}]"),
         )?;
+        if execution_context_projection && name == ACCESS_FLOW_EXECUTION_CONTEXT_HEADER {
+            return Err(ConfigCompileError::at(
+                "authorization.internal_context_headers",
+                "must not contain the protected Access Flow execution-context header",
+            ));
+        }
         if !names.insert(name.clone()) {
             return Err(ConfigCompileError::at(
                 "authorization.internal_context_headers",
@@ -4465,6 +4554,7 @@ fn validate_internal_context(
 fn validate_provider_security(
     config: &super::authoring::AuthoringConfig,
     credential_destinations: &BTreeSet<String>,
+    execution_context_projection: bool,
 ) -> Result<(), ConfigCompileError> {
     let loop_header = normalize_header_name(
         &config.safety.loop_detection.header,
@@ -4507,7 +4597,10 @@ fn validate_provider_security(
             if !seen.insert(header.clone()) {
                 return Err(ConfigCompileError::at(path, "duplicates an earlier header"));
             }
-            if base_protected_headers().contains(header.as_str()) || header == loop_header {
+            if base_protected_headers().contains(header.as_str())
+                || header == loop_header
+                || (execution_context_projection && header == ACCESS_FLOW_EXECUTION_CONTEXT_HEADER)
+            {
                 return Err(ConfigCompileError::at(
                     path,
                     "provider may not receive a protected header",
@@ -4549,6 +4642,7 @@ fn context_is_consuming(config: &super::authoring::AuthoringConfig, header: &str
 
 fn validate_policy(
     config: &super::authoring::AuthoringConfig,
+    execution_context_projection: bool,
 ) -> Result<Vec<Vec<CompiledUrlPattern>>, ConfigCompileError> {
     if config.policy.rules.len() > MAX_POLICY_RULES {
         return Err(ConfigCompileError::at_category(
@@ -4570,8 +4664,25 @@ fn validate_policy(
         .map(|value| value.header.to_ascii_lowercase())
         .collect();
     let mut ids = BTreeMap::new();
+    let mut execution_context_count = 0usize;
     let mut compiled_urls_by_rule = Vec::with_capacity(config.policy.rules.len());
     for (index, rule) in config.policy.rules.iter().enumerate() {
+        execution_context_count = execution_context_count
+            .checked_add(rule.execution_contexts.as_ref().map_or(0, Vec::len))
+            .ok_or_else(|| {
+                ConfigCompileError::at_category(
+                    ConfigCompileDiagnosticCategory::LimitExceeded,
+                    "policy.rules",
+                    "execution-context predicate count overflowed",
+                )
+            })?;
+        if execution_context_count > http_access_policy_acl::MAX_EXECUTION_CONTEXTS_PER_SNAPSHOT {
+            return Err(ConfigCompileError::at_category(
+                ConfigCompileDiagnosticCategory::LimitExceeded,
+                "policy.rules",
+                "contains too many execution-context predicate values",
+            ));
+        }
         if rule.id.trim().is_empty() {
             return Err(ConfigCompileError::at_rule(index, "id", "must be nonempty"));
         }
@@ -4605,6 +4716,7 @@ fn validate_policy(
             rule.client_cidrs.len(),
             rule.identity_states.as_ref().map_or(0, Vec::len),
             rule.identity_subjects.as_ref().map_or(0, Vec::len),
+            rule.execution_contexts.as_ref().map_or(0, Vec::len),
             rule.headers.absent_any.len(),
             rule.headers.present_all.len(),
             rule.headers.all.values().map(Vec::len).sum(),
@@ -4671,7 +4783,8 @@ fn validate_policy(
         compiled_urls_by_rule.push(patterns);
         validate_methods(&rule.methods, "methods")
             .map_err(|error| error.with_rule_cursor(index))?;
-        validate_header_predicates(rule, &contexts, &inbound)
+        validate_execution_contexts(rule).map_err(|error| error.with_rule_cursor(index))?;
+        validate_header_predicates(rule, &contexts, &inbound, execution_context_projection)
             .map_err(|error| error.with_rule_cursor(index))?;
 
         match rule.decision {
@@ -4866,6 +4979,37 @@ fn validate_methods(methods: &[String], path: &str) -> Result<(), ConfigCompileE
     Ok(())
 }
 
+fn validate_execution_contexts(rule: &PolicyRuleConfig) -> Result<(), ConfigCompileError> {
+    let Some(values) = &rule.execution_contexts else {
+        return Ok(());
+    };
+    if values.is_empty() {
+        return Err(ConfigCompileError::at(
+            "execution_contexts",
+            "must not be empty when present",
+        ));
+    }
+    let mut contexts = values
+        .iter()
+        .map(|value| {
+            ExecutionContext::new(value.clone()).map_err(|_| {
+                ConfigCompileError::at(
+                    "execution_contexts",
+                    "contains an invalid execution context",
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    contexts.sort();
+    if contexts.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(ConfigCompileError::at(
+            "execution_contexts",
+            "must not contain duplicates",
+        ));
+    }
+    Ok(())
+}
+
 fn is_http_token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric()
         || matches!(
@@ -4891,6 +5035,7 @@ fn validate_header_predicates(
     rule: &PolicyRuleConfig,
     contexts: &BTreeSet<String>,
     inbound: &BTreeSet<String>,
+    execution_context_projection: bool,
 ) -> Result<(), ConfigCompileError> {
     let count = rule.headers.absent_any.len()
         + rule.headers.present_all.len()
@@ -4910,10 +5055,12 @@ fn validate_header_predicates(
     ] {
         for name in names {
             let header = normalize_header_name(name, &format!("headers.{kind}"))?;
-            if contexts.contains(&header) {
+            if contexts.contains(&header)
+                || (execution_context_projection && header == ACCESS_FLOW_EXECUTION_CONTEXT_HEADER)
+            {
                 return Err(ConfigCompileError::at(
                     format!("headers.{kind}"),
-                    "internal context headers cannot be policy predicates",
+                    "protected context headers cannot be policy predicates",
                 ));
             }
             if !all_names.insert(header) {
@@ -4930,6 +5077,7 @@ fn validate_header_predicates(
             if contexts.contains(&header)
                 || inbound.contains(&header)
                 || base_sensitive_value_headers().contains(header.as_str())
+                || (execution_context_projection && header == ACCESS_FLOW_EXECUTION_CONTEXT_HEADER)
             {
                 return Err(ConfigCompileError::at(
                     format!("headers.{kind}"),
@@ -4967,34 +5115,28 @@ fn validate_all_literal_effects(
     credential_destinations: &BTreeSet<String>,
     inbound_headers: &BTreeSet<String>,
     internal_context_headers: &BTreeSet<String>,
+    execution_context_projection: bool,
 ) -> Result<(), ConfigCompileError> {
-    validate_literal_effects(
-        &config.egress.request_headers,
-        "egress.request_headers",
+    let protection = LiteralEffectProtection {
         loop_header,
         credential_destinations,
         inbound_headers,
         internal_context_headers,
+        execution_context_projection,
+    };
+    validate_literal_effects(
+        &config.egress.request_headers,
+        "egress.request_headers",
+        &protection,
         true,
     )?;
     for (index, rule) in config.policy.rules.iter().enumerate() {
-        validate_literal_effects(
-            &rule.request_headers,
-            "request_headers",
-            loop_header,
-            credential_destinations,
-            inbound_headers,
-            internal_context_headers,
-            false,
-        )
-        .map_err(|error| error.with_rule_cursor(index))?;
+        validate_literal_effects(&rule.request_headers, "request_headers", &protection, false)
+            .map_err(|error| error.with_rule_cursor(index))?;
         validate_literal_effects(
             &rule.response_headers,
             "response_headers",
-            loop_header,
-            credential_destinations,
-            inbound_headers,
-            internal_context_headers,
+            &protection,
             false,
         )
         .map_err(|error| error.with_rule_cursor(index))?;
@@ -5002,13 +5144,18 @@ fn validate_all_literal_effects(
     Ok(())
 }
 
+struct LiteralEffectProtection<'a> {
+    loop_header: &'a str,
+    credential_destinations: &'a BTreeSet<String>,
+    inbound_headers: &'a BTreeSet<String>,
+    internal_context_headers: &'a BTreeSet<String>,
+    execution_context_projection: bool,
+}
+
 fn validate_literal_effects(
     effects: &[HeaderEffectConfig],
     path: &str,
-    loop_header: &str,
-    credential_destinations: &BTreeSet<String>,
-    inbound_headers: &BTreeSet<String>,
-    internal_context_headers: &BTreeSet<String>,
+    protection: &LiteralEffectProtection<'_>,
     allow_internal_context_headers: bool,
 ) -> Result<(), ConfigCompileError> {
     if effects.len() > MAX_EFFECTS_PER_SCOPE {
@@ -5018,10 +5165,13 @@ fn validate_literal_effects(
         let name = effect_header_name(effect).expect("every effect has a header name");
         let name = normalize_header_name(&name, &format!("{path}[{index}].name"))?;
         if base_protected_headers().contains(name.as_str())
-            || name == loop_header
-            || credential_destinations.contains(&name)
-            || inbound_headers.contains(&name)
-            || (!allow_internal_context_headers && internal_context_headers.contains(&name))
+            || name == protection.loop_header
+            || protection.credential_destinations.contains(&name)
+            || protection.inbound_headers.contains(&name)
+            || (!allow_internal_context_headers
+                && protection.internal_context_headers.contains(&name))
+            || (protection.execution_context_projection
+                && name == ACCESS_FLOW_EXECUTION_CONTEXT_HEADER)
         {
             return Err(ConfigCompileError::at(
                 format!("{path}[{index}].name"),
@@ -7632,7 +7782,7 @@ fn compile_reloadable_plan(
     config: &super::authoring::AuthoringConfig,
     working_directory: &Path,
     endpoint_urls: &CanonicalEndpointUrls,
-    compiled_urls_by_rule: Vec<Vec<CompiledUrlPattern>>,
+    compiled_urls: CompiledUrlPlans,
     capture_sink: Option<CaptureSinkSpec>,
     resource_plan: CompiledResourcePlan,
     redaction: ProductRedactionPlan,
@@ -7650,10 +7800,14 @@ fn compile_reloadable_plan(
             }),
         )
         .expect("identity connection capacity was validated"),
-        egress: compile_egress_plan(&config.egress, endpoint_urls.parent_proxy.as_ref())?,
+        egress: compile_egress_plan(
+            &config.egress,
+            endpoint_urls.parent_proxy.as_ref(),
+            compiled_urls.access_flow_execution_context,
+        )?,
         policy: compile_policy_plan(
             &config.policy,
-            compiled_urls_by_rule,
+            compiled_urls.policy_by_rule,
             http_body_read_plans_by_cursor,
         )?,
         authorization: compile_authorization_plan(
@@ -7847,6 +8001,7 @@ fn compile_forwarding_plan(value: &super::authoring::ForwardingConfig) -> Forwar
 fn compile_egress_plan(
     value: &EgressConfig,
     parent_target: Option<&CanonicalUrl>,
+    access_flow_execution_context_urls: Option<Vec<CompiledUrlPattern>>,
 ) -> Result<EgressPlan, ConfigCompileError> {
     Ok(EgressPlan {
         route: match value.route {
@@ -7865,6 +8020,8 @@ fn compile_egress_plan(
             }
         },
         request_headers: compile_header_effects(&value.request_headers, "egress.request_headers")?,
+        access_flow_execution_context: access_flow_execution_context_urls
+            .map(|urls| AccessFlowExecutionContextPlan { urls }),
         credential_actions: compile_credential_actions(
             &value.credential_actions,
             "egress.credential_actions",
@@ -7974,6 +8131,8 @@ fn compile_policy_rule_plan(
             .map_err(|error| error.with_rule_cursor(index))?,
         identity: compile_identity_predicate_plan(value)
             .map_err(|error| error.with_rule_cursor(index))?,
+        execution_contexts: compile_execution_contexts(value)
+            .map_err(|error| error.with_rule_cursor(index))?,
         headers: compile_header_predicates_plan(&value.headers)
             .map_err(|error| error.with_rule_cursor(index))?,
         request_timeout: value.request_timeout.as_ref().map(|timeout| timeout.get()),
@@ -7990,6 +8149,30 @@ fn compile_policy_rule_plan(
         )
         .map_err(|error| error.with_rule_cursor(index))?,
     })
+}
+
+fn compile_execution_contexts(
+    value: &PolicyRuleConfig,
+) -> Result<Option<Vec<ExecutionContext>>, ConfigCompileError> {
+    value
+        .execution_contexts
+        .as_ref()
+        .map(|values| {
+            let mut contexts = values
+                .iter()
+                .map(|value| {
+                    ExecutionContext::new(value.clone()).map_err(|_| {
+                        ConfigCompileError::at(
+                            "execution_contexts",
+                            "contains an invalid execution context after validation",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            contexts.sort();
+            Ok(contexts)
+        })
+        .transpose()
 }
 
 fn compile_identity_predicate_plan(
@@ -8993,12 +9176,16 @@ fn base_sensitive_value_headers() -> BTreeSet<&'static str> {
     ])
 }
 
-fn reject_base_protected_header(
+fn reject_protected_header(
     name: &str,
     loop_header: &str,
     path: &str,
+    execution_context_projection: bool,
 ) -> Result<(), ConfigCompileError> {
-    if base_protected_headers().contains(name) || name == loop_header {
+    if base_protected_headers().contains(name)
+        || name == loop_header
+        || (execution_context_projection && name == ACCESS_FLOW_EXECUTION_CONTEXT_HEADER)
+    {
         return Err(ConfigCompileError::at(
             path,
             "header is reserved by the proxy",
@@ -9028,6 +9215,15 @@ mod tests {
         url: &http_access_types::CanonicalUrl,
         peer_ip: IpAddr,
     ) -> http_access_policy_acl::PolicyEvaluation<crate::policy::ProductRuleEffectsRef> {
+        evaluate_test_policy_with_context(snapshot, url, peer_ip, None)
+    }
+
+    fn evaluate_test_policy_with_context(
+        snapshot: &crate::policy::ProductAclSnapshot,
+        url: &http_access_types::CanonicalUrl,
+        peer_ip: IpAddr,
+        execution_context: Option<&ExecutionContext>,
+    ) -> http_access_policy_acl::PolicyEvaluation<crate::policy::ProductRuleEffectsRef> {
         let facts = http_access_types::InterceptedRequestFacts::new(
             http_access_types::IngressMode::ExplicitHttps,
             http_access_types::HttpVersion::Http11,
@@ -9049,6 +9245,7 @@ mod tests {
             http_access_types::BodyRepresentation::PreservedContentCoded,
             http_access_types::BodyObservation::unobserved(),
             &access_identity::IdentityContext::Disabled,
+            execution_context,
         )
         .unwrap();
         snapshot.snapshot().evaluate(&input).unwrap()
@@ -10490,6 +10687,152 @@ http_versions = ["http1"]
         let config: super::super::authoring::AuthoringConfig =
             toml::from_str(toml).expect("test input should deserialize");
         compile_config(config, Path::new("/etc/acl-proxy"))
+    }
+
+    #[test]
+    fn execution_context_rules_are_canonical_or_predicates_and_reject_invalid_sets() {
+        let configured = MINIMAL.replace(
+            "[policy]\ndefault = \"deny\"",
+            r#"[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "context"
+decision = "allow"
+urls = ["https://broker.example.test/**"]
+execution_contexts = ["internal", "external"]
+"#,
+        );
+        let compiled = compile(&configured).unwrap();
+        let contexts = compiled.reloadable_plan.policy.rules[0]
+            .execution_contexts
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            contexts
+                .iter()
+                .map(ExecutionContext::as_str)
+                .collect::<Vec<_>>(),
+            ["external", "internal"]
+        );
+        let snapshot = crate::policy::ProductAclSnapshot::compile(
+            &compiled.reloadable_plan.policy,
+            http_access_types::PolicyGeneration::new(1).unwrap(),
+            http_access_types::SnapshotIdentity::new(),
+            &[],
+        )
+        .unwrap();
+        let url =
+            http_access_url::canonicalize_http_url("https://broker.example.test/api").unwrap();
+        let peer = "192.0.2.10".parse().unwrap();
+        let internal = ExecutionContext::new("internal").unwrap();
+        let external = ExecutionContext::new("external").unwrap();
+        let workstation = ExecutionContext::new("workstation").unwrap();
+        for context in [&internal, &external] {
+            assert!(matches!(
+                evaluate_test_policy_with_context(&snapshot, &url, peer, Some(context)),
+                http_access_policy_acl::PolicyEvaluation::Allow { .. }
+            ));
+        }
+        for context in [None, Some(&workstation)] {
+            assert!(matches!(
+                evaluate_test_policy_with_context(&snapshot, &url, peer, context),
+                http_access_policy_acl::PolicyEvaluation::Deny { .. }
+            ));
+        }
+
+        for invalid in [
+            "execution_contexts = []",
+            "execution_contexts = [\"internal\", \"internal\"]",
+            "execution_contexts = [\"Internal\"]",
+        ] {
+            let candidate =
+                configured.replace("execution_contexts = [\"internal\", \"external\"]", invalid);
+            assert!(compile(&candidate).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn access_flow_execution_context_projection_is_https_only_and_reserves_its_header() {
+        let projection = r#"[egress.access_flow_execution_context]
+urls = ["https://broker.example.test/**"]
+
+"#;
+        let configured = MINIMAL.replace("[policy]", &format!("{projection}[policy]"));
+        let compiled = compile(&configured).unwrap();
+        let projected = compiled
+            .reloadable_plan
+            .egress
+            .access_flow_execution_context
+            .as_ref()
+            .unwrap();
+        assert!(projected.urls[0].is_match(
+            &http_access_url::canonicalize_http_url("https://broker.example.test/api").unwrap()
+        ));
+        assert!(!projected.urls[0].is_match(
+            &http_access_url::canonicalize_http_url("https://other.example.test/api").unwrap()
+        ));
+
+        for invalid in [
+            "urls = []",
+            "urls = [\"http://broker.example.test/**\"]",
+            "urls = [\"**\"]",
+        ] {
+            assert!(
+                compile(
+                    &configured.replace("urls = [\"https://broker.example.test/**\"]", invalid,)
+                )
+                .is_err(),
+                "accepted {invalid}"
+            );
+        }
+
+        for protected_use in [
+            r#"[[egress.request_headers]]
+operation = "remove"
+when = "always"
+name = "x-agent-access-context"
+
+"#,
+            r#"[credentials]
+allowed_custom_headers = ["x-agent-access-context"]
+
+"#,
+            r#"[authorization]
+internal_context_headers = ["x-agent-access-context"]
+
+"#,
+            r#"[authorization.providers.context]
+kind = "process"
+command = "/bin/false"
+include_headers = ["x-agent-access-context"]
+
+"#,
+        ] {
+            let candidate = configured.replace("[policy]", &format!("{protected_use}[policy]"));
+            assert!(compile(&candidate).is_err(), "accepted {protected_use}");
+        }
+
+        let loop_collision = configured.replace(
+            "[policy]",
+            "[safety.loop_detection]\nheader = \"x-agent-access-context\"\ninject = true\n\n[policy]",
+        );
+        assert!(compile(&loop_collision).is_err());
+
+        let predicate_collision = configured.replace(
+            "[policy]\ndefault = \"deny\"",
+            r#"[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "context-header"
+decision = "deny"
+urls = ["https://broker.example.test/**"]
+
+[policy.rules.headers]
+present_all = ["x-agent-access-context"]"#,
+        );
+        assert!(compile(&predicate_collision).is_err());
     }
 
     fn tls_access_flow_config(listener: &str, destination_port: u16) -> String {

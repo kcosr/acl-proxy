@@ -1843,6 +1843,7 @@ mod tests {
             body,
             1_000,
             Arc::new(access_identity::IdentityContext::Disabled),
+            None,
         )
         .unwrap()
     }

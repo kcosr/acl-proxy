@@ -45,6 +45,12 @@ route = "direct"
 trust = "system"
 http_versions = ["http1", "http2"]
 
+# Project an admitted Access Flow v2 execution context only to selected HTTPS
+# URLs. The fixed outbound header is X-Agent-Access-Context.
+#
+# [egress.access_flow_execution_context]
+# urls = ["https://agent-access-broker-dev.vailsys.net/**"]
+
 [policy]
 default = "deny"
 
@@ -68,6 +74,7 @@ default = "deny"
 # urls = ["https://api.example.test/v1/**"]
 # methods = ["GET", "HEAD"]
 # client_cidrs = ["192.0.2.0/24"]
+# execution_contexts = ["internal", "external"]
 # allow_upgrades = false
 #
 # [policy.rules.headers]

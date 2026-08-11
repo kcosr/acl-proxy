@@ -5,13 +5,24 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use access_flow::{write_access_flow_preface, AccessFlowDestination};
+use access_flow::AccessFlowDestination;
 use access_identity::{IdentityPresentation, SensitiveBearer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
 
 const FILE_BEARER: &str = "file-backed-product-identity-bearer-000000000";
+
+async fn write_access_flow_preface<W>(
+    writer: &mut W,
+    destination: AccessFlowDestination,
+    presentation: &IdentityPresentation,
+) -> Result<(), access_flow::AccessFlowWriteError>
+where
+    W: tokio::io::AsyncWrite + Unpin + Send,
+{
+    access_flow::write_access_flow_preface(writer, destination, presentation, None).await
+}
 
 fn trusted_product_tempdir() -> tempfile::TempDir {
     let directory = tempfile::Builder::new()

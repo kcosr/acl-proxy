@@ -94,6 +94,8 @@ pub(crate) enum StandaloneProviderAllowError {
     Redaction,
     #[error("provider Content-Type is invalid")]
     ContentType,
+    #[error("Access Flow execution-context projection is invalid")]
+    ExecutionContextProjection,
     #[error("provider allow request rebuilding failed")]
     Runtime(#[source] http_access_runtime::RuntimeError),
     #[error("provider allow forwarding intent is invalid")]
@@ -404,6 +406,11 @@ fn finish_allow(
     }
     if let Some(batch) = provider_content_type {
         request_mutation_batches.push(batch);
+    }
+    if !outer_connect && generation.projects_access_flow_execution_context(request.facts().url()) {
+        if let Some(context) = request.execution_context() {
+            request_mutation_batches.push(execution_context_batch(context)?);
+        }
     }
 
     let mut response_mutation_batches = Vec::new();
@@ -735,6 +742,20 @@ fn content_type_batch(
     HeaderMutationBatch::new(vec![mutation]).map_err(|_| StandaloneProviderAllowError::ContentType)
 }
 
+fn execution_context_batch(
+    context: &access_execution_context::ExecutionContext,
+) -> Result<HeaderMutationBatch, StandaloneProviderAllowError> {
+    let name =
+        HeaderName::new(crate::config::compiler::ACCESS_FLOW_EXECUTION_CONTEXT_HEADER.to_owned())
+            .map_err(|_| StandaloneProviderAllowError::ExecutionContextProjection)?;
+    let value = HeaderValue::new(context.as_str().as_bytes().to_vec())
+        .map_err(|_| StandaloneProviderAllowError::ExecutionContextProjection)?;
+    let mutation = HeaderMutation::set(HeaderMutationCondition::Always, name, vec![value])
+        .map_err(|_| StandaloneProviderAllowError::ExecutionContextProjection)?;
+    HeaderMutationBatch::new(vec![mutation])
+        .map_err(|_| StandaloneProviderAllowError::ExecutionContextProjection)
+}
+
 fn compile_upgrade(
     request: &RuntimeRequest,
     allow: bool,
@@ -995,6 +1016,15 @@ header = "x-test-loop"
     }
 
     fn request(generation: &StandaloneGenerationPlan, chunks: Vec<Vec<u8>>) -> RuntimeRequest {
+        request_with_context(generation, chunks, "https://example.test/resource", None)
+    }
+
+    fn request_with_context(
+        generation: &StandaloneGenerationPlan,
+        chunks: Vec<Vec<u8>>,
+        url: &str,
+        execution_context: Option<access_execution_context::ExecutionContext>,
+    ) -> RuntimeRequest {
         let length = chunks.iter().map(Vec::len).sum::<usize>();
         let content_type = HeaderField::new(
             HeaderName::new("content-type".to_owned()).unwrap(),
@@ -1004,7 +1034,7 @@ header = "x-test-loop"
             IngressMode::ExplicitHttps,
             HttpVersion::Http11,
             HttpMethod::new("POST").unwrap(),
-            http_access_url::canonicalize_http_url("https://example.test/resource").unwrap(),
+            http_access_url::canonicalize_http_url(url).unwrap(),
             vec![content_type],
             BodyMetadata::new(BodyFraming::ContentLength(length as u64)),
             None,
@@ -1030,6 +1060,7 @@ header = "x-test-loop"
             body,
             30_001,
             Arc::new(access_identity::IdentityContext::Disabled),
+            execution_context,
         )
         .unwrap();
         observe_body(&mut request);
@@ -1067,6 +1098,7 @@ header = "x-test-loop"
             body,
             30_001,
             Arc::new(access_identity::IdentityContext::Disabled),
+            None,
         )
         .unwrap();
         observe_body(&mut request);
@@ -1143,6 +1175,7 @@ header = "x-test-loop"
             BodyRepresentation::PreservedContentCoded,
             BodyObservation::unobserved(),
             request.identity(),
+            request.execution_context(),
         )
         .unwrap();
         let evaluation = lease
@@ -1273,6 +1306,7 @@ header = "x-test-loop"
             BodyRepresentation::PreservedContentCoded,
             BodyObservation::unobserved(),
             request.identity(),
+            request.execution_context(),
         )
         .unwrap();
         let PolicyEvaluation::Delegate(delegated) = lease
@@ -1330,6 +1364,7 @@ header = "x-test-loop"
             BodyRepresentation::PreservedContentCoded,
             BodyObservation::unobserved(),
             request.identity(),
+            request.execution_context(),
         )
         .unwrap();
         let PolicyEvaluation::Allow {
@@ -1463,6 +1498,60 @@ header = "x-test-loop"
             drop(lease);
             runtime.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn execution_context_projection_is_one_final_set_for_matching_origin_requests() {
+        let configured = CONFIG.replace(
+            "[egress]\nroute = \"direct\"",
+            r#"[egress]
+route = "direct"
+
+[egress.access_flow_execution_context]
+urls = ["https://example.test/projected/**"]"#,
+        );
+        let (runtime, lease, _pool) = runtime_from_config(&configured).await;
+        let generation = lease.standalone();
+
+        for (url, context, expected) in [
+            (
+                "https://example.test/projected/action",
+                Some(access_execution_context::ExecutionContext::new("external").unwrap()),
+                Some(b"external".as_slice()),
+            ),
+            ("https://example.test/projected/action", None, None),
+            (
+                "https://example.test/resource",
+                Some(access_execution_context::ExecutionContext::new("internal").unwrap()),
+                None,
+            ),
+        ] {
+            let (guard, provider) = admission(&lease);
+            let result = adapt_provider_allow(
+                &lease,
+                0,
+                provider,
+                output(&lease, provider, false, None),
+                None,
+                guard,
+                request_with_context(generation, vec![b"body".to_vec()], url, context),
+            )
+            .unwrap();
+            let batches = result.plan.forwarding_plan().request_mutation_batches();
+            let applied = http_access_types::apply_header_mutation_batches(&[], batches).unwrap();
+            let values = applied
+                .iter()
+                .filter(|field| field.name().as_str() == "x-agent-access-context")
+                .map(|field| field.value().as_bytes())
+                .collect::<Vec<_>>();
+            match expected {
+                Some(expected) => assert_eq!(values, [expected]),
+                None => assert!(values.is_empty()),
+            }
+        }
+
+        drop(lease);
+        runtime.shutdown().await;
     }
 
     #[tokio::test]

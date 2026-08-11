@@ -53,6 +53,7 @@ urls = ["https://example.com/app/**"]
 description = "delegate application"
 authorization_provider = "approval"
 identity_states = ["authenticated"]
+execution_contexts = ["internal", "external"]
 identity_subjects = [
   { kind = "group", authority = "test-authority", id = "developers" },
   { kind = "principal", authority = "test-authority", id = "test-principal" },

@@ -40,6 +40,7 @@ urls = ["https://example.test/api/**", "https://example.test/status"]
 methods = ["get"]
 client_cidrs = ["10.0.0.0/8"]
 identity_states = ["disabled"]
+execution_contexts = ["internal", "external"]
 request_timeout = "5s"
 allow_upgrades = true
 authorization_provider = "approval"
@@ -122,6 +123,10 @@ fn policy_dump_defaults_to_stable_secret_free_json_off_tty() {
     assert_eq!(rule["client_cidrs"][0], "10.0.0.0/8");
     assert_eq!(rule["identity_states"][0], "disabled");
     assert_eq!(rule["identity_subjects"], serde_json::json!([]));
+    assert_eq!(
+        rule["execution_contexts"],
+        serde_json::json!(["external", "internal"])
+    );
     assert_eq!(rule["headers"]["absent_any"][0], "x-blocked");
     assert_eq!(rule["headers"]["present_all"][0], "x-identity");
     assert_eq!(rule["headers"]["all"][0]["name"], "x-tenant");
@@ -146,7 +151,7 @@ fn policy_dump_table_uses_the_same_compiled_projection() {
         .success()
         .stdout(contains("Default action: deny (source: main)"))
         .stdout(contains(
-            "INDEX\tRULE_ID\tSOURCE\tDECISION\tURLS\tMETHODS\tCLIENT_CIDRS\tIDENTITY_PREDICATES\tHEADER_PREDICATES\tDESCRIPTION\tAUTHORIZATION_PROVIDER\tREDACTION_PROFILE\tMUTATIONS",
+            "INDEX\tRULE_ID\tSOURCE\tDECISION\tURLS\tMETHODS\tCLIENT_CIDRS\tIDENTITY_PREDICATES\tEXECUTION_CONTEXTS\tHEADER_PREDICATES\tDESCRIPTION\tAUTHORIZATION_PROVIDER\tREDACTION_PROFILE\tMUTATIONS",
         ))
         .stdout(contains("0\tdelegated-api\tmain\tdelegate"))
         .stdout(contains(
@@ -157,6 +162,7 @@ fn policy_dump_table_uses_the_same_compiled_projection() {
         .stdout(contains("x-tenant=engineering"))
         .stdout(contains("x-channel!=untrusted"))
         .stdout(contains("state=disabled"))
+        .stdout(contains("external,internal"))
         .stdout(contains("approval"))
         .stdout(contains("request:set:x-route"))
         .stdout(contains("response:remove:x-remove-me"))

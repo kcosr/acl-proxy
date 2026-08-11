@@ -499,7 +499,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use access_flow::{write_access_flow_preface, AccessFlowDestination, AccessFlowPreface};
+    use access_flow::{AccessFlowDestination, AccessFlowPreface};
     use access_identity::{
         AuthorityId, IdentityPresentation, PrincipalId, PrincipalKind, PrincipalRef,
         SensitiveBearer,
@@ -518,6 +518,17 @@ mod tests {
     use super::*;
     use crate::config::load_and_compile_exact_config;
     use crate::test_certificates::{client_config_for_roots, TestTlsIdentity};
+
+    async fn write_access_flow_preface<W>(
+        writer: &mut W,
+        destination: AccessFlowDestination,
+        presentation: &IdentityPresentation,
+    ) -> Result<(), access_flow::AccessFlowWriteError>
+    where
+        W: tokio::io::AsyncWrite + Unpin + Send,
+    {
+        access_flow::write_access_flow_preface(writer, destination, presentation, None).await
+    }
 
     fn config(explicit_http: SocketAddr, control: SocketAddr, extra: &str) -> String {
         format!(
@@ -1815,9 +1826,10 @@ methods = ["GET"]
         let pending_preface = AccessFlowPreface::new(
             AccessFlowDestination::new("203.0.113.9".parse().unwrap(), 80).unwrap(),
             IdentityPresentation::Bearer(SensitiveBearer::new(BEARER.as_bytes()).unwrap()),
+            None,
         );
         let partial_preface = pending_preface.expose_encoded(|encoded| {
-            assert!(encoded.len() > access_flow::ACCESS_FLOW_HEADER_LEN);
+            assert!(encoded.len() > access_flow::ACCESS_FLOW_V2_HEADER_LEN);
             encoded[..encoded.len() - 1].to_vec()
         });
         let mut pending = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
@@ -1998,7 +2010,7 @@ methods = ["GET"]
 
         let connector = TlsConnector::from(Arc::new(client_config_for_roots(
             [identity.root_certificate_der()],
-            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN],
+            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN_V2],
         )));
         let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
         let mut anonymous = connector
@@ -2083,7 +2095,7 @@ methods = ["GET"]
         );
         assert_eq!(
             channel.get_ref().1.alpn_protocol(),
-            Some(access_flow_tls::ACCESS_FLOW_TLS_ALPN)
+            Some(access_flow_tls::ACCESS_FLOW_TLS_ALPN_V2)
         );
         write_access_flow_preface(
             &mut channel,
@@ -2210,7 +2222,7 @@ methods = ["GET"]
         );
         let rotated_connector = TlsConnector::from(Arc::new(client_config_for_roots(
             [rotated_identity.root_certificate_der()],
-            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN],
+            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN_V2],
         )));
         let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
         let mut rotated_candidate = rotated_connector
@@ -2301,7 +2313,7 @@ methods = ["GET"]
         );
         let recovered_connector = TlsConnector::from(Arc::new(client_config_for_roots(
             [recovered_identity.root_certificate_der()],
-            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN],
+            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN_V2],
         )));
         let recovered_security = product
             .static_resources
@@ -2566,7 +2578,7 @@ methods = ["POST"]
         });
         let connector = TlsConnector::from(Arc::new(client_config_for_roots(
             [identity.root_certificate_der()],
-            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN],
+            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN_V2],
         )));
         let send = |bearer: &'static str| {
             let connector = connector.clone();
@@ -2858,7 +2870,7 @@ urls = ["http://origin.example.test/**"]
 
         let connector = TlsConnector::from(Arc::new(client_config_for_roots(
             [identity.root_certificate_der()],
-            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN],
+            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN_V2],
         )));
         let open = |bearer: &'static str, path: &'static str| {
             let connector = connector.clone();
@@ -3119,7 +3131,7 @@ urls = ["https://origin.example.test/**"]
 
         let outer_connector = TlsConnector::from(Arc::new(client_config_for_roots(
             [outer_identity.root_certificate_der()],
-            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN],
+            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN_V2],
         )));
         let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
         let mut outer = outer_connector
@@ -3422,7 +3434,7 @@ default = "deny"
             .adapter;
         let connector = TlsConnector::from(Arc::new(client_config_for_roots(
             [identity.root_certificate_der()],
-            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN],
+            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN_V2],
         )));
 
         let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
@@ -3621,7 +3633,7 @@ methods = ["GET"]
             .adapter;
         let connector = TlsConnector::from(Arc::new(client_config_for_roots(
             [identity.root_certificate_der()],
-            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN],
+            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN_V2],
         )));
 
         let (origin_active_send, origin_active_receive) = oneshot::channel();
@@ -4946,6 +4958,10 @@ id = "unix-transparent-tls"
 decision = "allow"
 methods = ["GET"]
 urls = ["https://origin.example.test/**"]
+execution_contexts = ["external"]
+
+[egress.access_flow_execution_context]
+urls = ["https://origin.example.test/**"]
 "#,
             socket_path
         );
@@ -4996,10 +5012,13 @@ urls = ["https://origin.example.test/**"]
         });
 
         let mut unix = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
-        write_access_flow_preface(
+        let execution_context =
+            access_execution_context::ExecutionContext::new("external").unwrap();
+        access_flow::write_access_flow_preface(
             &mut unix,
             AccessFlowDestination::new("203.0.113.8".parse().unwrap(), 443).unwrap(),
             &IdentityPresentation::Disabled,
+            Some(&execution_context),
         )
         .await
         .unwrap();
@@ -5012,7 +5031,7 @@ urls = ["https://origin.example.test/**"]
             .unwrap();
         client
             .write_all(
-                b"GET /uds-tls HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
+                b"GET /uds-tls HTTP/1.1\r\nHost: origin.example.test\r\nX-Agent-Access-Context: internal\r\nX-Agent-Access-Context: workstation\r\nConnection: close\r\n\r\n",
             )
             .await
             .unwrap();
@@ -5021,6 +5040,9 @@ urls = ["https://origin.example.test/**"]
         assert!(response.ends_with(b"\r\n\r\nmitm accepted"));
         let request = origin_task.await.unwrap();
         assert!(request.starts_with(b"GET /uds-tls HTTP/1.1\r\n"));
+        let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+        assert_eq!(request.matches("\r\nx-agent-access-context:").count(), 1);
+        assert!(request.contains("\r\nx-agent-access-context: external\r\n"));
 
         product.shutdown().await;
         assert!(!socket_path.exists());

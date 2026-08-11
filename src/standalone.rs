@@ -14,6 +14,7 @@ use http_access_types::{
     SensitiveHeaderPolicy, SnapshotIdentity, StableId, StageTimeouts, TlsTrust, TrailerPolicy,
     TransportSecurity,
 };
+use http_access_url::CompiledUrlPattern;
 
 use crate::authorization::protocol::{ProviderOutputDefinition, ProviderOutputIndex};
 use crate::authorization::{ActivatedProviderOutputBinding, ProductAuthorizationSnapshot};
@@ -60,6 +61,7 @@ pub(crate) struct StandaloneGenerationCore {
     product_acl: ProductAclSnapshot,
     rules: Box<[StandaloneRuleTemplate]>,
     global_request_headers: Option<HeaderMutationBatch>,
+    access_flow_execution_context_urls: Option<Box<[CompiledUrlPattern]>>,
     global_credentials: Box<[StandaloneCredentialTemplate]>,
     provider_credentials: Box<[ProviderCredentialTemplates]>,
     snapshot_lease: Option<SnapshotLease>,
@@ -253,6 +255,11 @@ impl UnboundStandaloneGenerationPlan {
             &sensitive_headers,
         )?;
         let global_request_headers = compile_header_batch(&plan.egress.request_headers)?;
+        let access_flow_execution_context_urls = plan
+            .egress
+            .access_flow_execution_context
+            .as_ref()
+            .map(|projection| projection.urls.clone().into_boxed_slice());
 
         let mut credential_refs = Vec::new();
         let global_credentials = plan
@@ -327,6 +334,7 @@ impl UnboundStandaloneGenerationPlan {
             product_acl,
             rules: rules.into_boxed_slice(),
             global_request_headers,
+            access_flow_execution_context_urls,
             global_credentials,
             provider_credentials,
             snapshot_lease: None,
@@ -519,6 +527,19 @@ impl StandaloneGenerationCore {
 
     pub(crate) fn global_request_headers(&self) -> Option<&HeaderMutationBatch> {
         self.global_request_headers.as_ref()
+    }
+
+    pub(crate) fn projects_access_flow_execution_context(
+        &self,
+        url: &http_access_url::CanonicalUrl,
+    ) -> bool {
+        self.access_flow_execution_context_urls
+            .as_deref()
+            .is_some_and(|patterns| patterns.iter().any(|pattern| pattern.is_match(url)))
+    }
+
+    pub(crate) const fn access_flow_execution_context_projection_enabled(&self) -> bool {
+        self.access_flow_execution_context_urls.is_some()
     }
 
     pub(crate) fn global_credentials(&self) -> &[StandaloneCredentialTemplate] {

@@ -11,6 +11,7 @@ pub(crate) struct IngressPartitionPolicy<'a> {
     internal_context: &'a [http::HeaderName],
     sensitive: &'a [http_access_types::HeaderName],
     observation_sensitive: &'a [http_access_types::HeaderName],
+    access_flow_execution_context: Option<http::HeaderName>,
 }
 
 impl<'a> IngressPartitionPolicy<'a> {
@@ -20,6 +21,14 @@ impl<'a> IngressPartitionPolicy<'a> {
             internal_context: lease.authorization().internal_context_headers(),
             sensitive: lease.standalone().sensitive_headers(),
             observation_sensitive: lease.standalone().sensitive_header_policy().names(),
+            access_flow_execution_context: lease
+                .standalone()
+                .access_flow_execution_context_projection_enabled()
+                .then(|| {
+                    http::HeaderName::from_static(
+                        crate::config::compiler::ACCESS_FLOW_EXECUTION_CONTEXT_HEADER,
+                    )
+                }),
         }
     }
 }
@@ -55,6 +64,9 @@ pub(crate) fn partition_standalone_private_fields(
     private_fields: Vec<HeaderField>,
 ) -> Result<(Vec<HeaderField>, PartitionedIngressHeaders), ProductPartitionError> {
     let mut private = product_headers(&private_fields)?;
+    if let Some(name) = &policy.access_flow_execution_context {
+        private.remove(name);
+    }
 
     let mut audit_sensitive_presence = Vec::new();
     audit_sensitive_presence
@@ -236,6 +248,7 @@ mod tests {
             internal_context: internal,
             sensitive,
             observation_sensitive: sensitive,
+            access_flow_execution_context: None,
         }
     }
 
@@ -342,6 +355,30 @@ mod tests {
         .unwrap();
         assert_eq!(names(&visible), ["x-visible"]);
         assert_eq!(partitioned.internal_context["x-internal"], "context");
+    }
+
+    #[test]
+    fn execution_context_projection_strips_all_caller_values_before_partitioning() {
+        let inbound = InboundCredentialSnapshot::empty_for_test();
+        let mut policy = empty_policy(&inbound);
+        policy.access_flow_execution_context = Some(ProductHeaderName::from_static(
+            crate::config::compiler::ACCESS_FLOW_EXECUTION_CONTEXT_HEADER,
+        ));
+        let (visible, partitioned) = partition_standalone_private_fields(
+            &policy,
+            vec![
+                field("x-agent-access-context", "internal"),
+                field("x-agent-access-context", "external, workstation"),
+                field("x-visible", "ordinary"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(names(&visible), ["x-visible"]);
+        assert!(partitioned.internal_context.is_empty());
+        assert!(partitioned.retained_private.is_empty());
+        assert!(partitioned.sensitive_presence.is_empty());
+        assert!(partitioned.audit_sensitive_presence.is_empty());
     }
 
     #[test]

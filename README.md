@@ -236,6 +236,10 @@ path = "/Users/your-user/Library/Application Support/AW Gateway/runtime/transpar
 mode = "0600"
 ```
 
+Access Flow v2 may also carry one validated execution context independently of
+identity. ACL Proxy keeps that value as typed flow metadata; it never trusts an
+application header as its source.
+
 The same Access Flow endpoint may use server-authenticated TLS/TCP for a relay
 on another host. Remote listeners require workload identity and use exact
 destination port 80 for transparent HTTP or 443 for transparent HTTPS:
@@ -290,10 +294,12 @@ for the complete paired transparent HTTP and HTTPS shape.
 The shipped remote profile assumes one relay source per Proxy, gives each
 listener 64 global connection slots, and leaves `per_source` disabled.
 
-TLS/TCP is TLS 1.3 only and requires ALPN `aw-access-flow/1`. The relay
-authenticates the proxy certificate with its configured name and PEM trust
-bundle; the proxy does not request a client certificate. The AWAF bearer is the
-sole workload authentication input. A remote socket source is used only for
+TLS/TCP is TLS 1.3 only. Updated relays use ALPN `aw-access-flow/2`; the proxy
+also accepts legacy `aw-access-flow/1` clients and binds the negotiated ALPN to
+the matching AWAF wire version. The relay authenticates the proxy certificate
+with its configured name and PEM trust bundle; the proxy does not request a
+client certificate. The AWAF bearer is the sole workload authentication input.
+A remote socket source is used only for
 transport abuse control and is never exposed to ACLs, delegates, captures, or
 decision logs. Remote policy has no source-CIDR fact, and its fixed diagnostic
 client value is `0.0.0.0:0` (`0.0.0.0` in provider and decision-log fields).
@@ -473,6 +479,22 @@ trust = "system" # system | custom | system_plus_custom | insecure
 http_versions = ["http1", "http2"]
 ```
 
+To expose admitted Access Flow context to selected HTTPS URLs, configure
+the one narrow projection:
+
+```toml
+[egress.access_flow_execution_context]
+urls = ["https://agent-access-broker-dev.vailsys.net/**"]
+```
+
+For matching decrypted origin requests with a context, ACL Proxy sets exactly
+one `X-Agent-Access-Context` header immediately before forwarding. It removes
+all caller-supplied instances before policy, provider, and capture processing.
+Matching requests without context emit no header; nonmatching destinations and
+outer CONNECT requests never receive it. The URL list must be nonempty and
+HTTPS-only. This section and its compiled URL patterns reload atomically with
+the policy generation.
+
 Candidate activation declares every origin, parent-proxy, and HTTPS webhook
 trust requirement before performing TLS trust I/O. It then loads each distinct
 required source once through the shared Access Runtime trust implementation and
@@ -536,6 +558,7 @@ urls = ["https://api.example.test/v1/**"]
 methods = ["GET", "HEAD"]
 client_cidrs = ["192.0.2.0/24"]
 identity_states = ["authenticated"]
+execution_contexts = ["internal", "external"]
 identity_subjects = [
   { kind = "group", authority = "workstation", id = "developers" }
 ]
@@ -554,6 +577,10 @@ predicate. Authoring order does not affect the compiled rule. The singular
 OR set of exact authority-qualified `principal` or `group` references and may
 appear only with `identity_states = ["authenticated"]`. Identity predicates
 combine with the other predicates using the rule-wide AND behavior.
+`execution_contexts` is likewise an optional nonempty, duplicate-free OR set
+of canonical Access Flow context values. A rule with this predicate does not
+match a request whose context is absent. Context remains bound across a
+delegate `pass` before evaluation resumes at the next rule.
 
 URL patterns are component aware:
 
@@ -899,7 +926,9 @@ value = "no-store"
 ```
 
 Credential destination headers and reserved hop/control headers cannot be
-mutated with literal effects.
+mutated with literal effects. When execution-context projection is configured,
+`x-agent-access-context` is also reserved from literal effects, credentials,
+provider inputs/outputs, internal-context headers, and header predicates.
 
 ### Redaction And Capture
 

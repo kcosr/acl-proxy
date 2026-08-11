@@ -1324,6 +1324,7 @@ mod tests {
                 AccessFlowAdmissionInput {
                     destination,
                     presentation: &presentation,
+                    execution_context: None,
                     channel_facts: &(),
                     deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
                     cancellation: &cancellation,

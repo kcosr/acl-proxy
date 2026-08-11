@@ -95,8 +95,15 @@ impl StandaloneRequestFactory for ProductStandaloneRequestFactory {
         Box::pin(async move {
             let started_at = Instant::now();
             let listener_transport = ingress.listener_transport();
-            let (facts, projection, listener_connect_denied, identity, body, private_fields) =
-                ingress.into_parts();
+            let (
+                facts,
+                projection,
+                listener_connect_denied,
+                identity,
+                execution_context,
+                body,
+                private_fields,
+            ) = ingress.into_parts();
             let client = projection.client();
             let request_binding_peer_ip =
                 projection.checked_request_binding_peer_ip(identity.as_ref())?;
@@ -168,6 +175,7 @@ impl StandaloneRequestFactory for ProductStandaloneRequestFactory {
                 clock,
                 listener_denied: listener_connect_denied,
                 identity,
+                execution_context,
                 decision_target: Arc::clone(&self.observation).into(),
                 capture,
             };
@@ -242,6 +250,7 @@ struct StandaloneProviderInput {
     pub(crate) clock: Arc<TokioRuntimeClock>,
     pub(crate) listener_denied: bool,
     pub(crate) identity: Arc<access_identity::IdentityContext>,
+    pub(crate) execution_context: Option<access_execution_context::ExecutionContext>,
     pub(crate) decision_target: DecisionSubmissionTarget,
     pub(crate) capture: HttpCaptureContext,
 }
@@ -531,6 +540,7 @@ impl StandalonePolicyProvider {
             clock,
             listener_denied,
             identity,
+            execution_context,
             decision_target,
             capture,
         } = input;
@@ -573,6 +583,7 @@ impl StandalonePolicyProvider {
             policy_peer_ip,
             &header_facts,
             identity.as_ref(),
+            execution_context.as_ref(),
         )
         .map_err(|_| StandaloneProviderPrepareError::Policy)?;
         let initial_binding = evaluation_input.request_binding();
@@ -656,6 +667,7 @@ impl StandalonePolicyProvider {
             body,
             absolute_deadline_millis,
             identity,
+            execution_context,
         )?;
         let prepared_target = preflight_target.and_then(|preflight_target| {
             preflight_target
@@ -1695,7 +1707,8 @@ fn adapter_error_status(error: StandaloneProviderAllowError) -> u16 {
         StandaloneProviderAllowError::ProviderReplacement(
             ProviderBodyReplacementDecodeError::InvalidBody,
         ) => 415,
-        StandaloneProviderAllowError::ContentType => 500,
+        StandaloneProviderAllowError::ContentType
+        | StandaloneProviderAllowError::ExecutionContextProjection => 500,
         StandaloneProviderAllowError::Runtime(http_access_runtime::RuntimeError::LimitExceeded) => {
             503
         }
@@ -1795,6 +1808,7 @@ fn resolve_delegate(
         policy_peer_ip,
         request.policy_header_facts(),
         request.identity(),
+        request.execution_context(),
     )
     .map_err(|_| 500_u16)?;
     generation
@@ -1811,6 +1825,7 @@ fn policy_evaluation_input<'a>(
     policy_peer_ip: Option<IpAddr>,
     header_facts: &'a PolicyHeaderFacts,
     identity: &'a access_identity::IdentityContext,
+    execution_context: Option<&'a access_execution_context::ExecutionContext>,
 ) -> Result<EvaluationInput<'a>, http_access_policy_acl::AclError> {
     EvaluationInput::new(
         facts,
@@ -1821,6 +1836,7 @@ fn policy_evaluation_input<'a>(
         BodyRepresentation::PreservedContentCoded,
         BodyObservation::unobserved(),
         identity,
+        execution_context,
     )
 }
 
@@ -1920,6 +1936,7 @@ mod local_response_contract_tests {
             projection.policy_peer_ip(),
             &header_facts,
             &identity,
+            None,
         )
         .unwrap();
         assert_eq!(input.policy_peer_ip(), None);
@@ -1949,6 +1966,7 @@ mod local_response_contract_tests {
                         Vec::new(),
                         vec![PeerCidr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).unwrap()],
                         Vec::new(),
+                        None,
                         None,
                     )
                     .unwrap(),
@@ -2011,6 +2029,7 @@ mod local_response_contract_tests {
             body,
             deadline,
             Arc::new(access_identity::IdentityContext::Disabled),
+            None,
         )
         .unwrap();
         (request, clock)

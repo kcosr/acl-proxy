@@ -163,6 +163,7 @@ impl Config {
         let plan = AccessFlowRelayPlan::new(
             endpoints,
             presentation,
+            None,
             self.setup_timeout,
             max_connections,
             copy_buffer_bytes_per_direction,
@@ -459,7 +460,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn product_presentations_encode_exact_required_awaf_vectors() {
+    async fn product_relay_encodes_v2_without_an_authored_execution_context() {
         let fixture = load_adapter_parity_fixture().unwrap();
         let suite = load_awaf_vector_suite().unwrap();
         assert_eq!(CONFORMANCE_BEARER.len(), 32);
@@ -475,23 +476,13 @@ mod tests {
                 .map(AsRef::as_ref)
                 .collect::<Vec<_>>()
         );
-        assert_eq!(
-            fixture
-                .required_awaf_vectors()
-                .iter()
-                .map(AsRef::as_ref)
-                .collect::<Vec<_>>(),
-            [
-                "absent",
-                "anonymous",
-                "bearer",
-                "unicast-before-multicast",
-                "reserved-after-multicast",
-                "high-unicast-before-broadcast",
-            ]
-        );
-
-        for vector in suite.vectors() {
+        let vectors = suite
+            .vectors()
+            .iter()
+            .filter(|vector| vector.name() == "v2-absent-context")
+            .collect::<Vec<_>>();
+        assert_eq!(vectors.len(), 1);
+        for vector in vectors {
             let validated = validated_config_for_vector(vector.presentation());
             let matching_routes = validated
                 .plan
@@ -530,6 +521,7 @@ mod tests {
                 &mut *actual,
                 mapped_destination,
                 validated.plan.presentation(),
+                validated.plan.execution_context(),
             )
             .await
             .unwrap();

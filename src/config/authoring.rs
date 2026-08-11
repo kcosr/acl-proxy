@@ -675,6 +675,9 @@ pub(super) struct EgressConfig {
     pub request_headers: Vec<HeaderEffectConfig>,
 
     #[serde(default)]
+    pub access_flow_execution_context: Option<AccessFlowExecutionContextConfig>,
+
+    #[serde(default)]
     pub credential_actions: Vec<CredentialActionConfig>,
 }
 
@@ -685,9 +688,16 @@ impl Default for EgressConfig {
             origin_tls: TransportTlsConfig::default(),
             parent_proxy: None,
             request_headers: Vec::new(),
+            access_flow_execution_context: None,
             credential_actions: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AccessFlowExecutionContextConfig {
+    pub urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
@@ -809,6 +819,9 @@ pub(super) struct PolicyRuleConfig {
 
     #[serde(default)]
     pub identity_subjects: Option<Vec<IdentitySubjectConfig>>,
+
+    #[serde(default)]
+    pub execution_contexts: Option<Vec<String>>,
 
     #[serde(default)]
     pub headers: HeaderPredicatesConfig,

@@ -486,6 +486,7 @@ mod tests {
             origin_tls: origin(trust, ca_certificate),
             parent_proxy: None,
             request_headers: Vec::new(),
+            access_flow_execution_context: None,
             credential_actions: Vec::new(),
         }
     }
@@ -615,6 +616,7 @@ mod tests {
                 presentation: None,
             }),
             request_headers: Vec::new(),
+            access_flow_execution_context: None,
             credential_actions: Vec::new(),
         };
         let (activation, reads) = activate_candidate(
@@ -811,6 +813,7 @@ mod tests {
                 presentation: None,
             }),
             request_headers: Vec::new(),
+            access_flow_execution_context: None,
             credential_actions: Vec::new(),
         };
         let identity = SnapshotIdentity::new();
@@ -870,6 +873,7 @@ mod tests {
             origin_tls: origin(TlsClientTrustMode::System, None),
             parent_proxy: Some(parent),
             request_headers: Vec::new(),
+            access_flow_execution_context: None,
             credential_actions: Vec::new(),
         });
         let (_, executor) = activation.into_parts();
@@ -908,6 +912,7 @@ mod tests {
                     presentation: None,
                 }),
                 request_headers: Vec::new(),
+                access_flow_execution_context: None,
                 credential_actions: Vec::new(),
             });
         });
@@ -1048,6 +1053,7 @@ mod tests {
                     presentation: None,
                 }),
                 request_headers: Vec::new(),
+                access_flow_execution_context: None,
                 credential_actions: Vec::new(),
             };
             let error = EgressActivation::activate_for_test(

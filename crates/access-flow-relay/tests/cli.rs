@@ -180,12 +180,14 @@ fn exchange(
 ) {
     let mut source = connect_when_ready(listen);
     let mut endpoint = accept_unix(listener);
-    let mut header = [0_u8; access_flow::ACCESS_FLOW_HEADER_LEN];
+    let mut header = [0_u8; access_flow::ACCESS_FLOW_V2_HEADER_LEN];
     endpoint.read_exact(&mut header).unwrap();
     assert_eq!(&header[..4], b"AWAF");
+    assert_eq!(header[4], 2);
     assert_eq!(u16::from_be_bytes([header[8], header[9]]), listen.port());
     assert_eq!(&header[10..14], &Ipv4Addr::LOCALHOST.octets());
     assert_eq!(u16::from_be_bytes([header[14], header[15]]), 0);
+    assert_eq!(header[16], 0);
 
     source.write_all(request).unwrap();
     source.shutdown(Shutdown::Write).unwrap();

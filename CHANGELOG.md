@@ -45,9 +45,14 @@
 
 ### Added
 
+- Added Access Flow v2 execution-context policy predicates and an optional,
+  HTTPS-URL-scoped projection to the protected `X-Agent-Access-Context` outbound
+  header, with early spoof stripping and late single-value insertion.
+
 - Added server-authenticated TLS 1.3/TCP beneath transparent HTTP/HTTPS Access
-  Flow listeners, with exact `aw-access-flow/1` ALPN, mandatory AWAF workload
-  bearer resolution, bounded source-aware pre-admission controls, fixed
+  Flow listeners, with `aw-access-flow/2` plus legacy `aw-access-flow/1` ALPN,
+  mandatory AWAF workload bearer resolution, bounded source-aware pre-admission
+  controls, fixed
   accept coordination with no-wait handshake admission, bounded transient and
   descriptor-pressure retry before terminal listener failure, secure
   server-identity loading, independent SIGHUP rotation, expiry/readiness

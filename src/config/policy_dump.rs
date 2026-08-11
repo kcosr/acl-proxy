@@ -48,6 +48,7 @@ pub(crate) struct PolicyDumpRule {
     pub(crate) client_cidrs: Vec<String>,
     pub(crate) identity_states: Vec<PolicyDumpIdentityState>,
     pub(crate) identity_subjects: Vec<PolicyDumpIdentitySubject>,
+    pub(crate) execution_contexts: Vec<String>,
     pub(crate) headers: PolicyDumpHeaderPredicates,
     pub(crate) request_timeout_ms: Option<u64>,
     pub(crate) allow_upgrades: bool,
@@ -208,6 +209,7 @@ pub(crate) struct PolicyDumpTableRow {
     pub(crate) methods: String,
     pub(crate) client_cidrs: String,
     pub(crate) identity_predicates: String,
+    pub(crate) execution_contexts: String,
     pub(crate) header_predicates: String,
     pub(crate) description: String,
     pub(crate) authorization_provider: String,
@@ -336,6 +338,13 @@ impl PolicyDump {
                                 }
                             })
                             .collect(),
+                        execution_contexts: rule
+                            .execution_contexts
+                            .as_deref()
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|context| context.as_str().to_owned())
+                            .collect(),
                         headers: PolicyDumpHeaderPredicates {
                             absent_any: rule
                                 .headers
@@ -392,6 +401,7 @@ impl PolicyDump {
                 methods: rule.methods.join(","),
                 client_cidrs: rule.client_cidrs.join(","),
                 identity_predicates: format_identity_predicates(rule),
+                execution_contexts: rule.execution_contexts.join(","),
                 header_predicates: format_header_predicates(&rule.headers),
                 description: rule.description.clone().unwrap_or_default(),
                 authorization_provider: rule.authorization_provider.clone().unwrap_or_default(),

@@ -523,12 +523,12 @@ impl ProcessSignals {
 fn print_policy_table(policy: &PolicyDump) {
     println!("Default action: {} (source: main)", policy.default.as_str());
     println!(
-        "INDEX\tRULE_ID\tSOURCE\tDECISION\tURLS\tMETHODS\tCLIENT_CIDRS\tIDENTITY_PREDICATES\tHEADER_PREDICATES\tDESCRIPTION\tAUTHORIZATION_PROVIDER\tREDACTION_PROFILE\tMUTATIONS"
+        "INDEX\tRULE_ID\tSOURCE\tDECISION\tURLS\tMETHODS\tCLIENT_CIDRS\tIDENTITY_PREDICATES\tEXECUTION_CONTEXTS\tHEADER_PREDICATES\tDESCRIPTION\tAUTHORIZATION_PROVIDER\tREDACTION_PROFILE\tMUTATIONS"
     );
 
     for row in policy.table_rows() {
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             row.index,
             table_value(&row.rule_id),
             table_value(&row.source),
@@ -537,6 +537,7 @@ fn print_policy_table(policy: &PolicyDump) {
             table_value(&row.methods),
             table_value(&row.client_cidrs),
             table_value(&row.identity_predicates),
+            table_value(&row.execution_contexts),
             table_value(&row.header_predicates),
             table_value(&row.description),
             table_value(&row.authorization_provider),

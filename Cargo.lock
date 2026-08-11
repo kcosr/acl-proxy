@@ -7,10 +7,15 @@ name = "access-async-contracts"
 version = "0.1.0"
 
 [[package]]
+name = "access-execution-context"
+version = "0.1.0"
+
+[[package]]
 name = "access-flow"
 version = "0.1.0"
 dependencies = [
  "access-async-contracts",
+ "access-execution-context",
  "access-identity",
  "tokio",
  "zeroize",
@@ -21,6 +26,7 @@ name = "access-flow-conformance"
 version = "0.1.0"
 dependencies = [
  "access-async-contracts",
+ "access-execution-context",
  "access-flow",
  "access-flow-relay",
  "access-flow-tls",
@@ -38,6 +44,7 @@ name = "access-flow-relay"
 version = "0.1.0"
 dependencies = [
  "access-async-contracts",
+ "access-execution-context",
  "access-flow",
  "access-identity",
  "rustix",
@@ -122,6 +129,7 @@ name = "acl-proxy"
 version = "0.3.0-rc.1"
 dependencies = [
  "access-async-contracts",
+ "access-execution-context",
  "access-flow",
  "access-flow-tls",
  "access-flow-unix",
@@ -857,6 +865,7 @@ dependencies = [
 name = "http-access-conformance"
 version = "0.1.0"
 dependencies = [
+ "access-execution-context",
  "access-identity",
  "http-access-types",
  "http-access-url",
@@ -889,6 +898,7 @@ dependencies = [
 name = "http-access-policy-acl"
 version = "0.1.0"
 dependencies = [
+ "access-execution-context",
  "access-identity",
  "http-access-types",
  "http-access-url",
@@ -909,6 +919,7 @@ name = "http-access-runtime"
 version = "0.1.0"
 dependencies = [
  "access-async-contracts",
+ "access-execution-context",
  "access-flow",
  "access-identity",
  "access-tls-trust",
@@ -941,6 +952,7 @@ dependencies = [
 name = "http-access-types"
 version = "0.1.0"
 dependencies = [
+ "access-execution-context",
  "access-identity",
  "idna",
  "memchr",

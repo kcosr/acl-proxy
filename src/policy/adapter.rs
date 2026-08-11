@@ -1,8 +1,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use http_access_policy_acl::{
-    AclError, DefaultDecision, DelegateMatch, HeaderPredicate, IdentityPredicate, PeerCidr,
-    ProductActionRef, Rule, RulePredicates, TrafficPolicySnapshot,
+    AclError, DefaultDecision, DelegateMatch, ExecutionContextPredicate, HeaderPredicate,
+    IdentityPredicate, PeerCidr, ProductActionRef, Rule, RulePredicates, TrafficPolicySnapshot,
 };
 use http_access_types::{
     ContractError, DecisionProvenance, EffectivePolicy, HeaderName as NeutralHeaderName,
@@ -351,6 +351,10 @@ fn compile_predicates(rule: &PolicyRulePlan) -> Result<RulePredicates, ProductAc
                     .map_err(map_acl_error)
             })
             .transpose()?,
+        rule.execution_contexts
+            .as_ref()
+            .map(|contexts| ExecutionContextPredicate::new(contexts.clone()).map_err(map_acl_error))
+            .transpose()?,
     )
     .map_err(map_acl_error)
 }
@@ -536,6 +540,7 @@ mod tests {
                 BodyRepresentation::PreservedContentCoded,
                 BodyObservation::unobserved(),
                 identity,
+                None,
             )
             .unwrap()
         }
@@ -622,6 +627,7 @@ mod tests {
             methods: Vec::new(),
             client_cidrs: Vec::new(),
             identity: None,
+            execution_contexts: None,
             headers: empty_predicates(),
             request_timeout: None,
             allow_upgrades: false,
