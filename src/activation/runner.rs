@@ -2973,7 +2973,7 @@ urls = ["http://origin.example.test/**"]
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn remote_tls_access_flow_transparent_https_uses_the_nested_mitm_pipeline() {
+    async fn remote_tls_access_flow_v1_uses_context_free_nested_mitm_pipeline() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
         let reservations = super::super::reserve_listeners::<1>(&_test);
         let addresses = reservations.addresses();
@@ -2989,7 +2989,18 @@ urls = ["http://origin.example.test/**"]
         let origin_acceptor =
             TlsAcceptor::from(Arc::new(origin_identity.server_config(&[b"http/1.1"])));
         const VARIABLE: &str = "AW_REMOTE_TLS_HTTPS_IDENTITY_TOKEN";
-        const BEARER: &str = "remote-tls-https-identity-bearer-0000000000000";
+        let vectors = access_flow_conformance::load_awaf_vector_suite().unwrap();
+        let v1_bearer_vector = vectors
+            .vectors()
+            .iter()
+            .find(|vector| vector.name() == "bearer")
+            .unwrap();
+        let v1_bearer = v1_bearer_vector.wire().to_vec();
+        let bearer = std::str::from_utf8(
+            &v1_bearer[v1_bearer.len() - v1_bearer_vector.presentation_length()..],
+        )
+        .unwrap()
+        .to_owned();
         let text = format!(
             r#"schema_version = 4
 
@@ -3051,6 +3062,9 @@ directory = "mitm"
 [egress]
 route = "direct"
 
+[egress.access_flow_execution_context]
+urls = ["https://origin.example.test/**"]
+
 [egress.origin_tls]
 trust = "insecure"
 http_versions = ["http1"]
@@ -3059,17 +3073,24 @@ http_versions = ["http1"]
 default = "deny"
 
 [[policy.rules]]
+id = "remote-tls-transparent-https-context"
+decision = "allow"
+methods = ["GET"]
+urls = ["https://origin.example.test/context-only"]
+execution_contexts = ["external"]
+
+[[policy.rules]]
 id = "remote-tls-transparent-https"
 decision = "allow"
 methods = ["GET"]
-urls = ["https://origin.example.test/**"]
+urls = ["https://origin.example.test/outer-tls-mitm"]
 "#,
             addresses[0], certificate_path, private_key_path
         );
         fs::write(&config_path, text).unwrap();
         let loaded = load_and_compile_exact_config(&config_path).unwrap();
         unsafe {
-            std::env::set_var(VARIABLE, BEARER);
+            std::env::set_var(VARIABLE, &bearer);
         }
         let identity_sources = crate::identity::IdentitySourceRegistry::activate().unwrap();
         identity_sources
@@ -3116,6 +3137,46 @@ urls = ["https://origin.example.test/**"]
         product.activate_initial().await.unwrap();
         product.start_listeners().await.unwrap();
 
+        let outer_connector = TlsConnector::from(Arc::new(client_config_for_roots(
+            [outer_identity.root_certificate_der()],
+            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN_V1],
+        )));
+        let inner_connector = TlsConnector::from(Arc::new(client_config_for_roots(
+            mitm_ca_chain,
+            &[b"http/1.1"],
+        )));
+
+        let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        let mut denied_outer = outer_connector
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .unwrap();
+        assert_eq!(
+            denied_outer.get_ref().1.alpn_protocol(),
+            Some(access_flow_tls::ACCESS_FLOW_TLS_ALPN_V1)
+        );
+        denied_outer.write_all(&v1_bearer).await.unwrap();
+        let mut denied = inner_connector
+            .connect(
+                ServerName::try_from("origin.example.test").unwrap(),
+                denied_outer,
+            )
+            .await
+            .unwrap();
+        denied
+            .write_all(
+                b"GET /context-only HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let response = read_http_message(&mut denied).await;
+        assert!(response.starts_with(b"HTTP/1.1 403 "));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), origin.accept())
+                .await
+                .is_err()
+        );
+
         let origin_task = tokio::spawn(async move {
             let (stream, _) = origin.accept().await.unwrap();
             let mut stream = origin_acceptor.accept(stream).await.unwrap();
@@ -3129,34 +3190,24 @@ urls = ["https://origin.example.test/**"]
             request
         });
 
-        let outer_connector = TlsConnector::from(Arc::new(client_config_for_roots(
-            [outer_identity.root_certificate_der()],
-            &[access_flow_tls::ACCESS_FLOW_TLS_ALPN_V2],
-        )));
         let tcp = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
         let mut outer = outer_connector
             .connect(ServerName::try_from("localhost").unwrap(), tcp)
             .await
             .unwrap();
-        write_access_flow_preface(
-            &mut outer,
-            AccessFlowDestination::new("203.0.113.8".parse().unwrap(), 443).unwrap(),
-            &IdentityPresentation::Bearer(SensitiveBearer::new(BEARER.as_bytes()).unwrap()),
-        )
-        .await
-        .unwrap();
+        assert_eq!(
+            outer.get_ref().1.alpn_protocol(),
+            Some(access_flow_tls::ACCESS_FLOW_TLS_ALPN_V1)
+        );
+        outer.write_all(&v1_bearer).await.unwrap();
 
-        let inner_connector = TlsConnector::from(Arc::new(client_config_for_roots(
-            mitm_ca_chain,
-            &[b"http/1.1"],
-        )));
         let mut client = inner_connector
             .connect(ServerName::try_from("origin.example.test").unwrap(), outer)
             .await
             .unwrap();
         client
             .write_all(
-                b"GET /outer-tls-mitm HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
+                b"GET /outer-tls-mitm HTTP/1.1\r\nHost: origin.example.test\r\nX-Agent-Access-Context: spoofed\r\nConnection: close\r\n\r\n",
             )
             .await
             .unwrap();
@@ -3169,6 +3220,7 @@ urls = ["https://origin.example.test/**"]
             .to_ascii_lowercase();
         assert!(request.starts_with("get /outer-tls-mitm http/1.1\r\n"));
         assert!(!request.contains("x-aw-identity-token"));
+        assert!(!request.contains("x-agent-access-context"));
 
         product.shutdown().await;
         super::super::assert_listener_addresses_released(&_test, addresses);
@@ -4957,8 +5009,14 @@ default = "deny"
 id = "unix-transparent-tls"
 decision = "allow"
 methods = ["GET"]
-urls = ["https://origin.example.test/**"]
+urls = ["https://origin.example.test/uds-tls"]
 execution_contexts = ["external"]
+
+[[policy.rules]]
+id = "unix-transparent-tls-v1"
+decision = "allow"
+methods = ["GET"]
+urls = ["https://origin.example.test/legacy"]
 
 [egress.access_flow_execution_context]
 urls = ["https://origin.example.test/**"]
@@ -4998,6 +5056,74 @@ urls = ["https://origin.example.test/**"]
         product.activate_initial().await.unwrap();
         product.start_listeners().await.unwrap();
 
+        let v1_absent = access_flow_conformance::load_awaf_vector_suite()
+            .unwrap()
+            .vectors()
+            .iter()
+            .find(|vector| vector.name() == "absent")
+            .unwrap()
+            .wire()
+            .to_vec();
+        let connector = TlsConnector::from(Arc::new(client_config_for_roots(
+            ca_chain.clone(),
+            &[b"http/1.1"],
+        )));
+
+        let mut legacy = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        legacy.write_all(&v1_absent).await.unwrap();
+        let mut denied = connector
+            .connect(ServerName::try_from("origin.example.test").unwrap(), legacy)
+            .await
+            .unwrap();
+        denied
+            .write_all(
+                b"GET /uds-tls HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let response = read_http_message(&mut denied).await;
+        assert!(response.starts_with(b"HTTP/1.1 403 "));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), origin.accept())
+                .await
+                .is_err()
+        );
+
+        let legacy_origin = tokio::spawn({
+            let origin = origin;
+            async move {
+                let (stream, _) = origin.accept().await.unwrap();
+                let mut stream = origin_acceptor.accept(stream).await.unwrap();
+                let request = read_http_message(&mut stream).await;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nlegacy",
+                    )
+                    .await
+                    .unwrap();
+                (origin, origin_acceptor, request)
+            }
+        });
+        let mut legacy = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        legacy.write_all(&v1_absent).await.unwrap();
+        let mut legacy = connector
+            .connect(ServerName::try_from("origin.example.test").unwrap(), legacy)
+            .await
+            .unwrap();
+        legacy
+            .write_all(
+                b"GET /legacy HTTP/1.1\r\nHost: origin.example.test\r\nX-Agent-Access-Context: spoofed\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let response = read_http_message(&mut legacy).await;
+        assert!(response.starts_with(b"HTTP/1.1 200 "));
+        let (origin, origin_acceptor, legacy_request) = legacy_origin.await.unwrap();
+        assert!(!String::from_utf8(legacy_request)
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("x-agent-access-context"));
+
         let origin_task = tokio::spawn(async move {
             let (stream, _) = origin.accept().await.unwrap();
             let mut stream = origin_acceptor.accept(stream).await.unwrap();
@@ -5023,8 +5149,6 @@ urls = ["https://origin.example.test/**"]
         .await
         .unwrap();
 
-        let connector =
-            TlsConnector::from(Arc::new(client_config_for_roots(ca_chain, &[b"http/1.1"])));
         let mut client = connector
             .connect(ServerName::try_from("origin.example.test").unwrap(), unix)
             .await

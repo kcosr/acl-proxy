@@ -131,6 +131,7 @@ dependencies = [
  "access-async-contracts",
  "access-execution-context",
  "access-flow",
+ "access-flow-conformance",
  "access-flow-tls",
  "access-flow-unix",
  "access-identity",

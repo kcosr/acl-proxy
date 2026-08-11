@@ -1068,6 +1068,13 @@ header = "x-test-loop"
     }
 
     fn connect_request(generation: &StandaloneGenerationPlan) -> RuntimeRequest {
+        connect_request_with_context(generation, None)
+    }
+
+    fn connect_request_with_context(
+        generation: &StandaloneGenerationPlan,
+        execution_context: Option<access_execution_context::ExecutionContext>,
+    ) -> RuntimeRequest {
         let facts = http_access_types::InterceptedRequestFacts::new(
             IngressMode::ExplicitHttp,
             HttpVersion::Http11,
@@ -1098,7 +1105,7 @@ header = "x-test-loop"
             body,
             30_001,
             Arc::new(access_identity::IdentityContext::Disabled),
-            None,
+            execution_context,
         )
         .unwrap();
         observe_body(&mut request);
@@ -1639,9 +1646,19 @@ urls = ["https://example.test/projected/**"]"#,
     async fn delegated_outer_connect_skips_required_provider_origin_credentials() {
         let config = CONFIG
             .replace("methods = [\"POST\"]", "methods = [\"CONNECT\"]")
-            .replace("required = false", "required = true");
+            .replace("required = false", "required = true")
+            .replace(
+                "[egress.origin_tls]",
+                r#"[egress.access_flow_execution_context]
+urls = ["https://example.test/**"]
+
+[egress.origin_tls]"#,
+            );
         let (runtime, lease, _pool) = runtime_from_config(&config).await;
-        let request = connect_request(lease.standalone());
+        let request = connect_request_with_context(
+            lease.standalone(),
+            Some(access_execution_context::ExecutionContext::new("external").unwrap()),
+        );
         let peer = "192.0.2.10".parse().unwrap();
         let guard = admission_for_request(&lease, &request, peer);
         let provider = lease
@@ -1669,6 +1686,13 @@ urls = ["https://example.test/projected/**"]"#,
             .forwarding_plan()
             .credential_mutations()
             .is_empty());
+        assert!(result
+            .plan
+            .forwarding_plan()
+            .request_mutation_batches()
+            .iter()
+            .flat_map(|batch| batch.mutations())
+            .all(|mutation| mutation.name().as_str() != "x-agent-access-context"));
         drop((result, lineage));
 
         let request = connect_request(lease.standalone());

@@ -91,6 +91,7 @@ windows-sys = { version = "=0.61.2", features = [
 ] }
 
 [dev-dependencies]
+access-flow-conformance = { path = "../access-runtime/crates/access-flow-conformance", version = "=0.1.0" }
 access-tls-trust = { path = "../access-runtime/crates/access-tls-trust", version = "=0.1.0", features = ["conformance-fixtures"] }
 assert_cmd = "2.0"
 predicates = "3.1"
