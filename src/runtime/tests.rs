@@ -61,6 +61,10 @@ impl AuthorizationSnapshot for EmptySnapshot {
         &[]
     }
 
+    fn legacy_execution_context_header(&self) -> Option<&http::HeaderName> {
+        None
+    }
+
     fn provider_metadata(
         &self,
         _provider: ProviderIndex,
@@ -842,6 +846,7 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
     );
     let authorization_plan = AuthorizationPlan {
         internal_context_headers: vec![],
+        legacy_execution_context_header: None,
         callback: Some(AuthorizationCallbackPlan {
             resume_token_ttl: Duration::from_secs(5),
             max_pending_operations: PendingOperationLimit::try_new(1).unwrap(),

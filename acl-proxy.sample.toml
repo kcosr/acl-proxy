@@ -51,6 +51,21 @@ http_versions = ["http1", "http2"]
 # [egress.access_flow_execution_context]
 # urls = ["https://agent-access-broker-dev.vailsys.net/**"]
 
+# A trusted two-proxy deployment may normalize one existing private header into
+# the same typed execution context. This is valid only when the managed proxy
+# exclusively supplies both the header and workload bearer and cannot be
+# bypassed. The matching unconditional remove action is required by
+# internal-context-header safety.
+#
+# [[egress.request_headers]]
+# operation = "remove"
+# when = "always"
+# name = "x-aw-policy-context"
+#
+# [authorization]
+# internal_context_headers = ["x-aw-policy-context"]
+# legacy_execution_context_header = "x-aw-policy-context"
+
 [policy]
 default = "deny"
 

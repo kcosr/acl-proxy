@@ -1512,14 +1512,31 @@ variable = "{VARIABLE}"
 [egress]
 route = "direct"
 
+[[egress.request_headers]]
+operation = "remove"
+when = "always"
+name = "x-aw-policy-context"
+
+[authorization]
+internal_context_headers = ["x-aw-policy-context"]
+legacy_execution_context_header = "x-aw-policy-context"
+
 [policy]
 default = "deny"
 
 [[policy.rules]]
-id = "identity-parity"
+id = "legacy-context"
 decision = "allow"
-urls = ["http://origin.example.test/**"]
+urls = ["http://origin.example.test/explicit"]
 methods = ["GET"]
+execution_contexts = ["internal"]
+
+[[policy.rules]]
+id = "access-flow-context"
+decision = "allow"
+urls = ["http://origin.example.test/access-flow"]
+methods = ["GET"]
+execution_contexts = ["external"]
 "#,
             addresses[0], socket_path
         );
@@ -1580,7 +1597,7 @@ methods = ["GET"]
         let mut missing = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
         missing
             .write_all(
-                b"GET http://origin.example.test/missing HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
+                b"GET http://origin.example.test/missing HTTP/1.1\r\nHost: origin.example.test\r\nx-aw-policy-context: internal\r\nConnection: close\r\n\r\n",
             )
             .await
             .unwrap();
@@ -1599,11 +1616,24 @@ methods = ["GET"]
         assert!(unknown_response.starts_with(b"HTTP/1.1 403 "));
         assert!(unknown_response.ends_with(b"\r\n\r\nidentity invalid\n"));
 
+        let mut missing_context = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+        missing_context
+            .write_all(
+                format!(
+                    "GET http://origin.example.test/explicit HTTP/1.1\r\nHost: origin.example.test\r\nx-aw-identity-token: {BEARER}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let missing_context_response = read_http_message(&mut missing_context).await;
+        assert!(missing_context_response.starts_with(b"HTTP/1.1 403 "));
+
         let mut explicit = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
         explicit
             .write_all(
                 format!(
-                    "GET http://origin.example.test/explicit HTTP/1.1\r\nHost: origin.example.test\r\nx-aw-identity-token: {BEARER}\r\nConnection: close\r\n\r\n"
+                    "GET http://origin.example.test/explicit HTTP/1.1\r\nHost: origin.example.test\r\nx-aw-identity-token: {BEARER}\r\nx-aw-policy-context: internal\r\nConnection: close\r\n\r\n"
                 )
                 .as_bytes(),
             )
@@ -1615,16 +1645,19 @@ methods = ["GET"]
         let mut access_flow = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
         let presentation =
             IdentityPresentation::Bearer(SensitiveBearer::new(BEARER.as_bytes()).unwrap());
-        write_access_flow_preface(
+        let execution_context =
+            access_execution_context::ExecutionContext::new("external").unwrap();
+        access_flow::write_access_flow_preface(
             &mut access_flow,
             AccessFlowDestination::new("203.0.113.8".parse().unwrap(), 80).unwrap(),
             &presentation,
+            Some(&execution_context),
         )
         .await
         .unwrap();
         access_flow
             .write_all(
-                b"GET /access-flow HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
+                b"GET /access-flow HTTP/1.1\r\nHost: origin.example.test\r\nx-aw-policy-context: internal\r\nConnection: close\r\n\r\n",
             )
             .await
             .unwrap();
@@ -1634,6 +1667,7 @@ methods = ["GET"]
         for request in origin_task.await.unwrap() {
             let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
             assert!(!request.contains("x-aw-identity-token"));
+            assert!(!request.contains("x-aw-policy-context"));
         }
 
         product.shutdown().await;
@@ -4293,8 +4327,36 @@ variable = "{PARENT_VARIABLE}"
 trust = "custom"
 ca_certificate = {parent_ca_path:?}
 
+[[egress.request_headers]]
+operation = "remove"
+when = "always"
+name = "x-aw-policy-context"
+
+[authorization]
+internal_context_headers = ["x-aw-policy-context"]
+legacy_execution_context_header = "x-aw-policy-context"
+
 [policy]
-default = "allow"
+default = "deny"
+
+[[policy.rules]]
+id = "direct-http"
+decision = "allow"
+urls = ["http://origin.example.test/resource"]
+methods = ["GET"]
+
+[[policy.rules]]
+id = "connect-bootstrap"
+decision = "allow"
+urls = ["**"]
+methods = ["CONNECT"]
+
+[[policy.rules]]
+id = "legacy-context-inside-connect"
+decision = "allow"
+urls = ["https://origin.example.test/inside-connect"]
+methods = ["GET"]
+execution_contexts = ["internal"]
 "#,
             addresses[0]
         );
@@ -4417,7 +4479,7 @@ default = "allow"
             .unwrap();
         tunnel
             .write_all(
-                b"GET /inside-connect HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
+                b"GET /inside-connect HTTP/1.1\r\nHost: origin.example.test\r\nx-aw-policy-context: internal\r\nConnection: close\r\n\r\n",
             )
             .await
             .unwrap();

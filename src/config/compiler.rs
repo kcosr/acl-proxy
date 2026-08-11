@@ -750,6 +750,7 @@ impl CompiledTransportSecurity {
 #[derive(Clone)]
 pub(crate) struct AuthorizationPlan {
     pub(crate) internal_context_headers: Vec<HeaderName>,
+    pub(crate) legacy_execution_context_header: Option<HeaderName>,
     pub(crate) callback: Option<AuthorizationCallbackPlan>,
     pub(crate) providers: BTreeMap<String, AuthorizationProviderPlan>,
 }
@@ -4498,6 +4499,14 @@ fn validate_internal_context(
     config: &super::authoring::AuthoringConfig,
     execution_context_projection: bool,
 ) -> Result<(), ConfigCompileError> {
+    let legacy_execution_context_header = config
+        .authorization
+        .legacy_execution_context_header
+        .as_ref()
+        .map(|header| {
+            normalize_header_name(header, "authorization.legacy_execution_context_header")
+        })
+        .transpose()?;
     let mut names = BTreeSet::new();
     for (index, name) in config
         .authorization
@@ -4537,15 +4546,30 @@ fn validate_internal_context(
             ));
         }
         match matching[0] {
-            HeaderEffectConfig::Set(value) if matches!(value.when, HeaderEffectWhen::Always) => {}
+            HeaderEffectConfig::Set(value)
+                if matches!(value.when, HeaderEffectWhen::Always)
+                    && legacy_execution_context_header.as_ref() != Some(&name) => {}
             HeaderEffectConfig::Remove(value) if matches!(value.when, HeaderEffectWhen::Always) => {
             }
             _ => {
+                let requirement = if legacy_execution_context_header.as_ref() == Some(&name) {
+                    "an unconditional remove action"
+                } else {
+                    "an unconditional set or remove action"
+                };
                 return Err(ConfigCompileError::at(
                     "authorization.internal_context_headers",
-                    format!("{name:?} requires an unconditional set or remove action"),
+                    format!("{name:?} requires {requirement}"),
                 ));
             }
+        }
+    }
+    if let Some(header) = legacy_execution_context_header {
+        if !names.contains(&header) {
+            return Err(ConfigCompileError::at(
+                "authorization.legacy_execution_context_header",
+                "must name a header declared in authorization.internal_context_headers",
+            ));
         }
     }
     Ok(())
@@ -8426,6 +8450,13 @@ fn compile_authorization_plan(
             &value.internal_context_headers,
             "authorization.internal_context_headers",
         )?,
+        legacy_execution_context_header: value
+            .legacy_execution_context_header
+            .as_ref()
+            .map(|header| {
+                compile_header_name(header, "authorization.legacy_execution_context_header")
+            })
+            .transpose()?,
         callback: value
             .callback
             .as_ref()
@@ -10750,6 +10781,64 @@ execution_contexts = ["internal", "external"]
                 configured.replace("execution_contexts = [\"internal\", \"external\"]", invalid);
             assert!(compile(&candidate).is_err(), "accepted {invalid}");
         }
+    }
+
+    #[test]
+    fn legacy_execution_context_header_must_be_an_existing_internal_context_header() {
+        let legacy = r#"[[egress.request_headers]]
+operation = "remove"
+when = "always"
+name = "x-aw-policy-context"
+
+[authorization]
+internal_context_headers = ["x-aw-policy-context"]
+legacy_execution_context_header = "X-AW-Policy-Context"
+
+"#;
+        let configured = MINIMAL.replace("[policy]", &format!("{legacy}[policy]"));
+        let compiled = compile(&configured).unwrap();
+        assert_eq!(
+            compiled
+                .reloadable_plan
+                .authorization
+                .legacy_execution_context_header
+                .as_ref()
+                .map(HeaderName::as_str),
+            Some("x-aw-policy-context")
+        );
+
+        let undeclared = MINIMAL.replace(
+            "[policy]",
+            "[authorization]\nlegacy_execution_context_header = \"x-aw-policy-context\"\n\n[policy]",
+        );
+        let error = compile(&undeclared).expect_err("undeclared legacy context header must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("authorization.legacy_execution_context_header"),
+            "{error}"
+        );
+
+        let different = configured.replace(
+            "legacy_execution_context_header = \"X-AW-Policy-Context\"",
+            "legacy_execution_context_header = \"x-other-context\"",
+        );
+        assert!(compile(&different).is_err());
+
+        let reintroduced = configured
+            .replace("operation = \"remove\"", "operation = \"set\"")
+            .replace(
+                "name = \"x-aw-policy-context\"",
+                "name = \"x-aw-policy-context\"\nvalue = \"internal\"",
+            );
+        let error = compile(&reintroduced)
+            .expect_err("legacy context source must not be reintroduced upstream");
+        assert!(
+            error
+                .to_string()
+                .contains("requires an unconditional remove action"),
+            "{error}"
+        );
     }
 
     #[test]

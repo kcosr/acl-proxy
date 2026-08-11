@@ -495,6 +495,37 @@ outer CONNECT requests never receive it. The URL list must be nonempty and
 HTTPS-only. This section and its compiled URL patterns reload atomically with
 the policy generation.
 
+An existing trusted two-proxy deployment can normalize its private context
+header into the same typed execution context without changing rules or the
+outbound projection:
+
+```toml
+[[egress.request_headers]]
+operation = "remove"
+when = "always"
+name = "x-aw-policy-context"
+
+[authorization]
+internal_context_headers = ["x-aw-policy-context"]
+legacy_execution_context_header = "x-aw-policy-context"
+```
+
+The legacy header is admitted only on ordinary TCP ingress with an
+authenticated identity. It must occur exactly once and contain a canonical
+execution-context value; malformed, duplicate, or comma-joined values are
+rejected before policy. Absence remains context-free. Access Flow never trusts
+this header and uses only AWAF metadata, removing any legacy-header spoof before
+provider processing.
+
+Enable this option only when the managed preceding proxy supplies the
+authenticated presentation, unconditionally replaces every application value,
+and keeps the workload bearer unavailable to applications that could bypass it
+into the trusted listener. The admitted principal remains the workload
+principal; it is not replaced with a proxy identity. The header remains an
+internal authorization-provider input when a legacy provider explicitly
+includes it, but it is never available to ordinary header predicates, capture,
+or origin forwarding.
+
 Candidate activation declares every origin, parent-proxy, and HTTPS webhook
 trust requirement before performing TLS trust I/O. It then loads each distinct
 required source once through the shared Access Runtime trust implementation and

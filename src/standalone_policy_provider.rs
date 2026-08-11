@@ -125,11 +125,18 @@ impl StandaloneRequestFactory for ProductStandaloneRequestFactory {
                 ingress_mode = ?facts.ingress_mode(),
                 "proxy request admitted"
             );
-            let (visible_fields, partitioned) = partition_standalone_private_fields(
+            let (visible_fields, mut partitioned) = partition_standalone_private_fields(
                 &IngressPartitionPolicy::from_lease(&lease),
                 private_fields,
             )
             .map_err(|_| http_access_runtime::RuntimeError::InvalidInput)?;
+            let execution_context = resolve_ingress_execution_context(
+                listener_transport,
+                identity.as_ref(),
+                execution_context,
+                lease.authorization().legacy_execution_context_header(),
+                &mut partitioned.internal_context,
+            )?;
             let facts =
                 rebuild_standalone_facts(facts, visible_fields).map_err(|error| match error {
                     ProductPartitionError::EmptyPathSegment => {
@@ -184,6 +191,44 @@ impl StandaloneRequestFactory for ProductStandaloneRequestFactory {
                     .map_err(|_| http_access_runtime::RuntimeError::InvalidInput)?;
             Ok(PreparedStandaloneRequest::new(request, context))
         })
+    }
+}
+
+fn resolve_ingress_execution_context(
+    listener_transport: http_access_runtime::ListenerTransport,
+    identity: &access_identity::IdentityContext,
+    access_flow_context: Option<access_execution_context::ExecutionContext>,
+    legacy_header: Option<&HeaderName>,
+    internal_context: &mut HeaderMap,
+) -> Result<Option<access_execution_context::ExecutionContext>, http_access_runtime::RuntimeError> {
+    let Some(legacy_header) = legacy_header else {
+        return Ok(access_flow_context);
+    };
+    match listener_transport {
+        http_access_runtime::ListenerTransport::AccessFlow => {
+            internal_context.remove(legacy_header);
+            Ok(access_flow_context)
+        }
+        http_access_runtime::ListenerTransport::Tcp => {
+            if access_flow_context.is_some() {
+                return Err(http_access_runtime::RuntimeError::InvalidInput);
+            }
+            let mut values = internal_context.get_all(legacy_header).iter();
+            let Some(value) = values.next() else {
+                return Ok(None);
+            };
+            if values.next().is_some()
+                || !matches!(identity, access_identity::IdentityContext::Authenticated(_))
+            {
+                return Err(http_access_runtime::RuntimeError::RequestRejected);
+            }
+            let value = value
+                .to_str()
+                .map_err(|_| http_access_runtime::RuntimeError::RequestRejected)?;
+            access_execution_context::ExecutionContext::new(value.to_owned())
+                .map(Some)
+                .map_err(|_| http_access_runtime::RuntimeError::RequestRejected)
+        }
     }
 }
 
@@ -1868,6 +1913,106 @@ mod local_response_contract_tests {
     use http_access_types::{PolicyGeneration, SnapshotIdentity};
 
     use super::*;
+
+    #[test]
+    fn legacy_context_admission_is_tcp_authenticated_exactly_once_and_access_flow_disjoint() {
+        let header = HeaderName::from_static("x-aw-policy-context");
+        let authenticated = access_identity::authenticated_identity_context_fixture();
+
+        let mut absent = HeaderMap::new();
+        assert!(resolve_ingress_execution_context(
+            http_access_runtime::ListenerTransport::Tcp,
+            &authenticated,
+            None,
+            Some(&header),
+            &mut absent,
+        )
+        .unwrap()
+        .is_none());
+
+        let mut internal = HeaderMap::new();
+        internal.append(header.clone(), HeaderValue::from_static("internal"));
+        let admitted = resolve_ingress_execution_context(
+            http_access_runtime::ListenerTransport::Tcp,
+            &authenticated,
+            None,
+            Some(&header),
+            &mut internal,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(admitted.as_str(), "internal");
+        assert_eq!(internal[&header], "internal");
+
+        for values in [
+            vec!["internal", "external"],
+            vec!["internal,external"],
+            vec!["Internal"],
+        ] {
+            let mut invalid = HeaderMap::new();
+            for value in values {
+                invalid.append(header.clone(), HeaderValue::from_str(value).unwrap());
+            }
+            assert!(matches!(
+                resolve_ingress_execution_context(
+                    http_access_runtime::ListenerTransport::Tcp,
+                    &authenticated,
+                    None,
+                    Some(&header),
+                    &mut invalid,
+                ),
+                Err(http_access_runtime::RuntimeError::RequestRejected)
+            ));
+        }
+        let mut non_utf8 = HeaderMap::new();
+        non_utf8.append(
+            header.clone(),
+            HeaderValue::from_bytes(&[0xff]).expect("opaque header bytes are structurally valid"),
+        );
+        assert!(matches!(
+            resolve_ingress_execution_context(
+                http_access_runtime::ListenerTransport::Tcp,
+                &authenticated,
+                None,
+                Some(&header),
+                &mut non_utf8,
+            ),
+            Err(http_access_runtime::RuntimeError::RequestRejected)
+        ));
+
+        for identity in [
+            access_identity::IdentityContext::Disabled,
+            access_identity::IdentityContext::Anonymous,
+        ] {
+            let mut untrusted = HeaderMap::new();
+            untrusted.append(header.clone(), HeaderValue::from_static("internal"));
+            assert!(matches!(
+                resolve_ingress_execution_context(
+                    http_access_runtime::ListenerTransport::Tcp,
+                    &identity,
+                    None,
+                    Some(&header),
+                    &mut untrusted,
+                ),
+                Err(http_access_runtime::RuntimeError::RequestRejected)
+            ));
+        }
+
+        let external = access_execution_context::ExecutionContext::new("external").unwrap();
+        let mut spoofed_access_flow = HeaderMap::new();
+        spoofed_access_flow.append(header.clone(), HeaderValue::from_static("internal"));
+        let admitted = resolve_ingress_execution_context(
+            http_access_runtime::ListenerTransport::AccessFlow,
+            &authenticated,
+            Some(external),
+            Some(&header),
+            &mut spoofed_access_flow,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(admitted.as_str(), "external");
+        assert!(!spoofed_access_flow.contains_key(&header));
+    }
 
     #[test]
     fn absolute_deadline_millis_rounds_submillisecond_remainders_up() {

@@ -516,6 +516,7 @@ urls = [
 
 [authorization]
 internal_context_headers = ["x-aw-policy-context"]
+legacy_execution_context_header = "x-aw-policy-context"
 
 [authorization.providers.gitlab_acl]
 kind = "process"

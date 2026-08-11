@@ -122,6 +122,8 @@ pub(crate) trait ObservationSnapshot: Send + Sync {
 pub(crate) trait AuthorizationSnapshot: Send + Sync {
     fn internal_context_headers(&self) -> &[http::HeaderName];
 
+    fn legacy_execution_context_header(&self) -> Option<&http::HeaderName>;
+
     fn provider_metadata(
         &self,
         provider: ProviderIndex,

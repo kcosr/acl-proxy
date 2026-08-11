@@ -940,6 +940,9 @@ pub(super) struct AuthorizationConfig {
     pub internal_context_headers: Vec<String>,
 
     #[serde(default)]
+    pub legacy_execution_context_header: Option<String>,
+
+    #[serde(default)]
     pub callback: Option<AuthorizationCallbackConfig>,
 
     #[serde(default)]
@@ -1931,6 +1934,7 @@ max_request_body_bytes = 65536
 
 [authorization]
 internal_context_headers = ["x-aw-policy-context"]
+legacy_execution_context_header = "x-aw-policy-context"
 
 [authorization.callback]
 public_url = "http://127.0.0.1:8898/_acl-proxy/external-auth/callback"
@@ -2009,6 +2013,13 @@ max_inflight_body_bytes = 134217728
         );
         assert_eq!(parsed.authorization.providers.len(), 2);
         assert_eq!(parsed.authorization.internal_context_headers.len(), 1);
+        assert_eq!(
+            parsed
+                .authorization
+                .legacy_execution_context_header
+                .as_deref(),
+            Some("x-aw-policy-context")
+        );
         assert_eq!(parsed.credentials.inbound.len(), 1);
         let webhook = match &parsed.authorization.providers["approval"] {
             AuthorizationProviderConfig::Webhook(webhook) => webhook,

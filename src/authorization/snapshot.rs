@@ -33,6 +33,7 @@ use crate::safety::HttpWireBodyGuard;
 pub(crate) struct ProductAuthorizationSnapshot {
     id: u64,
     internal_context_headers: Box<[HeaderName]>,
+    legacy_execution_context_header: Option<HeaderName>,
     providers: Box<[ActiveProvider]>,
     callback: Option<AuthorizationCallbackPlan>,
     webhook_runtime: Arc<WebhookAuthorizationRuntime>,
@@ -288,6 +289,7 @@ impl ProductAuthorizationSnapshot {
             snapshot: Self {
                 id: next_authorization_snapshot_id(),
                 internal_context_headers: plan.internal_context_headers.into_boxed_slice(),
+                legacy_execution_context_header: plan.legacy_execution_context_header,
                 providers: providers.into_boxed_slice(),
                 callback: plan.callback,
                 webhook_runtime,
@@ -298,6 +300,10 @@ impl ProductAuthorizationSnapshot {
 
     pub(crate) fn internal_context_headers(&self) -> &[HeaderName] {
         &self.internal_context_headers
+    }
+
+    pub(crate) fn legacy_execution_context_header(&self) -> Option<&HeaderName> {
+        self.legacy_execution_context_header.as_ref()
     }
 
     fn bind_allow_output(
@@ -501,6 +507,10 @@ impl ProductAuthorizationSnapshot {
 impl AuthorizationSnapshot for ProductAuthorizationSnapshot {
     fn internal_context_headers(&self) -> &[HeaderName] {
         ProductAuthorizationSnapshot::internal_context_headers(self)
+    }
+
+    fn legacy_execution_context_header(&self) -> Option<&HeaderName> {
+        ProductAuthorizationSnapshot::legacy_execution_context_header(self)
     }
 
     fn provider_metadata(
@@ -807,6 +817,7 @@ mod tests {
     ) -> AuthorizationPlan {
         AuthorizationPlan {
             internal_context_headers: vec![],
+            legacy_execution_context_header: None,
             callback: None,
             providers,
         }
@@ -846,6 +857,7 @@ mod tests {
         fn plan(path: &str) -> AuthorizationPlan {
             AuthorizationPlan {
                 internal_context_headers: vec![],
+                legacy_execution_context_header: None,
                 callback: Some(AuthorizationCallbackPlan {
                     resume_token_ttl: Duration::from_secs(5),
                     max_pending_operations: PendingOperationLimit::try_new(1).unwrap(),
@@ -1035,6 +1047,7 @@ mod tests {
     async fn webhook_provider_activates_with_generation_callback_policy() {
         let plan = AuthorizationPlan {
             internal_context_headers: vec![],
+            legacy_execution_context_header: None,
             callback: Some(AuthorizationCallbackPlan {
                 resume_token_ttl: Duration::from_secs(30),
                 max_pending_operations: PendingOperationLimit::try_new(4).unwrap(),
@@ -1089,6 +1102,7 @@ mod tests {
     async fn object_safe_snapshot_stages_exact_raw_provider_material() {
         let plan = AuthorizationPlan {
             internal_context_headers: vec![],
+            legacy_execution_context_header: None,
             callback: Some(AuthorizationCallbackPlan {
                 resume_token_ttl: Duration::from_secs(30),
                 max_pending_operations: PendingOperationLimit::try_new(4).unwrap(),

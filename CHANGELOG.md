@@ -48,6 +48,9 @@
 - Added Access Flow v2 execution-context policy predicates and an optional,
   HTTPS-URL-scoped projection to the protected `X-Agent-Access-Context` outbound
   header, with early spoof stripping and late single-value insertion.
+- Added explicit normalization of one existing private legacy-proxy context
+  header into typed execution context on authenticated TCP ingress, while
+  keeping Access Flow context exclusively sourced from AWAF metadata.
 
 - Added server-authenticated TLS 1.3/TCP beneath transparent HTTP/HTTPS Access
   Flow listeners, with `aw-access-flow/2` plus legacy `aw-access-flow/1` ALPN,
