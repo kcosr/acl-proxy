@@ -513,18 +513,23 @@ legacy_execution_context_header = "x-aw-policy-context"
 The legacy header is admitted only on ordinary TCP ingress with an
 authenticated identity. It must occur exactly once and contain a canonical
 execution-context value; malformed, duplicate, or comma-joined values are
-rejected before policy. Absence remains context-free. Access Flow never trusts
-this header and uses only AWAF metadata, removing any legacy-header spoof before
-provider processing.
+rejected before policy. A present legacy header on unauthenticated TCP ingress
+also rejects the request before policy; it is never silently ignored. Absence
+remains context-free. Access Flow never trusts this header and uses only AWAF
+metadata, removing any legacy-header spoof before provider processing.
 
 Enable this option only when the managed preceding proxy supplies the
 authenticated presentation, unconditionally replaces every application value,
 and keeps the workload bearer unavailable to applications that could bypass it
-into the trusted listener. The admitted principal remains the workload
-principal; it is not replaced with a proxy identity. The header remains an
-internal authorization-provider input when a legacy provider explicitly
-includes it, but it is never available to ordinary header predicates, capture,
-or origin forwarding.
+into the trusted listener. Decrypted requests inside a CONNECT/MITM tunnel are
+admitted independently on that authenticated connection, so the preceding
+proxy must also terminate and re-originate TLS to control their plaintext; do
+not enable CONNECT on this listener when it merely relays an application-owned
+tunnel. The admitted principal remains the workload principal; it is not
+replaced with a proxy identity. The header remains an internal
+authorization-provider input when a legacy provider explicitly includes it,
+but it is never available to ordinary header predicates, capture, or origin
+forwarding.
 
 Candidate activation declares every origin, parent-proxy, and HTTPS webhook
 trust requirement before performing TLS trust I/O. It then loads each distinct

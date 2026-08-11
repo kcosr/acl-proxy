@@ -54,8 +54,11 @@ http_versions = ["http1", "http2"]
 # A trusted two-proxy deployment may normalize one existing private header into
 # the same typed execution context. This is valid only when the managed proxy
 # exclusively supplies both the header and workload bearer and cannot be
-# bypassed. The matching unconditional remove action is required by
-# internal-context-header safety.
+# bypassed. It must also terminate and re-originate TLS before using CONNECT;
+# an application-owned tunnel could otherwise supply the decrypted inner
+# header on the authenticated connection. A present header on unauthenticated
+# TCP rejects the request. The matching unconditional remove action is required
+# by internal-context-header safety.
 #
 # [[egress.request_headers]]
 # operation = "remove"
